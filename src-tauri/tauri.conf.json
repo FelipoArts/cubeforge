@@ -23,9 +23,20 @@
       "csp": null
     }
   },
+  "plugins": {
+    "shell": {},
+    "os": {},
+    "fs": {},
+    "http": null,
+    "dialog": null,
+    "process": {}
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "binaries/tsnet-node"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

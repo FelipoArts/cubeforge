@@ -1,0 +1,7 @@
+{
+  "provider": "tailscale",
+  "credentials": {
+    "authKey": "tskey-auth-YOUR_KEY_HERE",
+    "hostname": "cubeforge-dev"
+  }
+}

@@ -6,6 +6,79 @@
     "main"
   ],
   "permissions": [
-    "core:default"
+    "core:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "powershell",
+          "cmd": "powershell",
+          "args": [
+            "-Command",
+            {
+              "validator": "[\\s\\S]*"
+            }
+          ]
+        },
+        {
+          "name": "tsnet-node",
+          "sidecar": true,
+          "args": [
+            "--config",
+            {
+              "validator": "[\\s\\S]*"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "tsnet-node",
+          "sidecar": true,
+          "args": [
+            "--config",
+            {
+              "validator": "[\\s\\S]*"
+            }
+          ]
+        }
+      ]
+    },
+    "shell:default",
+    "os:default",
+    "fs:default",
+    {
+      "identifier": "fs:allow-exists",
+      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+    },
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+    },
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+    },
+    {
+      "identifier": "fs:allow-remove",
+      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+    },
+    "http:default",
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [
+        { "url": "https://api.adoptium.net" },
+        { "url": "https://api.cubeforge.dev" }
+      ]
+    },
+    "dialog:default",
+    "process:default"
   ]
 }
