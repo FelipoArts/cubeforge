@@ -1,6 +1,6 @@
 import { Command } from "@tauri-apps/plugin-shell";
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
-import { exists, mkdir, remove } from "@tauri-apps/plugin-fs";
+import { exists, mkdir } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 
 export type JREVersion = 8 | 17 | 21;

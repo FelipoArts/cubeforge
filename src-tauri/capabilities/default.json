@@ -2,9 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "enables the default permissions",
-  "windows": [
-    "main"
-  ],
+  "windows": ["main"],
   "permissions": [
     "core:default",
     {
@@ -13,22 +11,12 @@
         {
           "name": "powershell",
           "cmd": "powershell",
-          "args": [
-            "-Command",
-            {
-              "validator": "[\\s\\S]*"
-            }
-          ]
+          "args": ["-Command", {"validator":"[\\s\\S]*"}]
         },
         {
           "name": "tsnet-node",
           "sidecar": true,
-          "args": [
-            "--config",
-            {
-              "validator": "[\\s\\S]*"
-            }
-          ]
+          "args": ["--config", {"validator":"[\\s\\S]*"}]
         }
       ]
     },
@@ -38,12 +26,7 @@
         {
           "name": "tsnet-node",
           "sidecar": true,
-          "args": [
-            "--config",
-            {
-              "validator": "[\\s\\S]*"
-            }
-          ]
+          "args": ["--config", {"validator":"[\\s\\S]*"}]
         }
       ]
     },
@@ -52,33 +35,76 @@
     "fs:default",
     {
       "identifier": "fs:allow-exists",
-      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+      ]
     },
     {
       "identifier": "fs:allow-mkdir",
-      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+      ]
     },
     {
       "identifier": "fs:allow-write-file",
-      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+      ]
     },
     {
       "identifier": "fs:allow-read-file",
-      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": [
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false },
+        { "path": "$HOME/**/*", "recursive": true }
+      ]
     },
     {
       "identifier": "fs:allow-remove",
-      "allow": [{ "path": "$APPLOCALDATA/**/*", "recursive": true }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+      ]
     },
     "http:default",
     {
       "identifier": "http:allow-fetch",
       "allow": [
         { "url": "https://api.adoptium.net" },
-        { "url": "https://api.cubeforge.dev" }
+        { "url": "https://api.cubeforge.dev" },
+        { "url": "https://launchermeta.mojang.com" },
+        { "url": "https://piston-meta.mojang.net" },
+        { "url": "https://piston-meta.mojang.com" }
       ]
     },
-    "dialog:default",
-    "process:default"
+    "dialog:default"
   ]
 }
