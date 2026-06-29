@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { join } from '@tauri-apps/api/path';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { Check, X, AlertTriangle } from 'lucide-react';
-import { cn } from './page'; // reuse utility
+import { cn } from '@/lib/utils';
 
 interface ServerConfigModalProps {
   /** Full filesystem path to the server directory */
@@ -160,235 +160,242 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
     <AnimatePresence>
       {isOpen && (
         <motion.div
-          className="fixed inset-0 z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
         >
           {/* Backdrop */}
-          <motion.div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+          <motion.div className="absolute inset-0 bg-theme-overlay backdrop-blur-sm" onClick={onClose} />
           {/* Modal */}
           <motion.div
-            className="relative w-full max-w-lg bg-white rounded-[2rem] border border-slate-200 shadow-2xl p-8 z-10 space-y-6"
+            className="relative w-full max-w-lg bg-theme-card rounded-[2rem] border-theme-card shadow-2xl z-10 space-y-6 max-h-[85vh] flex flex-col"
             initial={{ opacity: 0, scale: 0.95, y: 15 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 15 }}
             transition={{ type: 'spring', duration: 0.3 }}
           >
-            <div className="flex items-center justify-between">
-              <h3 className="text-xl font-bold text-slate-800">Configurações do Servidor</h3>
-              <button onClick={onClose} className="p-1.5 hover:bg-slate-100 rounded-lg transition-colors" title="Cancelar">
-                <X className="w-5 h-5" />
-              </button>
+            <div className="p-8 pb-0 flex-shrink-0">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xl font-bold text-theme-primary">Configurações do Servidor</h3>
+                <button type="button" onClick={onClose} className="p-1.5 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer" title="Cancelar">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
-            {isServerRunning && (
-              <div className="p-4 bg-amber-50 border border-amber-100 text-amber-800 rounded-2xl flex items-start gap-3 text-sm">
-                <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold">Servidor em execução.</span> As configurações só podem ser alteradas com o servidor Minecraft parado. Pare o servidor antes de modificar as propriedades.
+            <div className="px-8 overflow-y-auto flex-1 custom-scrollbar">
+              {isServerRunning && (
+                <div className="p-4 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
+                  <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold">Servidor em execução.</span> As configurações só podem ser alteradas com o servidor Minecraft parado. Pare o servidor antes de modificar as propriedades.
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            <form className="space-y-4" onSubmit={e => { e.preventDefault(); handleSave(); }}>
-              {/* MOTD */}
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Mensagem do Dia (motd)</label>
-                <input
-                  type="text"
-                  value={motd}
-                  onChange={e => setMotd(e.target.value)}
-                  disabled={isServerRunning}
-                  className="w-full rounded-2xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
-                />
-              </div>
-              {/* Gamemode & Difficulty */}
-              <div className="grid grid-cols-2 gap-4">
+              <form className="space-y-4 pb-4" onSubmit={e => { e.preventDefault(); handleSave(); }}>
+                {/* MOTD */}
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Modo de Jogo</label>
-                  <select
-                    value={gamemode}
-                    onChange={e => setGamemode(e.target.value)}
-                    disabled={isServerRunning}
-                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
-                  >
-                    <option value="survival">Sobrevivência</option>
-                    <option value="creative">Criativo</option>
-                    <option value="adventure">Aventura</option>
-                    <option value="spectator">Espectador</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Dificuldade</label>
-                  <select
-                    value={difficulty}
-                    onChange={e => setDifficulty(e.target.value)}
-                    disabled={isServerRunning}
-                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
-                  >
-                    <option value="peaceful">Pacífico</option>
-                    <option value="easy">Fácil</option>
-                    <option value="normal">Normal</option>
-                    <option value="hard">Difícil</option>
-                  </select>
-                </div>
-              </div>
-              {/* Toggles */}
-              <div className="grid grid-cols-2 gap-4">
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={hardcore} onChange={e => setHardcore(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Hardcore</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={whitelist} onChange={e => setWhitelist(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Lista de Aprovados</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={pvp} onChange={e => setPvp(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">PVP</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={allowFlight} onChange={e => setAllowFlight(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Permitir Voo</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={allowNether} onChange={e => setAllowNether(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Permitir Nether</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={spawnMonsters} onChange={e => setSpawnMonsters(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Gerar Monstros</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={spawnAnimals} onChange={e => setSpawnAnimals(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Gerar Animais</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={spawnNpcs} onChange={e => setSpawnNpcs(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Gerar Aldeões</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={onlineMode} onChange={e => setOnlineMode(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Modo Online</span>
-                </label>
-                <label className="inline-flex items-center space-x-2">
-                  <input type="checkbox" checked={enforceSecureProfile} onChange={e => setEnforceSecureProfile(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                  <span className="text-sm text-slate-700">Perfil Seguro</span>
-                </label>
-              </div>
-              {/* Numeric fields */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Máx. Jogadores</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={maxPlayers}
-                    onChange={e => setMaxPlayers(Number(e.target.value))}
-                    disabled={isServerRunning}
-                    className="w-full rounded-2xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Porta do Servidor</label>
-                  <input
-                    type="number"
-                    value={serverPort}
-                    onChange={e => setServerPort(Number(e.target.value))}
-                    disabled={isServerRunning}
-                    className={cn(
-                      "w-full rounded-2xl border px-3 py-2 focus:outline-none transition-colors",
-                      portError
-                        ? "border-rose-400 focus:border-rose-500 bg-rose-50"
-                        : "border-slate-200 focus:border-indigo-500",
-                      isServerRunning && "bg-slate-50 text-slate-400 cursor-not-allowed"
-                    )}
-                  />
-                  {portError && (
-                    <p className="mt-1 text-xs text-rose-500 flex items-center gap-1">
-                      <AlertTriangle className="w-3 h-3" /> {portError}
-                    </p>
-                  )}
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1">Semente (level-seed)</label>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">Mensagem do Dia (motd)</label>
                   <input
                     type="text"
-                    value={levelSeed}
-                    onChange={e => setLevelSeed(e.target.value)}
+                    value={motd}
+                    onChange={e => setMotd(e.target.value)}
                     disabled={isServerRunning}
-                    className="w-full rounded-2xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed"
+                    className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                   />
                 </div>
-              </div>
-              {/* View Distance Slider */}
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Distância de Visão</label>
-                <div className="flex items-center space-x-4">
-                  <input
-                    type="range"
-                    min={4}
-                    max={32}
-                    step={1}
-                    value={viewDistance}
-                    onChange={e => setViewDistance(Number(e.target.value))}
-                    disabled={isServerRunning}
-                    className="flex-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                  />
-                  <span className="w-12 text-center font-medium text-slate-800">{viewDistance}</span>
-                </div>
-              </div>
-              {/* RAM Allocation Slider */}
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Memória RAM Alocada</label>
-                <div className="flex items-center space-x-4">
-                  <input
-                    type="range"
-                    min={2}
-                    max={Math.max(2, totalSystemRam - 1)}
-                    step={1}
-                    value={allocatedRam}
-                    onChange={e => setAllocatedRam(Number(e.target.value))}
-                    disabled={isServerRunning}
-                    className="flex-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                  />
-                  <span className="w-16 text-center font-medium text-slate-800 font-mono">{allocatedRam} GB</span>
-                </div>
-                <div className="flex justify-between text-[10px] text-slate-400 mt-1">
-                  <span>Mín: 2 GB</span>
-                  <span>Total no PC: {totalSystemRam} GB</span>
-                </div>
-                {allocatedRam < 3 && (
-                  <div className="mt-2 p-2.5 bg-amber-50 border border-amber-100 text-amber-800 text-[10px] rounded-xl flex items-start gap-2">
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0 mt-0.5" />
-                    <span>
-                      <strong>Atenção:</strong> Menos de 3 GB de RAM pode causar lentidão ou travamentos no servidor, especialmente com muitos jogadores ou mods.
-                    </span>
+                {/* Gamemode & Difficulty */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Modo de Jogo</label>
+                    <select
+                      value={gamemode}
+                      onChange={e => setGamemode(e.target.value)}
+                      disabled={isServerRunning}
+                      className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <option value="survival">Sobrevivência</option>
+                      <option value="creative">Criativo</option>
+                      <option value="adventure">Aventura</option>
+                      <option value="spectator">Espectador</option>
+                    </select>
                   </div>
-                )}
-                {totalSystemRam - allocatedRam < 2 && (
-                  <div className="mt-2 p-2.5 bg-rose-50 border border-rose-100 text-rose-800 text-[10px] rounded-xl flex items-start gap-2">
-                    <AlertTriangle className="w-3.5 h-3.5 text-rose-500 flex-shrink-0 mt-0.5" />
-                    <span>
-                      <strong>Perigo:</strong> Deixar menos de 2 GB livres para o sistema operacional pode travar o Windows ou corromper dados. Reduza a RAM alocada.
-                    </span>
+                  <div>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Dificuldade</label>
+                    <select
+                      value={difficulty}
+                      onChange={e => setDifficulty(e.target.value)}
+                      disabled={isServerRunning}
+                      className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <option value="peaceful">Pacífico</option>
+                      <option value="easy">Fácil</option>
+                      <option value="normal">Normal</option>
+                      <option value="hard">Difícil</option>
+                    </select>
                   </div>
-                )}
-              </div>
-              {/* Action buttons */}
-              <div className="flex justify-end space-x-3 pt-4">
-                <button type="button" onClick={onClose} className="px-4 py-2 rounded-2xl bg-slate-100 text-slate-600 hover:bg-slate-200 transition-colors">
+                </div>
+                {/* Toggles */}
+                <div className="grid grid-cols-2 gap-4">
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={hardcore} onChange={e => setHardcore(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Hardcore</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={whitelist} onChange={e => setWhitelist(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Lista de Aprovados</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={pvp} onChange={e => setPvp(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">PVP</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={allowFlight} onChange={e => setAllowFlight(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Permitir Voo</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={allowNether} onChange={e => setAllowNether(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Permitir Nether</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={spawnMonsters} onChange={e => setSpawnMonsters(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Gerar Monstros</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={spawnAnimals} onChange={e => setSpawnAnimals(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Gerar Animais</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={spawnNpcs} onChange={e => setSpawnNpcs(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Gerar Aldeões</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={onlineMode} onChange={e => setOnlineMode(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Modo Online</span>
+                  </label>
+                  <label className="inline-flex items-center space-x-2">
+                    <input type="checkbox" checked={enforceSecureProfile} onChange={e => setEnforceSecureProfile(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <span className="text-sm text-theme-primary">Perfil Seguro</span>
+                  </label>
+                </div>
+                {/* Numeric fields */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Máx. Jogadores</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={maxPlayers}
+                      onChange={e => setMaxPlayers(Number(e.target.value))}
+                      disabled={isServerRunning}
+                      className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Porta do Servidor</label>
+                    <input
+                      type="number"
+                      value={serverPort}
+                      onChange={e => setServerPort(Number(e.target.value))}
+                      disabled={isServerRunning}
+                      className={cn(
+                        "w-full rounded-2xl border px-3 py-2 focus:outline-none transition-colors bg-transparent text-theme-primary",
+                        portError
+                          ? "border-rose-400 focus:border-rose-500 bg-rose-50 dark:bg-rose-900/20"
+                          : "border-theme-card focus:border-indigo-500",
+                        isServerRunning && "opacity-50 cursor-not-allowed"
+                      )}
+                    />
+                    {portError && (
+                      <p className="mt-1 text-xs text-rose-500 flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3" /> {portError}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Semente (level-seed)</label>
+                    <input
+                      type="text"
+                      value={levelSeed}
+                      onChange={e => setLevelSeed(e.target.value)}
+                      disabled={isServerRunning}
+                      className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                  </div>
+                </div>
+                {/* View Distance Slider */}
+                <div>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">Distância de Visão</label>
+                  <div className="flex items-center space-x-4">
+                    <input
+                      type="range"
+                      min={4}
+                      max={32}
+                      step={1}
+                      value={viewDistance}
+                      onChange={e => setViewDistance(Number(e.target.value))}
+                      disabled={isServerRunning}
+                      className="flex-1 accent-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                    <span className="w-12 text-center font-medium text-theme-primary">{viewDistance}</span>
+                  </div>
+                </div>
+                {/* RAM Allocation Slider */}
+                <div>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">Memória RAM Alocada</label>
+                  <div className="flex items-center space-x-4">
+                    <input
+                      type="range"
+                      min={2}
+                      max={Math.max(2, totalSystemRam - 1)}
+                      step={1}
+                      value={allocatedRam}
+                      onChange={e => setAllocatedRam(Number(e.target.value))}
+                      disabled={isServerRunning}
+                      className="flex-1 accent-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                    <span className="w-16 text-center font-medium text-theme-primary font-mono">{allocatedRam} GB</span>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-theme-secondary mt-1">
+                    <span>Mín: 2 GB</span>
+                    <span>Total no PC: {totalSystemRam} GB</span>
+                  </div>
+                  {allocatedRam < 3 && (
+                    <div className="mt-2 p-2.5 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 text-[10px] rounded-xl flex items-start gap-2">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0 mt-0.5" />
+                      <span>
+                        <strong>Atenção:</strong> Menos de 3 GB de RAM pode causar lentidão ou travamentos no servidor, especialmente com muitos jogadores ou mods.
+                      </span>
+                    </div>
+                  )}
+                  {totalSystemRam - allocatedRam < 2 && (
+                    <div className="mt-2 p-2.5 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 text-[10px] rounded-xl flex items-start gap-2">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-500 flex-shrink-0 mt-0.5" />
+                      <span>
+                        <strong>Perigo:</strong> Deixar menos de 2 GB livres para o sistema operacional pode travar o Windows ou corromper dados. Reduza a RAM alocada.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </form>
+            </div>
+
+            {/* Action buttons */}
+            <div className="p-8 pt-0 flex-shrink-0">
+              <div className="flex justify-end space-x-3 pt-4 border-t border-theme-card">
+                <button type="button" onClick={onClose} className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer">
                   Cancelar
                 </button>
-                <button type="submit" disabled={isServerRunning} className="px-4 py-2 rounded-2xl bg-indigo-600 text-white hover:bg-indigo-700 transition-colors flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed">
+                <button type="submit" disabled={isServerRunning} onClick={handleSave} className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-theme-shadow cursor-pointer">
                   <Check className="w-4 h-4" /> Salvar
                 </button>
               </div>
-            </form>
+            </div>
           </motion.div>
         </motion.div>
       )}

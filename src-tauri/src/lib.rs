@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use tauri::{Manager, Emitter};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use std::sync::Arc;
+use std::thread;
+use std::path::PathBuf;
+use std::time::Instant;
 
 fn log_to_file(app: &tauri::AppHandle, message: &str) {
     let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -967,8 +971,1163 @@ async fn write_server_properties(server_dir: String, props: HashMap<String, Stri
     std::fs::write(&path, new_content).map_err(|e| e.to_string())
 }
 
+// ============================================================
+// Server Registry — Servidor HTTP local para descoberta de servidores
+// ============================================================
+//
+// O Rust mantém um registro em memória dos servidores Minecraft disponíveis.
+// Um servidor HTTP local (127.0.0.1:25567) expõe endpoints para:
+//
+// - GET /registry/resolve?code={shortCode} → retorna metadados do servidor
+// - POST /registry/update                → atualiza o registro
+//
+// O sidecar Go consulta este servidor HTTP local para responder requisições
+// que chegam via Tailscale (na porta 25566).
+
+use std::collections::BTreeMap;
+
+/// Estrutura de metadados de um servidor no registro
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ServerRegistryEntry {
+    short_code: String,
+    name: String,
+    version: String,
+    server_type: String,
+    description: String,
+    status: String, // "offline" | "starting" | "online" | "stopping" | "crashed"
+    port: u16,
+}
+
+/// Estado global do registro de servidores (thread-safe)
+struct ServerRegistry {
+    entries: Mutex<BTreeMap<String, ServerRegistryEntry>>, // key = shortCode
+}
+
+/// Inicia o servidor HTTP de registro em uma thread separada.
+/// Escuta em 127.0.0.1:25567 (para o sidecar Go) e em 0.0.0.0:25566 (para o guest via Tailscale).
+fn start_registry_http_server(registry: Arc<ServerRegistry>) {
+    // Servidor interno (127.0.0.1:25567) — usado pelo sidecar Go como proxy
+    let registry_internal = registry.clone();
+    thread::spawn(move || {
+        let addr = "127.0.0.1:25567";
+        let server = match tiny_http::Server::http(addr) {
+            Ok(s) => {
+                eprintln!("[Registry] Servidor HTTP interno iniciado em {}", addr);
+                s
+            }
+            Err(e) => {
+                eprintln!("[Registry] Falha ao iniciar servidor HTTP interno em {}: {}", addr, e);
+                return;
+            }
+        };
+        
+        loop {
+            match server.recv() {
+                Ok(mut request) => {
+                    let url = request.url().to_string();
+                    let method = request.method().as_str().to_string();
+                    eprintln!("[Registry] Requisição recebida (interno): {} {}", method, url);
+                    
+                    let response = handle_registry_request(&registry_internal, &method, &url, &mut request);
+                    let _ = request.respond(tiny_http::Response::from_string(response));
+                }
+                Err(e) => {
+                    eprintln!("[Registry] Erro no servidor HTTP interno: {}", e);
+                }
+            }
+        }
+    });
+    
+    // Servidor externo (0.0.0.0:25566) — acessível via Tailscale pelo guest
+    // O Tailscale roteia conexões para o IP virtual do host, e qualquer processo
+    // escutando em 0.0.0.0:PORT receberá essas conexões.
+    thread::spawn(move || {
+        let addr = "0.0.0.0:25566";
+        let server = match tiny_http::Server::http(addr) {
+            Ok(s) => {
+                eprintln!("[Registry] Servidor HTTP externo iniciado em {}", addr);
+                s
+            }
+            Err(e) => {
+                eprintln!("[Registry] Falha ao iniciar servidor HTTP externo em {}: {}", addr, e);
+                return;
+            }
+        };
+        
+        loop {
+            match server.recv() {
+                Ok(mut request) => {
+                    let url = request.url().to_string();
+                    let method = request.method().as_str().to_string();
+                    eprintln!("[Registry] Requisição recebida (externo): {} {} de {:?}", method, url, request.remote_addr());
+                    
+                    let response = handle_registry_request(&registry, &method, &url, &mut request);
+                    let _ = request.respond(tiny_http::Response::from_string(response));
+                }
+                Err(e) => {
+                    eprintln!("[Registry] Erro no servidor HTTP externo: {}", e);
+                }
+            }
+        }
+    });
+}
+
+/// Processa uma requisição HTTP do registro e retorna a resposta como string.
+fn handle_registry_request(registry: &ServerRegistry, method: &str, url: &str, request: &mut tiny_http::Request) -> String {
+    match (method, url) {
+        // GET /registry/resolve?code={shortCode}
+        ("GET", url_str) if url_str.starts_with("/registry/resolve") || url_str.starts_with("/resolve") => {
+            let code = url_str.split("?code=").nth(1).unwrap_or("").to_string();
+            eprintln!("[Registry] Resolvendo código: '{}'", code);
+            let entries = registry.entries.lock().unwrap();
+            eprintln!("[Registry] Entradas no registro: {:?}", entries.keys().collect::<Vec<_>>());
+            match entries.get(&code) {
+                Some(entry) => {
+                    eprintln!("[Registry] Servidor encontrado: {:?}", entry);
+                    let json = serde_json::to_string(entry).unwrap_or_default();
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", json)
+                }
+                None => {
+                    eprintln!("[Registry] Código '{}' não encontrado no registro!", code);
+                    format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"Servidor não encontrado para o código: {}\"}}", code)
+                }
+            }
+        }
+        // GET /registry/list — lista todos os servidores
+        ("GET", "/registry/list") | ("GET", "/list") => {
+            let entries = registry.entries.lock().unwrap();
+            let list: Vec<&ServerRegistryEntry> = entries.values().collect();
+            let json = serde_json::to_string(&list).unwrap_or_default();
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", json)
+        }
+        // GET /status — health check
+        ("GET", "/status") => {
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"ok\"}}")
+        }
+        // POST /registry/update — atualiza ou adiciona um servidor
+        ("POST", "/registry/update") | ("POST", "/update") => {
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            if let Ok(entry) = serde_json::from_str::<ServerRegistryEntry>(&body) {
+                let code = entry.short_code.clone();
+                let mut entries = registry.entries.lock().unwrap();
+                entries.insert(code, entry);
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"updated\"}}")
+            } else {
+                format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"JSON inválido\"}}")
+            }
+        }
+        // POST /registry/remove — remove um servidor pelo shortCode
+        ("POST", url_str) if url_str.starts_with("/registry/remove") || url_str.starts_with("/remove") => {
+            let code = url_str.split("?code=").nth(1).unwrap_or("").to_string();
+            let mut entries = registry.entries.lock().unwrap();
+            entries.remove(&code);
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"removed\"}}")
+        }
+        // Qualquer outro endpoint
+        _ => {
+            format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"Endpoint não encontrado\"}}")
+        }
+    }
+}
+
+/// Comando Tauri: atualiza o registro de servidores.
+/// Chamado pelo frontend quando um servidor é criado, iniciado ou parado.
+#[tauri::command]
+async fn update_server_registry(
+    app: tauri::AppHandle,
+    short_code: String,
+    name: String,
+    version: String,
+    server_type: String,
+    description: String,
+    status: String,
+    port: u16,
+) -> Result<(), String> {
+    let registry = app.state::<Arc<ServerRegistry>>();
+    let entry = ServerRegistryEntry {
+        short_code: short_code.clone(),
+        name,
+        version,
+        server_type,
+        description,
+        status,
+        port,
+    };
+    let mut entries = registry.entries.lock().unwrap();
+    entries.insert(short_code, entry);
+    Ok(())
+}
+
+/// Comando Tauri: remove um servidor do registro.
+#[tauri::command]
+async fn remove_server_registry(
+    app: tauri::AppHandle,
+    short_code: String,
+) -> Result<(), String> {
+    let registry = app.state::<Arc<ServerRegistry>>();
+    let mut entries = registry.entries.lock().unwrap();
+    entries.remove(&short_code);
+    Ok(())
+}
+
+/// Comando Tauri: descobre informações de um servidor pelo código de convite completo.
+/// O guest chama este comando APÓS conectar na mesh para obter metadados.
+/// Faz uma requisição HTTP para o host via Tailscale (porta 25566).
+/// O sidecar Go extrai o shortCode e consulta o registro do Rust.
+///
+/// Inclui retry automático com backoff para dar tempo do servidor HTTP iniciar.
+#[tauri::command]
+async fn discover_server(
+    app: tauri::AppHandle,
+    host_ip: String,
+    short_code: String,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[discover_server] Iniciando descoberta: host_ip={}, short_code={}", host_ip, short_code));
+    
+    let url = format!("http://{}:25566/resolve?code={}", host_ip, short_code);
+    log_to_file(&app, &format!("[discover_server] URL da requisição: {}", url));
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| {
+            let msg = format!("[discover_server] Erro ao criar cliente HTTP: {}", e);
+            log_to_file(&app, &msg);
+            e.to_string()
+        })?;
+    
+    // Tentar com retry: até 5 tentativas com 1 segundo de intervalo
+    let max_attempts = 5;
+    let mut last_error = String::new();
+    
+    for attempt in 1..=max_attempts {
+        log_to_file(&app, &format!("[discover_server] Tentativa {}/{} - Enviando requisição GET...", attempt, max_attempts));
+        
+        match client.get(&url).send().await {
+            Ok(response) => {
+                log_to_file(&app, &format!("[discover_server] Resposta recebida: HTTP {}", response.status()));
+                
+                let status_code = response.status();
+                if !status_code.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    let msg = format!("[discover_server] Host retornou erro: HTTP {}. Body: {}", status_code, body);
+                    log_to_file(&app, &msg);
+                    return Err(msg);
+                }
+                
+                let data: serde_json::Value = response.json().await.map_err(|e| {
+                    let msg = format!("[discover_server] Falha ao parsear resposta do host: {}", e);
+                    log_to_file(&app, &msg);
+                    msg
+                })?;
+                
+                log_to_file(&app, &format!("[discover_server] Servidor encontrado: {:?}", data));
+                return Ok(data);
+            }
+            Err(e) => {
+                last_error = format!("[discover_server] Falha ao conectar ao host {}:25566 (tentativa {}/{}): {}", host_ip, attempt, max_attempts, e);
+                log_to_file(&app, &last_error);
+                
+                if attempt < max_attempts {
+                    log_to_file(&app, &format!("[discover_server] Aguardando 1s antes da próxima tentativa..."));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    
+    Err(last_error)
+}
+
+// ============================================================
+// Camada de Sincronização com API Central (SyncEngine)
+// ============================================================
+//
+// Esta camada substitui os comandos diretos de API por um sistema
+// robusto de fila persistente com retry, backoff exponencial e
+// telemetria operacional.
+//
+// Conceitos:
+// - SyncQueue: Fila persistente em disco de operações pendentes
+// - SyncEngine: Motor que processa a fila periodicamente
+// - SyncTelemetry: Métricas de diagnóstico operacional
+//
+// Fluxo:
+// 1. Comando Tauri → enfileira operação + tenta executar imediatamente
+// 2. Se falhar (sem internet, API indisponível), fica na fila
+// 3. SyncEngine processa a fila a cada 30s com backoff exponencial
+// 4. Quando a conexão voltar, as operações são sincronizadas automaticamente
+
+use uuid::Uuid;
+
+/// URL base da API Central do CubeForge
+const API_BASE_URL: &str = "https://cubeforge-api.cubeforge.workers.dev";
+
+// ============================================================
+// Tipos da Fila de Sincronização
+// ============================================================
+
+/// Tipos de operação suportados pela fila de sincronização
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+enum SyncOperationType {
+    RegisterServer,
+    UpdateServer,
+    DeleteServer,
+    CreateSession,
+    UpdateSession,
+    DeleteSession,
+    Heartbeat,
+}
+
+/// Uma operação na fila de sincronização
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SyncOperation {
+    id: String,                    // UUID único da operação
+    op_type: SyncOperationType,    // Tipo da operação
+    payload: serde_json::Value,    // Payload da operação
+    created_at: String,            // Timestamp ISO de criação
+    retry_count: u32,              // Número de tentativas já realizadas
+    last_attempt: Option<String>,  // Timestamp ISO da última tentativa
+}
+
+/// Estado da fila de sincronização
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SyncQueueState {
+    operations: Vec<SyncOperation>,
+}
+
+/// Métricas de telemetria operacional
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SyncTelemetry {
+    total_sync_attempts: u64,
+    total_sync_success: u64,
+    total_sync_failures: u64,
+    total_retries: u64,
+    pending_operations: usize,
+    failed_operations: usize,
+    avg_response_time_ms: f64,
+    last_sync_time: Option<String>,
+    api_available: bool,
+}
+
+impl Default for SyncTelemetry {
+    fn default() -> Self {
+        Self {
+            total_sync_attempts: 0,
+            total_sync_success: 0,
+            total_sync_failures: 0,
+            total_retries: 0,
+            pending_operations: 0,
+            failed_operations: 0,
+            avg_response_time_ms: 0.0,
+            last_sync_time: None,
+            api_available: false,
+        }
+    }
+}
+
+// ============================================================
+// Gerenciamento da Fila Persistente
+// ============================================================
+
+/// Obtém o caminho do arquivo de fila de sincronização
+fn get_sync_queue_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let data_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    Ok(data_dir.join("cubeforge_sync_queue.json"))
+}
+
+/// Carrega a fila de sincronização do disco
+fn load_sync_queue(app: &tauri::AppHandle) -> SyncQueueState {
+    let path = match get_sync_queue_path(app) {
+        Ok(p) => p,
+        Err(_) => return SyncQueueState { operations: Vec::new() },
+    };
+    
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                serde_json::from_str(&content).unwrap_or(SyncQueueState { operations: Vec::new() })
+            }
+            Err(_) => SyncQueueState { operations: Vec::new() },
+        }
+    } else {
+        SyncQueueState { operations: Vec::new() }
+    }
+}
+
+/// Salva a fila de sincronização no disco
+fn save_sync_queue(app: &tauri::AppHandle, state: &SyncQueueState) {
+    let path = match get_sync_queue_path(app) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    
+    if let Ok(content) = serde_json::to_string(state) {
+        let _ = std::fs::write(&path, &content);
+    }
+}
+
+/// Adiciona uma operação à fila de sincronização
+fn enqueue_operation(
+    app: &tauri::AppHandle,
+    op_type: SyncOperationType,
+    payload: serde_json::Value,
+) -> String {
+    let mut queue = load_sync_queue(app);
+    let id = Uuid::new_v4().to_string();
+    
+    let operation = SyncOperation {
+        id: id.clone(),
+        op_type,
+        payload,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        retry_count: 0,
+        last_attempt: None,
+    };
+    
+    // Limitar a 100 operações na fila (descarta as mais antigas)
+    if queue.operations.len() >= 100 {
+        queue.operations.remove(0);
+    }
+    
+    queue.operations.push(operation);
+    save_sync_queue(app, &queue);
+    
+    id
+}
+
+/// Remove uma operação da fila pelo ID
+fn remove_operation(app: &tauri::AppHandle, operation_id: &str) {
+    let mut queue = load_sync_queue(app);
+    queue.operations.retain(|op| op.id != operation_id);
+    save_sync_queue(app, &queue);
+}
+
+/// Remove operações expiradas (> 24h) da fila
+fn cleanup_expired_operations(app: &tauri::AppHandle) {
+    let mut queue = load_sync_queue(app);
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    
+    queue.operations.retain(|op| {
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&op.created_at) {
+            created > cutoff
+        } else {
+            true
+        }
+    });
+    
+    save_sync_queue(app, &queue);
+}
+
+// ============================================================
+// Execução de Operações Individuais
+// ============================================================
+
+/// Executa uma operação de sincronização contra a API Central.
+/// Retorna Ok(()) se bem-sucedido, Err(String) se falhou.
+async fn execute_sync_operation(
+    app: &tauri::AppHandle,
+    op: &SyncOperation,
+    telemetry: &Arc<Mutex<SyncTelemetry>>,
+) -> Result<(), String> {
+    let start = Instant::now();
+    
+    let result = match op.op_type {
+        SyncOperationType::RegisterServer => {
+            execute_register_server(app, &op.payload).await
+        }
+        SyncOperationType::UpdateServer => {
+            execute_update_server(app, &op.payload).await
+        }
+        SyncOperationType::DeleteServer => {
+            execute_delete_server(app, &op.payload).await
+        }
+        SyncOperationType::CreateSession => {
+            execute_create_session(app, &op.payload).await
+        }
+        SyncOperationType::UpdateSession => {
+            execute_update_session(app, &op.payload).await
+        }
+        SyncOperationType::DeleteSession => {
+            execute_delete_session(app, &op.payload).await
+        }
+        SyncOperationType::Heartbeat => {
+            execute_heartbeat(app, &op.payload).await
+        }
+    };
+    
+    let elapsed = start.elapsed().as_millis() as f64;
+    
+    // Atualizar telemetria
+    {
+        let mut t = telemetry.lock().unwrap();
+        t.total_sync_attempts += 1;
+        t.last_sync_time = Some(chrono::Utc::now().to_rfc3339());
+        
+        // Média móvel do tempo de resposta
+        if t.avg_response_time_ms == 0.0 {
+            t.avg_response_time_ms = elapsed;
+        } else {
+            t.avg_response_time_ms = (t.avg_response_time_ms * 0.9) + (elapsed * 0.1);
+        }
+        
+        match &result {
+            Ok(_) => {
+                t.total_sync_success += 1;
+                t.api_available = true;
+            }
+            Err(_) => {
+                t.total_sync_failures += 1;
+                t.api_available = false;
+            }
+        }
+    }
+    
+    result
+}
+
+/// POST /api/v1/servers — Criar servidor
+async fn execute_register_server(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let url = format!("{}/api/v1/servers", API_BASE_URL);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.post(&url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Servidor registrado: {:?}", body.get("data").and_then(|d| d.get("shortCode"))));
+    Ok(())
+}
+
+/// PATCH /api/v1/servers/:shortCode — Atualizar servidor
+async fn execute_update_server(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.patch(&url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Servidor atualizado: {}", short_code));
+    Ok(())
+}
+
+/// DELETE /api/v1/servers/:shortCode — Remover servidor
+async fn execute_delete_server(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.delete(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Servidor removido: {}", short_code));
+    Ok(())
+}
+
+/// POST /api/v1/servers/:shortCode/sessions — Criar/atualizar sessão
+async fn execute_create_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}/sessions", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.post(&url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Sessão criada: {}", short_code));
+    Ok(())
+}
+
+/// POST /api/v1/servers/:shortCode/heartbeat — Atualizar sessão (via heartbeat com status)
+/// A API Central não tem PATCH /sessions. O heartbeat aceita status e currentPlayers no body.
+async fn execute_update_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.post(&url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Sessão atualizada via heartbeat: {}", short_code));
+    Ok(())
+}
+
+/// DELETE /api/v1/servers/:shortCode/sessions — Encerrar sessão
+async fn execute_delete_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}/sessions", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.delete(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    log_to_file(app, &format!("[SYNC] Sessão encerrada: {}", short_code));
+    Ok(())
+}
+
+/// POST /api/v1/servers/:shortCode/heartbeat — Heartbeat
+async fn execute_heartbeat(_app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let response = client.post(&url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    
+    Ok(())
+}
+
+// ============================================================
+// Motor de Sincronização (SyncEngine)
+// ============================================================
+
+/// Processa a fila de sincronização, executando operações pendentes.
+/// Usa backoff exponencial para retry: 30s, 1min, 2min, 4min, 8min, 16min (max)
+async fn process_sync_queue(
+    app: tauri::AppHandle,
+    telemetry: Arc<Mutex<SyncTelemetry>>,
+) {
+    let queue = load_sync_queue(&app);
+    if queue.operations.is_empty() {
+        return;
+    }
+    
+    log_to_file(&app, &format!("[SYNC] Processando {} operações pendentes...", queue.operations.len()));
+    
+    let mut remaining = Vec::new();
+    
+    for op in queue.operations {
+        // Calcular backoff: 30s * 2^retry_count, max 16 min
+        let backoff_seconds = std::cmp::min(30 * (2u64.pow(op.retry_count)), 960); // 16 min
+        let should_retry = match &op.last_attempt {
+            Some(last) => {
+                if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last) {
+                    let elapsed = chrono::Utc::now().signed_duration_since(last_time);
+                    elapsed.num_seconds() >= backoff_seconds as i64
+                } else {
+                    true
+                }
+            }
+            None => true, // Nunca tentou, pode tentar agora
+        };
+        
+        if !should_retry {
+            remaining.push(op);
+            continue;
+        }
+        
+        // Máximo de 5 tentativas
+        if op.retry_count >= 5 {
+            log_to_file(&app, &format!("[SYNC] Operação {} excedeu 5 tentativas. Removendo da fila.", op.id));
+            {
+                let mut t = telemetry.lock().unwrap();
+                t.failed_operations += 1;
+            }
+            continue;
+        }
+        
+        // Tentar executar
+        match execute_sync_operation(&app, &op, &telemetry).await {
+            Ok(_) => {
+                log_to_file(&app, &format!("[SYNC] Operação {} executada com sucesso.", op.id));
+                // Não adiciona a `remaining` — foi removida com sucesso
+            }
+            Err(e) => {
+                log_to_file(&app, &format!("[SYNC] Operação {} falhou (tentativa {}/5): {}", op.id, op.retry_count + 1, e));
+                let mut updated_op = op.clone();
+                updated_op.retry_count += 1;
+                updated_op.last_attempt = Some(chrono::Utc::now().to_rfc3339());
+                
+                {
+                    let mut t = telemetry.lock().unwrap();
+                    t.total_retries += 1;
+                }
+                
+                remaining.push(updated_op);
+            }
+        }
+    }
+    
+    // Salvar operações restantes
+    let new_queue = SyncQueueState { operations: remaining };
+    save_sync_queue(&app, &new_queue);
+    
+    // Atualizar telemetria
+    {
+        let mut t = telemetry.lock().unwrap();
+        t.pending_operations = new_queue.operations.len();
+    }
+    
+    // Limpar operações expiradas
+    cleanup_expired_operations(&app);
+}
+
+// ============================================================
+// Comandos Tauri da Camada de Sincronização
+// ============================================================
+
+/// Registra um servidor na API Central (via fila de sincronização).
+/// Enfileira a operação e tenta executar imediatamente.
+#[tauri::command]
+async fn sync_register_server(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    name: String,
+    version: String,
+    server_type: String,
+    description: String,
+    short_code: Option<String>,
+    owner: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_register_server: name={}, version={}", name, version));
+    
+    let payload = serde_json::json!({
+        "name": name,
+        "version": version,
+        "serverType": server_type,
+        "description": description,
+        "shortCode": short_code,
+        "owner": owner,
+    });
+    
+    let op_id = enqueue_operation(&app, SyncOperationType::RegisterServer, payload.clone());
+    log_to_file(&app, &format!("[SYNC] Operação enfileirada: {}", op_id));
+    
+    // Tentar executar imediatamente
+    let op = SyncOperation {
+        id: op_id.clone(),
+        op_type: SyncOperationType::RegisterServer,
+        payload: payload.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        retry_count: 0,
+        last_attempt: None,
+    };
+    
+    match execute_sync_operation(&app, &op, &telemetry).await {
+        Ok(_) => {
+            remove_operation(&app, &op_id);
+            log_to_file(&app, "[SYNC] Servidor registrado com sucesso!");
+            Ok(serde_json::json!({
+                "success": true,
+                "code": "SERVER_CREATED",
+                "message": "Servidor registrado com sucesso.",
+                "data": payload,
+            }))
+        }
+        Err(e) => {
+            log_to_file(&app, &format!("[SYNC] Falha ao registrar (ficou na fila): {}", e));
+            Ok(serde_json::json!({
+                "success": true,
+                "code": "QUEUED",
+                "message": "Operação enfileirada para sincronização.",
+                "data": {
+                    "operationId": op_id,
+                    "pending": true,
+                },
+            }))
+        }
+    }
+}
+
+/// Atualiza metadados do servidor na API Central.
+#[tauri::command]
+async fn sync_update_server(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+    name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_update_server: short_code={}", short_code));
+    
+    let mut payload = serde_json::json!({
+        "shortCode": short_code,
+    });
+    
+    if let Some(n) = name { payload["name"] = serde_json::json!(n); }
+    if let Some(v) = version { payload["version"] = serde_json::json!(v); }
+    if let Some(d) = description { payload["description"] = serde_json::json!(d); }
+    
+    let op_id = enqueue_operation(&app, SyncOperationType::UpdateServer, payload);
+    
+    // Tentar executar imediatamente
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "SERVER_UPDATED", "message": "Servidor atualizado." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Operação enfileirada: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+    }
+}
+
+/// Remove um servidor da API Central.
+#[tauri::command]
+async fn sync_delete_server(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_delete_server: short_code={}", short_code));
+    
+    let payload = serde_json::json!({ "shortCode": short_code });
+    let op_id = enqueue_operation(&app, SyncOperationType::DeleteServer, payload);
+    
+    // Tentar executar imediatamente
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "SERVER_DELETED", "message": "Servidor removido." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Operação enfileirada: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+    }
+}
+
+/// Cria/atualiza uma sessão de jogo na API Central.
+#[tauri::command]
+async fn sync_create_session(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+    provider: String,
+    host_ip: String,
+    port: u16,
+    status: String,
+    current_players: Option<u16>,
+    max_players: Option<u16>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_create_session: short_code={}, provider={}", short_code, provider));
+    
+    let payload = serde_json::json!({
+        "shortCode": short_code,
+        "provider": provider,
+        "hostIp": host_ip,
+        "port": port,
+        "status": status,
+        "currentPlayers": current_players,
+        "maxPlayers": max_players,
+    });
+    
+    let op_id = enqueue_operation(&app, SyncOperationType::CreateSession, payload);
+    
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "SESSION_CREATED", "message": "Sessão criada." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Operação enfileirada: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+    }
+}
+
+/// Atualiza o status de uma sessão na API Central.
+#[tauri::command]
+async fn sync_update_session(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+    status: String,
+    current_players: Option<u16>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_update_session: short_code={}, status={}", short_code, status));
+    
+    let payload = serde_json::json!({
+        "shortCode": short_code,
+        "status": status,
+        "currentPlayers": current_players,
+    });
+    
+    let op_id = enqueue_operation(&app, SyncOperationType::UpdateSession, payload);
+    
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "SESSION_UPDATED", "message": "Sessão atualizada." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Operação enfileirada: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+    }
+}
+
+/// Encerra uma sessão na API Central.
+#[tauri::command]
+async fn sync_delete_session(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_delete_session: short_code={}", short_code));
+    
+    let payload = serde_json::json!({ "shortCode": short_code });
+    let op_id = enqueue_operation(&app, SyncOperationType::DeleteSession, payload);
+    
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "SESSION_DELETED", "message": "Sessão encerrada." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Operação enfileirada: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+    }
+}
+
+/// Envia heartbeat para a API Central (via fila de sincronização).
+#[tauri::command]
+async fn sync_send_heartbeat(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+    short_code: String,
+    status: String,
+    current_players: Option<u16>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] sync_send_heartbeat: short_code={}, status={}", short_code, status));
+    
+    let payload = serde_json::json!({
+        "shortCode": short_code,
+        "status": status,
+        "currentPlayers": current_players,
+    });
+    
+    let op_id = enqueue_operation(&app, SyncOperationType::Heartbeat, payload);
+    
+    let queue = load_sync_queue(&app);
+    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
+        match execute_sync_operation(&app, op, &telemetry).await {
+            Ok(_) => {
+                remove_operation(&app, &op_id);
+                Ok(serde_json::json!({ "success": true, "code": "HEARTBEAT_RECEIVED", "message": "Heartbeat enviado." }))
+            }
+            Err(e) => {
+                Ok(serde_json::json!({
+                    "success": true, "code": "QUEUED",
+                    "message": format!("Heartbeat enfileirado: {}", e),
+                    "data": { "operationId": op_id, "pending": true },
+                }))
+            }
+        }
+    } else {
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Heartbeat enfileirado." }))
+    }
+}
+
+/// Retorna o estado atual da fila de sincronização.
+#[tauri::command]
+async fn get_sync_queue_status(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+) -> Result<serde_json::Value, String> {
+    let queue = load_sync_queue(&app);
+    let t = telemetry.lock().unwrap();
+    
+    Ok(serde_json::json!({
+        "pendingOperations": queue.operations.len(),
+        "operations": queue.operations.iter().map(|op| {
+            serde_json::json!({
+                "id": op.id,
+                "type": format!("{:?}", op.op_type),
+                "retryCount": op.retry_count,
+                "createdAt": op.created_at,
+                "lastAttempt": op.last_attempt,
+            })
+        }).collect::<Vec<_>>(),
+        "telemetry": {
+            "totalSyncAttempts": t.total_sync_attempts,
+            "totalSyncSuccess": t.total_sync_success,
+            "totalSyncFailures": t.total_sync_failures,
+            "totalRetries": t.total_retries,
+            "pendingOperations": t.pending_operations,
+            "failedOperations": t.failed_operations,
+            "avgResponseTimeMs": t.avg_response_time_ms,
+            "lastSyncTime": t.last_sync_time,
+            "apiAvailable": t.api_available,
+        },
+    }))
+}
+
+/// Força o processamento imediato da fila de sincronização.
+#[tauri::command]
+async fn force_sync_now(
+    app: tauri::AppHandle,
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, "[SYNC] force_sync_now: Processando fila imediatamente...");
+    process_sync_queue(app.clone(), telemetry.inner().clone()).await;
+    
+    let queue = load_sync_queue(&app);
+    Ok(serde_json::json!({
+        "success": true,
+        "remainingOperations": queue.operations.len(),
+    }))
+}
+
+/// Retorna as métricas de telemetria operacional.
+#[tauri::command]
+async fn get_sync_telemetry(
+    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
+) -> Result<serde_json::Value, String> {
+    let t = telemetry.lock().unwrap();
+    Ok(serde_json::json!({
+        "totalSyncAttempts": t.total_sync_attempts,
+        "totalSyncSuccess": t.total_sync_success,
+        "totalSyncFailures": t.total_sync_failures,
+        "totalRetries": t.total_retries,
+        "pendingOperations": t.pending_operations,
+        "failedOperations": t.failed_operations,
+        "avgResponseTimeMs": t.avg_response_time_ms,
+        "lastSyncTime": t.last_sync_time,
+        "apiAvailable": t.api_available,
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  let registry = Arc::new(ServerRegistry {
+      entries: Mutex::new(BTreeMap::new()),
+  });
+  
+  let telemetry = Arc::new(Mutex::new(SyncTelemetry::default()));
+  
+  // Iniciar servidor HTTP de registro em background
+  start_registry_http_server(registry.clone());
+  
+  // Iniciar motor de sincronização periódico (a cada 30 segundos)
+  let telemetry_clone = telemetry.clone();
+  
   tauri::Builder::default()
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_os::init())
@@ -976,7 +2135,53 @@ pub fn run() {
     .plugin(tauri_plugin_http::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_process::init())
+    .setup(move |app| {
+      if cfg!(debug_assertions) {
+        app.handle().plugin(
+          tauri_plugin_log::Builder::default()
+            .level(log::LevelFilter::Info)
+            .build(),
+        )?;
+      }
+      
+      // Limpar operações obsoletas da fila (que usavam PATCH /sessions, agora inexistente)
+      // e operações com mais de 5 tentativas para não poluir a fila com lixo
+      {
+        let mut queue = load_sync_queue(app.handle());
+        let before = queue.operations.len();
+        queue.operations.retain(|op| {
+          // Remover UpdateSession antigos (que tentavam PATCH /sessions - endpoint removido)
+          if op.op_type == SyncOperationType::UpdateSession && op.retry_count >= 1 {
+            return false;
+          }
+          // Remover Heartbeat com retry_count >= 3 (provavelmente sessão não existe)
+          if op.op_type == SyncOperationType::Heartbeat && op.retry_count >= 3 {
+            return false;
+          }
+          true
+        });
+        let removed = before - queue.operations.len();
+        if removed > 0 {
+          log_to_file(app.handle(), &format!("[SYNC] Cleanup: {} operações obsoletas removidas da fila.", removed));
+        }
+        save_sync_queue(app.handle(), &queue);
+      }
+      
+      // Iniciar o motor de sincronização periódico (a cada 30 segundos)
+      let app_handle = app.handle().clone();
+      let telemetry = telemetry_clone.clone();
+      tauri::async_runtime::spawn(async move {
+        loop {
+          tokio::time::sleep(Duration::from_secs(30)).await;
+          process_sync_queue(app_handle.clone(), telemetry.clone()).await;
+        }
+      });
+      
+      Ok(())
+    })
     .manage(AppState::default())
+    .manage(registry)
+    .manage(telemetry)
     .invoke_handler(tauri::generate_handler![
        start_network_node,
        stop_network_node,
@@ -987,17 +2192,21 @@ pub fn run() {
        get_total_memory,
        read_server_properties,
        write_server_properties,
+       update_server_registry,
+       remove_server_registry,
+       discover_server,
+       // Comandos de sincronização com API Central
+       sync_register_server,
+       sync_update_server,
+       sync_delete_server,
+       sync_create_session,
+       sync_update_session,
+       sync_delete_session,
+       sync_send_heartbeat,
+       get_sync_queue_status,
+       force_sync_now,
+       get_sync_telemetry,
     ])
-    .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
-      Ok(())
-    })
     .on_window_event(|window, event| {
       // Interceptar CloseRequested para fazer shutdown gracioso:
       // 1. Parar servidor Minecraft (enviar comando stop)

@@ -1,0 +1,19 @@
+{
+  "name": "cubeforge-api",
+  "version": "1.0.0",
+  "description": "CubeForge Central API - Server discovery and session management",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "nanoid": "^5.0.9"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260624.1",
+    "vitest": "^1.6.0",
+    "wrangler": "^3.60.0"
+  }
+}

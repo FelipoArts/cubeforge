@@ -3,7 +3,7 @@ import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { exists, mkdir } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 
-export type JREVersion = 8 | 17 | 21;
+export type JREVersion = 8 | 17 | 21 | 25;
 
 export interface DownloadProgress {
   status: string;

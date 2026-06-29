@@ -1,17 +1,109 @@
 @import "tailwindcss";
 
+/* ============================================================
+   Tema Claro (padrão)
+   ============================================================ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #F8FAFC;
+  --foreground: #0F172A;
+  --card-bg: #FFFFFF;
+  --card-border: #E2E8F0;
+  --card-shadow: rgba(0, 0, 0, 0.04);
+  --header-bg: rgba(255, 255, 255, 0.8);
+  --header-border: rgba(226, 232, 240, 0.6);
+  --sidebar-bg: #FFFFFF;
+  --sidebar-border: #E2E8F0;
+  --input-bg: #FFFFFF;
+  --input-border: #E2E8F0;
+  --muted-bg: #F1F5F9;
+  --muted-border: #E2E8F0;
+  --text-primary: #0F172A;
+  --text-secondary: #64748B;
+  --text-muted: #94A3B8;
+  --accent-bg: #EEF2FF;
+  --accent-border: #E0E7FF;
+  --success-bg: #ECFDF5;
+  --success-border: #D1FAE5;
+  --warning-bg: #FFFBEB;
+  --warning-border: #FEF3C7;
+  --danger-bg: #FFF1F2;
+  --danger-border: #FFE4E6;
+  --console-bg: #0F172A;
+  --console-border: rgba(255, 255, 255, 0.1);
+  --overlay-bg: rgba(15, 23, 42, 0.45);
+  --shadow-color: rgba(0, 0, 0, 0.08);
+  --shadow-color-lg: rgba(0, 0, 0, 0.1);
+  --shadow-color-xl: rgba(0, 0, 0, 0.12);
+  --shadow-color-2xl: rgba(0, 0, 0, 0.15);
+}
+
+/* ============================================================
+   Tema Escuro (default)
+   ============================================================ */
+.dark {
+  --background: #0B1120;
+  --foreground: #E2E8F0;
+  --card-bg: #131C31;
+  --card-border: #1E293B;
+  --card-shadow: rgba(0, 0, 0, 0.3);
+  --header-bg: rgba(15, 23, 42, 0.85);
+  --header-border: rgba(30, 41, 59, 0.8);
+  --sidebar-bg: #131C31;
+  --sidebar-border: #1E293B;
+  --input-bg: #1E293B;
+  --input-border: #334155;
+  --muted-bg: #1E293B;
+  --muted-border: #334155;
+  --text-primary: #E2E8F0;
+  --text-secondary: #94A3B8;
+  --text-muted: #64748B;
+  --accent-bg: rgba(99, 102, 241, 0.1);
+  --accent-border: rgba(99, 102, 241, 0.2);
+  --success-bg: rgba(16, 185, 129, 0.1);
+  --success-border: rgba(16, 185, 129, 0.2);
+  --warning-bg: rgba(245, 158, 11, 0.1);
+  --warning-border: rgba(245, 158, 11, 0.2);
+  --danger-bg: rgba(244, 63, 94, 0.1);
+  --danger-border: rgba(244, 63, 94, 0.2);
+  --console-bg: #050A15;
+  --console-border: rgba(255, 255, 255, 0.05);
+  --overlay-bg: rgba(0, 0, 0, 0.6);
+  --shadow-color: rgba(0, 0, 0, 0.4);
+  --shadow-color-lg: rgba(0, 0, 0, 0.5);
+  --shadow-color-xl: rgba(0, 0, 0, 0.55);
+  --shadow-color-2xl: rgba(0, 0, 0, 0.6);
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Custom scrollbar for console logs and server list */
+/* ============================================================
+   Transições suaves para elementos do tema
+   ============================================================ */
+*,
+*::before,
+*::after {
+  transition: background-color 0.3s ease,
+              border-color 0.3s ease,
+              box-shadow 0.3s ease,
+              color 0.2s ease;
+}
+
+/* Excluir animações e transições de elementos que não devem ter transição de tema */
+.no-theme-transition,
+.no-theme-transition *,
+.no-theme-transition::before,
+.no-theme-transition::after {
+  transition: none !important;
+}
+
+/* ============================================================
+   Custom scrollbar
+   ============================================================ */
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
@@ -39,4 +131,48 @@ body {
   .text-balance {
     text-wrap: balance;
   }
+  
+  /* ============================================================
+     Classes utilitárias de tema (usam variáveis CSS)
+     ============================================================ */
+  
+  /* Backgrounds */
+  .bg-theme-base { background-color: var(--background); }
+  .bg-theme-card { background-color: var(--card-bg); }
+  .bg-theme-header { background-color: var(--header-bg); }
+  .bg-theme-sidebar { background-color: var(--sidebar-bg); }
+  .bg-theme-input { background-color: var(--input-bg); }
+  .bg-theme-muted { background-color: var(--muted-bg); }
+  .bg-theme-accent { background-color: var(--accent-bg); }
+  .bg-theme-success { background-color: var(--success-bg); }
+  .bg-theme-warning { background-color: var(--warning-bg); }
+  .bg-theme-danger { background-color: var(--danger-bg); }
+  .bg-theme-console { background-color: var(--console-bg); }
+  .bg-theme-overlay { background-color: var(--overlay-bg); }
+  
+  /* Text colors */
+  .text-theme-primary { color: var(--text-primary); }
+  .text-theme-secondary { color: var(--text-secondary); }
+  .text-theme-muted { color: var(--text-muted); }
+  
+  /* Border colors */
+  .border-theme-card { border-color: var(--card-border); }
+  .border-theme-header { border-color: var(--header-border); }
+  .border-theme-sidebar { border-color: var(--sidebar-border); }
+  .border-theme-input { border-color: var(--input-border); }
+  .border-theme-muted { border-color: var(--muted-border); }
+  .border-theme-accent { border-color: var(--accent-border); }
+  .border-theme-success { border-color: var(--success-border); }
+  .border-theme-warning { border-color: var(--warning-border); }
+  .border-theme-danger { border-color: var(--danger-border); }
+  .border-theme-console { border-color: var(--console-border); }
+  
+  /* Shadows */
+  .shadow-theme-card { box-shadow: 0 1px 3px var(--card-shadow); }
+  .shadow-theme { box-shadow: 0 1px 3px var(--shadow-color); }
+  .shadow-theme-md { box-shadow: 0 4px 6px -1px var(--shadow-color), 0 2px 4px -2px var(--shadow-color); }
+  .shadow-theme-lg { box-shadow: 0 10px 15px -3px var(--shadow-color-lg), 0 4px 6px -4px var(--shadow-color-lg); }
+  .shadow-theme-xl { box-shadow: 0 20px 25px -5px var(--shadow-color-xl), 0 8px 10px -6px var(--shadow-color-xl); }
+  .shadow-theme-2xl { box-shadow: 0 25px 50px -12px var(--shadow-color-2xl); }
+  .shadow-theme-shadow { box-shadow: 0 4px 6px -1px var(--shadow-color), 0 2px 4px -2px var(--shadow-color); }
 }

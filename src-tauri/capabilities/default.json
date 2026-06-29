@@ -102,7 +102,8 @@
         { "url": "https://api.cubeforge.dev" },
         { "url": "https://launchermeta.mojang.com" },
         { "url": "https://piston-meta.mojang.net" },
-        { "url": "https://piston-meta.mojang.com" }
+        { "url": "https://piston-meta.mojang.com" },
+        { "url": "https://cubeforge-api.cubeforge.workers.dev" }
       ]
     },
     "dialog:default"

@@ -8,9 +8,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"tailscale.com/tsnet"
 )
@@ -97,6 +100,9 @@ func startHostMode(ctx context.Context, s *tsnet.Server, cfg Config) {
 
 	fmt.Printf("{\"info\": \"Host listening on :25565\"}\n")
 
+	// Start HTTP API server on Tailscale port 25566
+	go startHTTPServer(ctx, s)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -132,6 +138,137 @@ func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config) {
 		}
 		go handleProxy(conn, targetConn)
 	}
+}
+
+// startHTTPServer inicia um servidor HTTP na Tailscale (porta 25566)
+// que serve como API pública para descoberta de servidores.
+// Ele faz proxy das requisições para o servidor HTTP interno do Rust (127.0.0.1:25567).
+func startHTTPServer(ctx context.Context, s *tsnet.Server) {
+	log.Printf("[HTTP] Tentando escutar em tsnet::25566...")
+	ln, err := s.Listen("tcp", ":25566")
+	if err != nil {
+		log.Printf("[HTTP] ERRO ao escutar em tsnet:25566: %v", err)
+		return
+	}
+	defer ln.Close()
+
+	log.Printf("[HTTP] Listener criado com sucesso em tsnet:25566")
+	fmt.Printf("{\"info\": \"HTTP API listening on :25566\"}\n")
+
+	mux := http.NewServeMux()
+	
+	// GET /resolve?code=XXXXXX — Resolve um código de convite para metadados do servidor
+	// Faz proxy para o Rust em 127.0.0.1:25567/registry/resolve?code={shortCode}
+	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[HTTP] Requisição recebida: %s %s de %s", r.Method, r.URL.String(), r.RemoteAddr)
+		
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		
+		code := r.URL.Query().Get("code")
+		log.Printf("[HTTP] Código recebido: '%s'", code)
+		if code == "" {
+			http.Error(w, `{"error":"code parameter is required"}`, http.StatusBadRequest)
+			return
+		}
+		
+		// Extrair o shortCode do código de convite (formato: CF-{shortCode6}{ipHex8})
+		shortCode := extractShortCode(code)
+		log.Printf("[HTTP] ShortCode extraído: '%s'", shortCode)
+		if shortCode == "" {
+			http.Error(w, `{"error":"invalid invite code format"}`, http.StatusBadRequest)
+			return
+		}
+		
+		// Fazer proxy para o Rust
+		log.Printf("[HTTP] Fazendo proxy para Rust: http://127.0.0.1:25567/registry/resolve?code=%s", shortCode)
+		proxyToRust(w, fmt.Sprintf("http://127.0.0.1:25567/registry/resolve?code=%s", shortCode))
+	})
+
+	// GET /status — Health check
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	server := &http.Server{
+		Handler: mux,
+		// Timeouts para evitar conexões penduradas
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// Rodar servidor HTTP até o contexto ser cancelado
+	go func() {
+		<-ctx.Done()
+		server.Close()
+	}()
+
+	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Printf("HTTP server error: %v", err)
+	}
+}
+
+// extractShortCode extrai o shortCode de 6 caracteres de um código de convite.
+// Aceita dois formatos:
+// 1. Código completo: CF-{shortCode6}{ipHex8} (ex: CF-X7K9M26454150A)
+// 2. ShortCode puro: {shortCode6} (ex: X7K9M2)
+func extractShortCode(code string) string {
+	clean := strings.TrimSpace(code)
+	clean = strings.ToUpper(clean)
+	
+	// Formato 2: ShortCode puro (6 caracteres, sem "CF-")
+	// Ex: "LYW4FZ" ou "X7K9M2"
+	if len(clean) == 6 && !strings.HasPrefix(clean, "CF-") {
+		return clean
+	}
+	
+	// Formato 1: Código de convite completo com "CF-"
+	if !strings.HasPrefix(clean, "CF-") {
+		return ""
+	}
+	
+	payload := clean[3:] // Remove "CF-"
+	
+	// Formato novo: CF-{shortCode6}{ipHex8} = 14 chars
+	if len(payload) == 14 {
+		return payload[:6] // shortCode são os primeiros 6 caracteres
+	}
+	
+	// Formato legado: CF-{ipHex8} = 8 chars (sem shortCode)
+	if len(payload) == 8 {
+		return "" // código legado, sem shortCode
+	}
+	
+	return ""
+}
+
+// proxyToRust faz uma requisição HTTP para o servidor interno do Rust e escreve a resposta
+func proxyToRust(w http.ResponseWriter, url string) {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Proxy error: %v", err)
+		http.Error(w, fmt.Sprintf(`{"error":"internal server error: %v"}`, err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	
+	// Copiar headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func proxyConn(conn net.Conn, targetAddr string) {

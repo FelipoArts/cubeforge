@@ -1,0 +1,23 @@
+name = "cubeforge-api"
+main = "src/index.ts"
+compatibility_date = "2024-06-20"
+
+# KV namespace for server registry
+kv_namespaces = [
+  { binding = "CUBEFORGE_REGISTRY", id = "296c93195b224bdba5484f877102c458", preview_id = "server_registry_preview" }
+]
+
+# Environment variables (configurable)
+[vars]
+SERVER_TTL_SECONDS = "14400"
+HEARTBEAT_TIMEOUT_SECONDS = "300"
+HEARTBEAT_EXPIRE_SECONDS = "600"
+SHORT_CODE_LENGTH = "6"
+API_BASE_URL = "https://api.cubeforge.dev"
+
+# CORS configuration
+[env.production]
+vars = { ENVIRONMENT = "production" }
+
+[env.preview]
+vars = { ENVIRONMENT = "preview" }

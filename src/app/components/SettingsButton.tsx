@@ -2,19 +2,23 @@
 
 import React from "react";
 import { Settings } from "lucide-react";
-import { cn } from "../lib/utils";
+import { cn } from "@/lib/utils";
+
+// ============================================================
+// SettingsButton
+// ============================================================
+// Botão de engrenagem para abrir configurações do servidor.
+// ============================================================
 
 interface SettingsButtonProps {
   serverDir: string;
-  setConfigServer: (dir: string) => void;
-  setShowConfigModal: (show: boolean) => void;
+  onConfig: (dir: string) => void;
 }
 
-export default function SettingsButton({ serverDir, setConfigServer, setShowConfigModal }: SettingsButtonProps) {
+export default function SettingsButton({ serverDir, onConfig }: SettingsButtonProps) {
   const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
-    setConfigServer(serverDir);
-    setShowConfigModal(true);
+    onConfig(serverDir);
   }
   return (
     <button

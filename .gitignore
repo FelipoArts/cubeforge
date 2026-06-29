@@ -1,6 +1,8 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# ============================================================
+# CubeForge / Cubicase — .gitignore
+# ============================================================
 
-# dependencies
+# Dependências
 /node_modules
 /.pnp
 .pnp.*
@@ -9,36 +11,47 @@
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
+api/node_modules/
+api/.wrangler/
+api/dist/
 
-# testing
-/coverage
-
-# next.js
+# Build & Geração
 /.next/
 /out/
-
-# production
 /build
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/gen/
+src-tauri/sidecars/**/*.exe
 
-# misc
+# Logs
+*.log
+
+# Testing
+/coverage
+
+# IDE / OS
 .DS_Store
 *.pem
+Thumbs.db
 
-# debug
+# Debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# Environment & Secrets
 .env*
+network_session.json
 
-# vercel
+# Cloudflare (Wrangler)
+.wrangler/
 .vercel
 
-# typescript
+# TypeScript
 *.tsbuildinfo
 next-env.d.ts
 
-# local credentials and network configuration
-network_session.json
+# Planos de arquitetura (documentos internos)
+plans/
