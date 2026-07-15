@@ -65,7 +65,13 @@ export function GuestView({
   const [copied, setCopied] = useState(false);
 
   // Sincronizar servidores locais do host na biblioteca do guest
+  // Adiciona servidores locais novos e remove os que foram deletados
   useEffect(() => {
+    const localShortCodes = new Set(
+      localServers.filter(s => s.shortCode).map(s => s.shortCode!)
+    );
+
+    // Adicionar servidores locais novos que ainda não estão na lista
     for (const server of localServers) {
       if (!server.shortCode) continue;
       const exists = knownServers.find(s => s.shortCode === server.shortCode);
@@ -86,6 +92,15 @@ export function GuestView({
           networkProvider: "tailscale",
         });
       }
+    }
+
+    // Remover servidores "Meu" que foram deletados localmente
+    // (isOwnServer=true mas não existe mais em localServers)
+    const serversToRemove = knownServers.filter(
+      s => s.isOwnServer && !localShortCodes.has(s.shortCode)
+    );
+    for (const s of serversToRemove) {
+      removeKnownServer(s.shortCode);
     }
   }, [localServers]);
 
@@ -427,23 +442,30 @@ export function GuestView({
               {/* Ações do card */}
               <div className="px-5 pb-5 pt-0 flex items-center gap-2">
                 {server.status === "online" ? (
-                  <button
-                    type="button"
-                    onClick={() => handleConnect(server)}
-                    disabled={isConnecting}
-                    className={cn(
-                      "flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer",
-                      connectedShortCode === server.shortCode
-                        ? "bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
-                        : "bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
-                    )}
-                  >
-                    {connectedShortCode === server.shortCode ? (
-                      <><X className="w-3.5 h-3.5" /> Desconectar</>
-                    ) : (
-                      <><Zap className="w-3.5 h-3.5 fill-current" /> Conectar</>
-                    )}
-                  </button>
+                  server.isOwnServer ? (
+                    // Servidor do próprio host: não permite conectar (não pode conectar na própria mesh)
+                    <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
+                      <Zap className="w-3 h-3 text-indigo-400" />
+                      Online
+                    </div>
+                  ) : connectedShortCode === server.shortCode ? (
+                    <button
+                      type="button"
+                      onClick={() => handleDisconnect()}
+                      className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
+                    >
+                      <X className="w-3.5 h-3.5" /> Desconectar
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleConnect(server)}
+                      disabled={isConnecting}
+                      className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
+                    >
+                      <Zap className="w-3.5 h-3.5 fill-current" /> Conectar
+                    </button>
+                  )
                 ) : server.status === "crashed" ? (
                   <div className="flex-1 h-10 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-rose-500">
                     <AlertTriangle className="w-3 h-3" />

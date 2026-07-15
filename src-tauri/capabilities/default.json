@@ -37,53 +37,53 @@
       "identifier": "fs:allow-exists",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+        { "path": "$DOCUMENT/**/*", "recursive": true },
+        { "path": "$DOCUMENT/**", "recursive": false }
       ]
     },
     {
       "identifier": "fs:allow-mkdir",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubicaseServers", "recursive": false }
       ]
     },
     {
       "identifier": "fs:allow-write-file",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubicaseServers", "recursive": false }
       ]
     },
     {
       "identifier": "fs:allow-write-text-file",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubicaseServers", "recursive": false }
       ]
     },
     {
       "identifier": "fs:allow-read-file",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true }
       ]
     },
     {
       "identifier": "fs:allow-read-text-file",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true }
       ]
     },
     {
       "identifier": "fs:allow-read-dir",
       "allow": [
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers", "recursive": false },
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true },
+        { "path": "$DOCUMENT/CubicaseServers", "recursive": false },
         { "path": "$HOME/**/*", "recursive": true }
       ]
     },
@@ -91,7 +91,7 @@
       "identifier": "fs:allow-remove",
       "allow": [
         { "path": "$APPLOCALDATA/**/*", "recursive": true },
-        { "path": "$DOCUMENT/CubeForgeServers/**/*", "recursive": true }
+        { "path": "$DOCUMENT/CubicaseServers/**/*", "recursive": true }
       ]
     },
     "http:default",

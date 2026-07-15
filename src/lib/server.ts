@@ -22,8 +22,10 @@ export interface ServerInfo {
   serverType: string;
   /** Descrição personalizada do servidor */
   description: string;
-  /** Versão do schema do cubeforge-meta.json */
+  /** Versão do schema do cubicase-meta.json */
   schemaVersion: number;
+  /** Indica se o EULA do Minecraft foi aceito (eula=true no eula.txt) */
+  eulaAccepted: boolean;
 }
 
 export interface ServerInstallProgress {
@@ -150,7 +152,7 @@ export function getPopularVersions(): string[] {
 // ============================================================
 
 /**
- * Versão mínima suportada pelo CubeForge.
+ * Versão mínima suportada pelo Cubicase.
  * Tudo abaixo disso é filtrado do manifest.
  */
 const MINIMUM_VERSION = "1.8.9";
@@ -218,7 +220,7 @@ export function searchVersions(manifest: VersionManifest, query: string): string
 // ============================================================
 
 /**
- * Versões de JRE suportadas pelo CubeForge.
+ * Versões de JRE suportadas pelo Cubicase.
  * Atualizar conforme novas versões do Minecraft exigirem Java mais novo.
  */
 export type JREVersion = 8 | 17 | 21 | 25;
@@ -318,7 +320,7 @@ export async function installMinecraftServer(
 ): Promise<void> {
   // --- Caminhos ---
   const docsDir = await documentDir();
-  const serversRoot = await join(docsDir, "CubeForgeServers");
+  const serversRoot = await join(docsDir, "CubicaseServers");
   const serverPath = await join(serversRoot, serverName);
   const jarPath = await join(serverPath, "server.jar");
 
@@ -340,7 +342,7 @@ export async function installMinecraftServer(
   // --- Aceitar EULA automaticamente ---
   onProgress({ status: "Aceitando EULA...", percent: 80 });
   const eulaPath = await join(serverPath, "eula.txt");
-  await writeTextFile(eulaPath, "# Aceito automaticamente pelo CubeForge\neula=true\n");
+  await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
 
   // --- Gerar server.properties ---
   onProgress({ status: "Gerando configurações...", percent: 88 });
@@ -358,7 +360,7 @@ export async function installMinecraftServer(
   ).join('').toUpperCase();
 
   // --- Salvar metadados do servidor ---
-  const metaPath = await join(serverPath, "cubeforge-meta.json");
+  const metaPath = await join(serverPath, "cubicase-meta.json");
   await writeTextFile(metaPath, JSON.stringify({
     schemaVersion: 1,
     uuid,
@@ -372,7 +374,7 @@ export async function installMinecraftServer(
     // Campos preparados para futuras extensões (opcionais)
     iconPath: null,
     tags: [],
-    motd: `Servidor CubeForge - ${serverName}`,
+    motd: `Servidor Cubicase - ${serverName}`,
     lastPlayedAt: null,
   }, null, 2));
 
@@ -381,12 +383,12 @@ export async function installMinecraftServer(
 
 /**
  * Gera o conteúdo do server.properties com configurações adequadas para
- * uso com o CubeForge: offline-mode e porta padrão 25565 local.
+ * uso com o Cubicase: offline-mode e porta padrão 25565 local.
  */
 function generateServerProperties(version: string, _ramGb: number): string {
   return [
-    `# Gerado pelo CubeForge - versao ${version}`,
-    `# Nao altere server-port manualmente; o CubeForge gerencia as portas.`,
+    `# Gerado pelo Cubicase - versao ${version}`,
+    `# Nao altere server-port manualmente; o Cubicase gerencia as portas.`,
     `online-mode=false`,
     `server-port=25565`,
     `max-players=20`,
@@ -395,7 +397,7 @@ function generateServerProperties(version: string, _ramGb: number): string {
     `difficulty=easy`,
     `gamemode=survival`,
     `enable-command-block=false`,
-    `motd=Servidor CubeForge`,
+    `motd=Servidor Cubicase`,
     `spawn-protection=0`,
     `enforce-whitelist=false`,
     `white-list=false`,
@@ -407,11 +409,363 @@ function generateServerProperties(version: string, _ramGb: number): string {
 // ============================================================
 
 /**
+ * Detecta a versão do Minecraft em uma pasta de servidor.
+ * Usa múltiplas estratégias de fallback:
+ * 1. cubicase-meta.json
+ * 2. Comentário no server.properties
+ * 3. Pasta versions/
+ * 4. Nome de arquivos .jar
+ */
+export async function detectServerVersion(serverPath: string): Promise<string | null> {
+  // Estratégia 1: cubicase-meta.json
+  const metaPath = await join(serverPath, "cubicase-meta.json");
+  if (await exists(metaPath)) {
+    try {
+      const metaContent = await readTextFile(metaPath);
+      const meta = JSON.parse(metaContent) as { version?: string };
+      if (meta.version) return meta.version;
+    } catch { /* ignora */ }
+  }
+
+  // Estratégia 2: Comentário no server.properties
+  const propsPath = await join(serverPath, "server.properties");
+  if (await exists(propsPath)) {
+    try {
+      const propsContent = await readTextFile(propsPath);
+      const patterns = [
+        /^#\s*Gerado pelo Cubicase\s*[-–]\s*vers[ãa]o\s+([\d.]+)/mi,
+        /^#\s*Cubicase\s+version\s+([\d.]+)/mi,
+        /^#\s*vers[ãa]o\s+([\d.]+)/mi,
+        /^#.*?(\d+\.\d+(?:\.\d+)?)/m,
+      ];
+      for (const pattern of patterns) {
+        const match = propsContent.match(pattern);
+        if (match) return match[1];
+      }
+    } catch { /* ignora */ }
+  }
+
+  // Estratégia 3: Pasta versions/
+  try {
+    const versionsPath = await join(serverPath, 'versions');
+    if (await exists(versionsPath)) {
+      const versionEntries = await readDir(versionsPath);
+      for (const ve of versionEntries) {
+        if (ve.isDirectory) {
+          const verMatch = ve.name.match(/^\d+\.\d+(?:\.\d+)?$/);
+          if (verMatch) return verMatch[0];
+        }
+      }
+    }
+  } catch { /* ignora */ }
+
+  // Estratégia 4: Nome de arquivos .jar
+  try {
+    const dirEntries = await readDir(serverPath);
+    for (const dirEntry of dirEntries) {
+      if (!dirEntry.isDirectory && dirEntry.name.endsWith('.jar')) {
+        const jarMatch = dirEntry.name.match(/(\d+\.\d+(?:\.\d+)?)/);
+        if (jarMatch) return jarMatch[1];
+      }
+    }
+  } catch { /* ignora */ }
+
+  return null;
+}
+
+/**
+ * Detecta o tipo do servidor Minecraft baseado nos arquivos presentes.
+ */
+export async function detectServerType(serverPath: string): Promise<string> {
+  // Verificar presença de loaders/modloaders específicos
+  const markers: [string, string][] = [
+    ['forge', 'forge-*.jar'],
+    ['fabric-server-launch.jar', 'fabric'],
+    ['paper-*.jar', 'paper'],
+    ['purpur-*.jar', 'purpur'],
+    ['spigot-*.jar', 'spigot'],
+    ['bukkit-*.jar', 'bukkit'],
+  ];
+
+  try {
+    const entries = await readDir(serverPath);
+    const fileNames = entries.map(e => e.name.toLowerCase());
+
+    // Papel/Pufferfish/Purpur/Spigot/Bukkit (baseados em Paper)
+    if (fileNames.some(n => n.startsWith('purpur-'))) return 'purpur';
+    if (fileNames.some(n => n.startsWith('paper-'))) return 'paper';
+    if (fileNames.some(n => n.startsWith('spigot-'))) return 'spigot';
+    if (fileNames.some(n => n.startsWith('bukkit-'))) return 'bukkit';
+
+    // Fabric
+    if (fileNames.some(n => n.startsWith('fabric-server-launch'))) return 'fabric';
+
+    // Forge (pela pasta mods ou pelo jar)
+    if (await exists(await join(serverPath, 'mods'))) {
+      const modsDir = await readDir(await join(serverPath, 'mods'));
+      if (modsDir.some(e => e.name.toLowerCase().includes('forge'))) return 'forge';
+    }
+    if (fileNames.some(n => n.startsWith('forge-'))) return 'forge';
+  } catch { /* ignora */ }
+
+  return 'vanilla';
+}
+
+/**
+ * Valida se uma pasta contém um servidor Minecraft válido.
+ * Verifica a presença de server.jar e server.properties.
+ */
+export async function isValidServerFolder(path: string): Promise<boolean> {
+  if (!(await exists(path))) return false;
+  const jarPath = await join(path, 'server.jar');
+  if (!(await exists(jarPath))) return false;
+  return true;
+}
+
+// ============================================================
+// Utilitários para EULA do Minecraft
+// ============================================================
+
+/**
+ * Verifica se o EULA do Minecraft já foi aceito em uma pasta de servidor.
+ * Lê o arquivo eula.txt e procura por "eula=true" (case-insensitive).
+ *
+ * @param serverPath Caminho absoluto da pasta do servidor
+ * @returns true se eula=true foi encontrado, false caso contrário
+ */
+export async function checkEulaAccepted(serverPath: string): Promise<boolean> {
+  const eulaPath = await join(serverPath, "eula.txt");
+  if (!(await exists(eulaPath))) return false;
+
+  try {
+    const content = await readTextFile(eulaPath);
+    // Procura por "eula=true" em qualquer linha (ignorando comentários)
+    const lines = content.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Pular comentários e linhas vazias
+      if (trimmed.startsWith("#") || trimmed.length === 0) continue;
+      // Verificar se a linha contém eula=true (case-insensitive)
+      if (/^eula\s*=\s*true\s*$/i.test(trimmed)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Aceita o EULA do Minecraft escrevendo "eula=true" no eula.txt.
+ * Se o arquivo já existir, atualiza a linha eula=false → eula=true.
+ * Se não existir, cria o arquivo com o conteúdo adequado.
+ *
+ * @param serverPath Caminho absoluto da pasta do servidor
+ */
+export async function acceptEula(serverPath: string): Promise<void> {
+  const eulaPath = await join(serverPath, "eula.txt");
+
+  if (await exists(eulaPath)) {
+    try {
+      const content = await readTextFile(eulaPath);
+      const lines = content.split(/\r?\n/);
+      let modified = false;
+
+      const newLines = lines.map(line => {
+        const trimmed = line.trim();
+        // Se a linha já for eula=true, não precisa modificar
+        if (/^eula\s*=\s*true\s*$/i.test(trimmed)) return line;
+        // Se for eula=false, trocar para true
+        if (/^eula\s*=\s*false\s*$/i.test(trimmed)) {
+          modified = true;
+          return line.replace(/eula\s*=\s*false/i, "eula=true");
+        }
+        return line;
+      });
+
+      if (modified) {
+        await writeTextFile(eulaPath, newLines.join("\n"));
+      }
+      // Se não encontrou nenhuma linha eula=, adiciona no final
+      if (!modified && !lines.some(l => /^eula\s*=\s*true\s*$/i.test(l.trim()))) {
+        await writeTextFile(eulaPath, content.trimEnd() + "\n# Aceito automaticamente pelo Cubicase\neula=true\n");
+      }
+    } catch {
+      // Se falhou ler, sobrescreve
+      await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
+    }
+  } else {
+    // Arquivo não existe: criar
+    await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
+  }
+}
+
+/**
+ * Importa um servidor Minecraft de uma pasta existente.
+ *
+ * 1. Valida que a pasta tem server.jar
+ * 2. Detecta a versão automaticamente (várias estratégias)
+ * 3. Detecta o tipo (vanilla, forge, fabric, paper, etc.)
+ * 4. Verifica/aceita a EULA automaticamente (se ainda não aceita)
+ * 5. Cria/atualiza cubicase-meta.json com UUID e shortCode
+ * 6. Retorna o ServerInfo completo
+ */
+export async function importExistingServer(path: string): Promise<ServerInfo> {
+  // Validar
+  if (!(await isValidServerFolder(path))) {
+    throw new Error("A pasta selecionada não contém um servidor Minecraft válido (server.jar não encontrado).");
+  }
+
+  // Extrair nome da pasta
+  const name = path.split('\\').pop()?.split('/').pop() || 'Servidor Importado';
+
+  // Detectar versão
+  const version = await detectServerVersion(path);
+
+  // Detectar tipo
+  const serverType = await detectServerType(path);
+
+  // Verificar e aceitar EULA automaticamente
+  const eulaAccepted = await checkEulaAccepted(path);
+  if (!eulaAccepted) {
+    await acceptEula(path);
+  }
+
+  // Ler ou criar metadados
+  const metaPath = await join(path, "cubicase-meta.json");
+  let uuid: string | null = null;
+  let shortCode: string | null = null;
+  let description = "";
+  let schemaVersion = 1;
+
+  if (await exists(metaPath)) {
+    try {
+      const metaContent = await readTextFile(metaPath);
+      const meta = JSON.parse(metaContent) as {
+        uuid?: string;
+        shortCode?: string;
+        description?: string;
+        schemaVersion?: number;
+      };
+      uuid = meta.uuid ?? null;
+      shortCode = meta.shortCode ?? null;
+      description = meta.description ?? "";
+      schemaVersion = meta.schemaVersion ?? 1;
+    } catch { /* ignora */ }
+  }
+
+  // Gerar UUID e shortCode se não existirem
+  if (!uuid) {
+    uuid = crypto.randomUUID();
+  }
+  if (!shortCode) {
+    shortCode = Array.from({ length: 6 }, () =>
+      Math.floor(Math.random() * 36).toString(36)
+    ).join('').toUpperCase();
+  }
+
+  // Salvar/atualizar metadados
+  const meta = {
+    schemaVersion: 2,
+    uuid,
+    shortCode,
+    name,
+    version,
+    serverType,
+    description,
+    createdAt: new Date().toISOString(),
+    tags: [],
+    imported: true,
+    originalPath: path,
+  };
+  await writeTextFile(metaPath, JSON.stringify(meta, null, 2));
+
+  return {
+    name,
+    path,
+    version,
+    uuid,
+    shortCode,
+    serverType,
+    description,
+    schemaVersion: 2,
+    eulaAccepted: true,
+  };
+}
+
+/**
+ * Escaneia uma única pasta de servidor (qualquer local) e retorna ServerInfo.
+ * Útil para recarregar servidores importados sem recriar metadados.
+ * Não modifica a pasta.
+ */
+export async function scanExternalServer(serverPath: string): Promise<ServerInfo | null> {
+  if (!(await exists(serverPath))) return null;
+
+  const jarPath = await join(serverPath, "server.jar");
+  if (!(await exists(jarPath))) return null;
+
+  const name = serverPath.split('\\').pop()?.split('/').pop() || 'Servidor';
+
+  // Ler metadados
+  let version: string | null = null;
+  let uuid: string | null = null;
+  let shortCode: string | null = null;
+  let serverType = "vanilla";
+  let description = "";
+  let schemaVersion = 1;
+
+  const metaPath = await join(serverPath, "cubicase-meta.json");
+  if (await exists(metaPath)) {
+    try {
+      const metaContent = await readTextFile(metaPath);
+      const meta = JSON.parse(metaContent) as {
+        version?: string;
+        uuid?: string;
+        shortCode?: string;
+        serverType?: string;
+        description?: string;
+        schemaVersion?: number;
+      };
+      version = meta.version ?? null;
+      uuid = meta.uuid ?? null;
+      shortCode = meta.shortCode ?? null;
+      serverType = meta.serverType ?? "vanilla";
+      description = meta.description ?? "";
+      schemaVersion = meta.schemaVersion ?? 1;
+    } catch { /* ignora */ }
+  }
+
+  // Detectar versão se não encontrada nos metadados
+  if (!version) {
+    version = await detectServerVersion(serverPath);
+  }
+
+  // Detectar tipo se não encontrado nos metadados
+  if (!serverType || serverType === "vanilla") {
+    serverType = await detectServerType(serverPath);
+  }
+
+  // Verificar status do EULA
+  const eulaAccepted = await checkEulaAccepted(serverPath);
+
+  return {
+    name,
+    path: serverPath,
+    version,
+    uuid,
+    shortCode,
+    serverType,
+    description,
+    schemaVersion,
+    eulaAccepted,
+  };
+}
+
+/**
  * Varre a pasta de servidores e retorna a lista de servidores instalados.
  */
 export async function listLocalServers(): Promise<ServerInfo[]> {
   const docsDir = await documentDir();
-  const serversRoot = await join(docsDir, "CubeForgeServers");
+  const serversRoot = await join(docsDir, "CubicaseServers");
 
   if (!(await exists(serversRoot))) return [];
 
@@ -426,14 +780,14 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
     // Só inclui se tiver o server.jar (instalação completa)
     if (!(await exists(jarPath))) continue;
 
-    // Lê os metadados do CubeForge (cubeforge-meta.json)
+    // Lê os metadados do Cubicase (cubicase-meta.json)
     let version: string | null = null;
     let uuid: string | null = null;
     let shortCode: string | null = null;
     let serverType = "vanilla";
     let description = "";
     let schemaVersion = 1;
-    const metaPath = await join(serverPath, "cubeforge-meta.json");
+    const metaPath = await join(serverPath, "cubicase-meta.json");
     if (await exists(metaPath)) {
       try {
         const metaContent = await readTextFile(metaPath);
@@ -460,10 +814,9 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
       if (await exists(propsPath)) {
         try {
           const propsContent = await readTextFile(propsPath);
-          // Tenta vários padrões de comentário (com ou sem acento, maiúsculo/minúsculo)
           const patterns = [
-            /^#\s*Gerado pelo CubeForge\s*[-–]\s*vers[ãa]o\s+([\d.]+)/mi,
-            /^#\s*CubeForge\s+version\s+([\d.]+)/mi,
+            /^#\s*Gerado pelo Cubicase\s*[-–]\s*vers[ãa]o\s+([\d.]+)/mi,
+            /^#\s*Cubicase\s+version\s+([\d.]+)/mi,
             /^#\s*vers[ãa]o\s+([\d.]+)/mi,
             /^#.*?(\d+\.\d+(?:\.\d+)?)/m,
           ];
@@ -478,44 +831,15 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
       }
     }
 
-    // Fallback 2: tenta extrair a versão da pasta versions/ (criada pelo servidor na primeira execução)
-    // Ex: versions/1.20.1/1.20.1.json
+    // Fallback 2: tenta extrair a versão da pasta versions/
     if (!version) {
-      try {
-        const versionsPath = await join(serverPath, 'versions');
-        if (await exists(versionsPath)) {
-          const versionEntries = await readDir(versionsPath);
-          for (const ve of versionEntries) {
-            if (ve.isDirectory) {
-              // O nome da subpasta é a versão (ex: "1.20.1")
-              const verMatch = ve.name.match(/^\d+\.\d+(?:\.\d+)?$/);
-              if (verMatch) {
-                version = verMatch[0];
-                break;
-              }
-            }
-          }
-        }
-      } catch { /* ignora */ }
+      version = await detectServerVersion(serverPath);
     }
 
-    // Fallback 3: tenta extrair a versão do nome de arquivos .jar na pasta
-    if (!version) {
-      try {
-        const dirEntries = await readDir(serverPath);
-        for (const dirEntry of dirEntries) {
-          if (!dirEntry.isDirectory && dirEntry.name.endsWith('.jar')) {
-            const jarMatch = dirEntry.name.match(/(\d+\.\d+(?:\.\d+)?)/);
-            if (jarMatch) {
-              version = jarMatch[1];
-              break;
-            }
-          }
-        }
-      } catch { /* ignora */ }
-    }
+    // Verificar status do EULA
+    const eulaAccepted = await checkEulaAccepted(serverPath);
 
-    servers.push({ name: entry.name, path: serverPath, version, uuid, shortCode, serverType, description, schemaVersion });
+    servers.push({ name: entry.name, path: serverPath, version, uuid, shortCode, serverType, description, schemaVersion, eulaAccepted });
   }
 
   return servers;

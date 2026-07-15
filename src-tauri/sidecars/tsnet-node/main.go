@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -27,33 +28,61 @@ type Config struct {
 }
 
 func main() {
+	useStdin := flag.Bool("stdin", false, "Read config from stdin (first line)")
 	configPath := flag.String("config", "", "Path to JSON config file")
 	flag.Parse()
 
-	// Monitor stdin to exit if parent process closes
-	go func() {
-		buf := make([]byte, 1)
-		for {
-			_, err := os.Stdin.Read(buf)
-			if err != nil { // io.EOF or other read error
-				os.Exit(0)
-			}
-		}
-	}()
-
-	if *configPath == "" {
-		log.Fatal("Config path is required")
-	}
-
-	configFile, err := os.Open(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to open config: %v", err)
-	}
-	defer configFile.Close()
-
 	var cfg Config
-	if err := json.NewDecoder(configFile).Decode(&cfg); err != nil {
-		log.Fatalf("Failed to decode config: %v", err)
+
+	if *useStdin {
+		// Ler configuração da primeira linha do stdin (pipe anônimo)
+		// O pai (Rust) escreve a primeira linha como JSON e fecha o pipe
+		// Depois continuamos monitorando stdin para detectar morte do pai
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			line := scanner.Text()
+			if err := json.Unmarshal([]byte(line), &cfg); err != nil {
+				log.Fatalf("Failed to decode config from stdin: %v", err)
+			}
+		} else {
+			log.Fatalf("Failed to read config from stdin: %v", scanner.Err())
+		}
+
+		// Continuar monitorando stdin para detectar quando o pai morrer
+		// (as linhas seguintes do stdin serão lidas em background)
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				_, err := os.Stdin.Read(buf)
+				if err != nil { // io.EOF or other read error
+					os.Exit(0)
+				}
+			}
+		}()
+	} else if *configPath != "" {
+		// Modo legado: ler de arquivo
+		configFile, err := os.Open(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to open config: %v", err)
+		}
+		defer configFile.Close()
+
+		if err := json.NewDecoder(configFile).Decode(&cfg); err != nil {
+			log.Fatalf("Failed to decode config: %v", err)
+		}
+
+		// Monitor stdin to exit if parent process closes
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				_, err := os.Stdin.Read(buf)
+				if err != nil { // io.EOF or other read error
+					os.Exit(0)
+				}
+			}
+		}()
+	} else {
+		log.Fatal("Either --stdin or --config is required")
 	}
 
 	s := &tsnet.Server{

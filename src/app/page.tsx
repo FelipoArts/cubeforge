@@ -25,7 +25,7 @@ import { GuestView } from "@/app/components/guest/GuestView";
 // ============================================================
 // Page
 // ============================================================
-// Página principal do CubeForge Dash.
+// Página principal do Cubicase Dash.
 // Gerencia o estado global e a navegação entre modos Host/Guest.
 // Todos os estados compartilhados vivem aqui para preservar
 // estado ao alternar entre abas.
@@ -61,6 +61,53 @@ export default function Home() {
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [mcLogs, setMcLogs] = useState<string[]>([]);
+
+  // Carregar logs do localStorage na montagem e persistir em toda mudança
+  // IMPORTANTE: isso precisa acontecer em UM único useEffect para evitar que
+  // o salvamento com array vazio sobrescreva os dados carregados.
+  const logsLoadedRef = useRef(false);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('cubeforge-storage');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const savedLogs = parsed?.state?.logs;
+        const savedMcLogs = parsed?.state?.mcLogs;
+        if (savedLogs?.length || savedMcLogs?.length) {
+          setLogs(savedLogs?.slice(-150) || []);
+          setMcLogs(savedMcLogs?.slice(-500) || []);
+          logsLoadedRef.current = true;
+          return; // Não persiste de volta logo após carregar
+        }
+      }
+    } catch {}
+
+    // Se não tinha nada no localStorage, marca como carregado mesmo assim
+    logsLoadedRef.current = true;
+  }, []);
+
+  // Persistir SEPARADAMENTE: só roda quando logs/mcLogs mudam (não na montagem)
+  const prevLogsRef = useRef<string[]>([]);
+  const prevMcLogsRef = useRef<string[]>([]);
+  useEffect(() => {
+    // Ignorar a primeira execução (quando logsLoadedRef acabou de ficar true)
+    if (!logsLoadedRef.current) return;
+    // Só persistir se realmente mudou
+    if (logs === prevLogsRef.current && mcLogs === prevMcLogsRef.current) return;
+    prevLogsRef.current = logs;
+    prevMcLogsRef.current = mcLogs;
+    try {
+      const raw = localStorage.getItem('cubeforge-storage');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        parsed.state = parsed.state || {};
+        parsed.state.logs = logs.slice(-150);
+        parsed.state.mcLogs = mcLogs.slice(-500);
+        localStorage.setItem('cubeforge-storage', JSON.stringify(parsed));
+      }
+    } catch {}
+  }, [logs, mcLogs]);
+
   const [localServers, setLocalServers] = useState<ServerInfo[]>([]);
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -187,7 +234,7 @@ export default function Home() {
               setShortCode(metaShortCode);
               setLogs(prev => [...prev, `[INFO] Código do servidor: CF-${metaShortCode}`]);
 
-              // Usar o status atual do servidor MC (pode já estar online se iniciou antes da mesh)
+              // Registrar servidor na API Central (entidade permanente)
               const currentMcStatus = serverStatusRef.current;
               invoke("sync_register_server", {
                 name: currentSelectedServer,
@@ -207,33 +254,6 @@ export default function Home() {
                 } catch {
                   setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central! Status: ${currentMcStatus}`]);
                 }
-
-                // Após registrar o servidor, CRIAR a sessão com provider/hostIp/port
-                // A sessão precisa existir para que os heartbeats funcionem.
-                // Só depois de criar a sessão é que podemos atualizar o status.
-                const currentStatus = serverStatusRef.current;
-                const currentNetIp = netStatusRef.current === "online" ? netIp : null;
-                if (currentStatus !== "offline" && currentStatus !== "stopping") {
-                  invoke("sync_create_session", {
-                    shortCode: metaShortCode,
-                    provider: "tailscale",
-                    hostIp: currentNetIp || "0.0.0.0",
-                    port: serverConfigPortRef.current,
-                    status: currentStatus,
-                    currentPlayers: null,
-                    maxPlayers: 20,
-                  }).then(() => {
-                    setLogs(prev => [...prev, `[API] Sessão criada na API Central: ${currentStatus}`]);
-                  }).catch((err: any) => {
-                    console.warn("[API] Falha ao criar sessão na API Central:", err);
-                    // Fallback: tentar atualizar via heartbeat se create falhar
-                    invoke("sync_send_heartbeat", {
-                      shortCode: metaShortCode,
-                      status: currentStatus,
-                      currentPlayers: null,
-                    }).catch(() => {});
-                  });
-                }
               }).catch(() => {
                 setLogs(prev => [...prev, `[INFO] ⚠ API Central indisponível. Servidor funcionando em modo offline.`]);
               });
@@ -245,7 +265,7 @@ export default function Home() {
                   const serverInfo2 = localServersRef.current.find(s => s.name === currentSelectedServer);
                   if (serverInfo2) {
                     setServerStatus("starting");
-                    setMcLogs(prev => [...prev, `[CubeForge] Inicializando preparação do servidor "${currentSelectedServer}"...`]);
+                    setMcLogs(prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${currentSelectedServer}"...`]);
                     invoke("start_minecraft_server", {
                       serverDir: serverInfo2.path,
                       javaPath: "",
@@ -272,6 +292,18 @@ export default function Home() {
           setNetIp(null);
           setIsStarting(false);
           pendingMcStartRef.current = false;
+
+          // Rede mesh caiu → atualizar status combinado para a API
+          const currentShortCode = serverShortCodeRef.current;
+          const currentMcStatus = serverStatusRef.current;
+          if (currentShortCode) {
+            // Se mesh caiu, status efetivo é "offline" (mesmo se MC estiver rodando)
+            invoke("sync_send_heartbeat", {
+              shortCode: currentShortCode,
+              status: "offline",
+              currentPlayers: null,
+            }).catch(() => {});
+          }
         }
       });
 
@@ -288,12 +320,17 @@ export default function Home() {
 
         const currentShortCode = serverShortCodeRef.current;
         if (currentShortCode) {
-          invoke("sync_update_session", {
+          // Status combinado: só "online" se AMBOS servidor MC e rede mesh estiverem online
+          const currentNetStatus = netStatusRef.current;
+          const effectiveStatus = (status === "online" && currentNetStatus === "online") ? "online" : status;
+
+          invoke("sync_send_heartbeat", {
             shortCode: currentShortCode,
-            status: status,
+            status: effectiveStatus,
+            hostIp: currentNetStatus === "online" ? netIp : "0.0.0.0",
             currentPlayers: null,
           }).then(() => {
-            setLogs(prev => [...prev, `[API] Status atualizado na API Central: ${status}`]);
+            setLogs(prev => [...prev, `[API] Status atualizado na API Central: ${effectiveStatus}`]);
           }).catch((err: any) => {
             console.warn("[API] Falha ao atualizar status na API Central:", err);
             setLogs(prev => [...prev, `[WARN] API Central: falha ao atualizar status (${err})`]);
@@ -302,11 +339,11 @@ export default function Home() {
 
         let statusMsg = "";
         switch (status) {
-          case "online": statusMsg = "[CubeForge] Servidor de Minecraft está ONLINE!"; break;
-          case "offline": statusMsg = "[CubeForge] Servidor de Minecraft está OFFLINE."; break;
-          case "starting": statusMsg = "[CubeForge] Servidor de Minecraft está INICIANDO..."; break;
-          case "stopping": statusMsg = "[CubeForge] Servidor de Minecraft está PARANDO..."; break;
-          case "crashed": statusMsg = "[CubeForge ERR] O servidor de Minecraft fechou de forma inesperada (CRASHED)!"; break;
+          case "online": statusMsg = "[Cubicase] Servidor de Minecraft está ONLINE!"; break;
+          case "offline": statusMsg = "[Cubicase] Servidor de Minecraft está OFFLINE."; break;
+          case "starting": statusMsg = "[Cubicase] Servidor de Minecraft está INICIANDO..."; break;
+          case "stopping": statusMsg = "[Cubicase] Servidor de Minecraft está PARANDO..."; break;
+          case "crashed": statusMsg = "[Cubicase ERR] O servidor de Minecraft fechou de forma inesperada (CRASHED)!"; break;
         }
         if (statusMsg) setMcLogs(prev => [...prev, statusMsg]);
       });
@@ -317,6 +354,27 @@ export default function Home() {
           return newLogs.slice(-500);
         });
       });
+
+      // Restaurar estado real APÓS os listeners estarem registrados.
+      // Se chamássemos antes, os listeners sobrescreveriam o estado.
+      try {
+        const status = await invoke<{ minecraftStatus: string; netStatus: string; ip: string | null }>("get_system_status");
+        console.log("[Restore] Estado do sistema após recarga:", status);
+
+        if (status.netStatus === "online") {
+          setNetStatus("online");
+          setNetIp(status.ip || null);
+        }
+        if (status.minecraftStatus === "online") {
+          setServerStatus("online");
+          setMcLogs(prev => [...prev, "[Cubicase] ✅ Servidor Minecraft já estava ONLINE (detectado após recarga)."]);
+        } else if (status.minecraftStatus === "crashed") {
+          setServerStatus("crashed");
+          setMcLogs(prev => [...prev, "[Cubicase] ❌ Servidor Minecraft estava CRASHADO (detectado após recarga)."]);
+        }
+      } catch (err) {
+        console.warn("[Restore] Erro ao verificar estado do sistema:", err);
+      }
     })();
 
     return () => {
@@ -388,7 +446,7 @@ export default function Home() {
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <img
-              src={mounted ? (resolvedTheme === "dark" ? "/logo-dark.png" : "/logo.png") : "/logo.png"}
+              src={mounted ? (resolvedTheme === "dark" ? "/icon-dark.png" : "/icon.png") : "/icon.png"}
               alt="Cubicase"
               className="h-7"
             />

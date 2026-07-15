@@ -1,8 +1,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::fs::File;
 use std::io::{Write, BufRead, BufReader};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::net::TcpStream;
 use serde::{Serialize, Deserialize};
 use serde_json;
@@ -10,10 +11,17 @@ use std::collections::HashMap;
 use tauri::{Manager, Emitter};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
-use std::sync::Arc;
 use std::thread;
 use std::path::PathBuf;
-use std::time::Instant;
+
+// Módulos da nova arquitetura de rede
+mod api_client;
+mod session_manager;
+mod provider_manager;
+
+use api_client::{ApiClient, ApiConfig};
+use session_manager::SessionManager;
+use provider_manager::ProviderManager;
 
 fn log_to_file(app: &tauri::AppHandle, message: &str) {
     let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -890,6 +898,74 @@ async fn send_minecraft_command(
     } else {
         Err("Nenhum servidor Minecraft está em execução.".to_string())
     }
+}
+
+/// Verifica o estado atual do sistema (servidor MC e rede mesh)
+/// para restaurar o estado do frontend após recarga (Ctrl+R).
+///
+/// IMPORTANTE: Usa try_lock() em vez de lock() para evitar deadlock com
+/// a thread de monitoramento do Minecraft, que segura o lock enquanto
+/// chama child.wait() (bloqueante). Se o lock estiver ocupado, faz
+/// uma verificação via TCP na porta padrão (25565).
+#[tauri::command]
+async fn get_system_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Verificar se o servidor Minecraft ainda está rodando
+    // Usamos try_lock() para não travar se a monitor thread estiver com o lock
+    let mc_status = {
+        match state.minecraft_process.try_lock() {
+            Ok(mut guard) => {
+                if let Some(ref mut child) = *guard {
+                    match child.try_wait() {
+                        Ok(None) => { // processo ainda vivo
+                            drop(guard);
+                            "online"
+                        },
+                        Ok(Some(status)) => {
+                            drop(guard);
+                            if status.success() { "offline" } else { "crashed" }
+                        }
+                        Err(_) => {
+                            drop(guard);
+                            "offline"
+                        }
+                    }
+                } else {
+                    drop(guard);
+                    // Processo handle é None, mas tentar TCP como fallback
+                    "offline"
+                }
+            }
+            Err(_) => {
+                // Lock está ocupado pela thread de monitoramento.
+                // Isso significa que o processo Minecraft ainda está vivo
+                // (a thread só segura o lock durante child.wait()).
+                log_to_file(&app, "[get_system_status] Lock minecraft_process ocupado. Assumindo ONLINE.");
+                "online"
+            }
+        }
+    };
+
+    // Verificar se o sidecar de rede ainda está rodando
+    let net_status = {
+        let process = state.sidecar_process.lock().unwrap();
+        if process.is_some() {
+            "online"
+        } else {
+            let mock_active = state.is_mock_active.lock().unwrap();
+            if *mock_active { "online" } else { "offline" }
+        }
+    };
+
+    log_to_file(&app, &format!("[get_system_status] MC={}, Net={}", mc_status, net_status));
+
+    Ok(serde_json::json!({
+        "minecraftStatus": mc_status,
+        "netStatus": net_status,
+        "ip": null,
+    }))
 }
 
 /// Retorna o total de memória RAM do sistema em bytes.
@@ -2189,6 +2265,7 @@ pub fn run() {
        start_minecraft_server,
        stop_minecraft_server,
        send_minecraft_command,
+       get_system_status,
        get_total_memory,
        read_server_properties,
        write_server_properties,

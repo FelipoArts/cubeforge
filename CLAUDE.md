@@ -23,7 +23,7 @@ CubeForge Dash is a Tauri v2 desktop app that simplifies creating and sharing Mi
 - `src-tauri/sidecars/tsnet-node/main.go` — Go sidecar for Tailscale mesh
 - `src/app/page.tsx` — Main UI (host/guest flows, server management, console)
 - `src/app/store.ts` — Zustand store with localStorage persistence
-- `src/lib/server.ts` — Minecraft server installation (Mojang API, EULA, properties)
+- `src/lib/server.ts` — Minecraft server installation (Mojang API, EULA, properties, importExistingServer, scanExternalServer)
 - `src/lib/jre.ts` — Java runtime download/install from Adoptium
 - `src-tauri/capabilities/default.json` — Permission scoping for shell, fs, http
 

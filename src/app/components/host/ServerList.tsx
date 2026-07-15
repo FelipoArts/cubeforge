@@ -1,6 +1,6 @@
 "use client";
 
-import { Server, Plus, Trash2, Loader2 } from "lucide-react";
+import { Server, Plus, Trash2, Loader2, FolderOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
 import SettingsButton from "@/app/components/SettingsButton";
 import type { ServerInfo } from "@/lib/server";
@@ -18,9 +18,11 @@ interface ServerListProps {
   serverStatus: string;
   onSelect: (name: string) => void;
   onCreate: () => void;
+  onImport: () => void;
   onDelete: (name: string, e: React.MouseEvent) => void;
   onConfig: (path: string) => void;
   isDeleting: string | null;
+  isImporting: boolean;
 }
 
 export function ServerList({
@@ -29,9 +31,11 @@ export function ServerList({
   serverStatus,
   onSelect,
   onCreate,
+  onImport,
   onDelete,
   onConfig,
   isDeleting,
+  isImporting,
 }: ServerListProps) {
   return (
     <div className="bg-theme-card p-6 rounded-[2rem] border-theme-card shadow-theme-card space-y-4">
@@ -39,14 +43,25 @@ export function ServerList({
         <h3 className="font-bold text-theme-primary flex items-center gap-2">
           <Server className="w-4 h-4 text-indigo-500" /> Servidores Locais
         </h3>
-        <button
-          type="button"
-          onClick={onCreate}
-          className="p-1.5 hover:bg-theme-accent text-indigo-600 rounded-lg border border-theme-accent transition-colors cursor-pointer"
-          title="Criar Novo Servidor"
-        >
-          <Plus className="w-4 h-4" />
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onImport}
+            disabled={isImporting}
+            className="p-1.5 hover:bg-theme-accent text-indigo-600 rounded-lg border border-theme-accent transition-colors cursor-pointer disabled:opacity-40"
+            title="Importar Servidor Existente"
+          >
+            {isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderOpen className="w-4 h-4" />}
+          </button>
+          <button
+            type="button"
+            onClick={onCreate}
+            className="p-1.5 hover:bg-theme-accent text-indigo-600 rounded-lg border border-theme-accent transition-colors cursor-pointer"
+            title="Criar Novo Servidor"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
       <div className="space-y-2 max-h-60 overflow-y-auto pr-1">

@@ -15,12 +15,14 @@ interface DeleteConfirmModalProps {
   serverName: string | null;
   onClose: () => void;
   onConfirm: () => Promise<void>;
+  isImported?: boolean;
 }
 
 export function DeleteConfirmModal({
   serverName,
   onClose,
   onConfirm,
+  isImported = false,
 }: DeleteConfirmModalProps) {
   const [confirmInput, setConfirmInput] = useState("");
 
@@ -61,8 +63,11 @@ export function DeleteConfirmModal({
 
             <div className="space-y-4">
               <p className="text-sm text-theme-secondary leading-relaxed">
-                Tem certeza que deseja excluir permanentemente o servidor <strong className="text-theme-primary">"{serverName}"</strong>?
-                Todos os mundos, configurações e dados serão perdidos. Esta ação não pode ser desfeita.
+                {isImported ? (
+                  <>Tem certeza que deseja remover o servidor <strong className="text-theme-primary">"{serverName}"</strong> da sua lista? Os arquivos originais na pasta não serão deletados.</>
+                ) : (
+                  <>Tem certeza que deseja excluir permanentemente o servidor <strong className="text-theme-primary">"{serverName}"</strong>? Todos os mundos, configurações e dados serão perdidos. Esta ação não pode ser desfeita.</>
+                )}
               </p>
               <div className="space-y-1.5">
                 <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">

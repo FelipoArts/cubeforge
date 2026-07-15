@@ -38,6 +38,13 @@ interface AppSettings {
   // Servidores locais do host (runtime, não persistido separadamente)
   localServers: ServerInfo[];
 
+  // Caminhos de servidores importados (persistido - são pastas fora do padrão)
+  importedServerPaths: string[];
+
+  // Logs persistidos (para sobreviver a Ctrl+R)
+  logs: string[];
+  mcLogs: string[];
+
   // Setters
   setServerDir: (dir: string) => void;
   setInitialized: (val: boolean) => void;
@@ -49,7 +56,12 @@ interface AppSettings {
   addKnownServer: (server: KnownServer) => void;
   removeKnownServer: (shortCode: string) => void;
   updateKnownServerStatus: (shortCode: string, status: ServerStatus, currentPlayers?: number) => void;
+  addImportedServerPath: (path: string) => void;
+  removeImportedServerPath: (path: string) => void;
+  setLogs: (logs: any) => void;
+  setMcLogs: (logs: any) => void;
 }
+
 
 export const useAppStore = create<AppSettings>()(
   persist(
@@ -61,6 +73,9 @@ export const useAppStore = create<AppSettings>()(
       serverStatus: 'offline',
       knownServers: [],
       localServers: [],
+      importedServerPaths: [],
+      logs: [],
+      mcLogs: [],
 
       setServerDir: (dir) => set({ serverDir: dir }),
       setInitialized: (val) => set({ hasInitialized: val }),
@@ -70,7 +85,6 @@ export const useAppStore = create<AppSettings>()(
       setLocalServers: (servers) => set({ localServers: servers }),
       setKnownServers: (servers) => set({ knownServers: servers }),
       addKnownServer: (server) => set((state) => {
-        // Evitar duplicatas
         const exists = state.knownServers.find(s => s.shortCode === server.shortCode);
         if (exists) return state;
         return { knownServers: [...state.knownServers, server] };
@@ -90,6 +104,21 @@ export const useAppStore = create<AppSettings>()(
             : s
         ),
       })),
+      addImportedServerPath: (path) => set((state) => {
+        if (state.importedServerPaths.includes(path)) return state;
+        return { importedServerPaths: [...state.importedServerPaths, path] };
+      }),
+      removeImportedServerPath: (path) => set((state) => ({
+        importedServerPaths: state.importedServerPaths.filter(p => p !== path),
+      })),
+      setLogs: (logs) => set((state) => {
+        const newLogs = typeof logs === 'function' ? logs(state.logs) : logs;
+        return { logs: newLogs.slice(-150) };
+      }),
+      setMcLogs: (logs) => set((state) => {
+        const newLogs = typeof logs === 'function' ? logs(state.mcLogs) : logs;
+        return { mcLogs: newLogs.slice(-500) };
+      }),
     }),
     {
       name: 'cubeforge-storage',
@@ -100,7 +129,11 @@ export const useAppStore = create<AppSettings>()(
         minecraftPort: state.minecraftPort,
         selectedServer: state.selectedServer,
         knownServers: state.knownServers,
+        importedServerPaths: state.importedServerPaths,
+        logs: state.logs,
+        mcLogs: state.mcLogs,
       }),
     }
   )
 );
+

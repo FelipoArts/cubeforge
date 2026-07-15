@@ -25,6 +25,8 @@ import { installJRE, isJREInstalled, getJREPath, type DownloadProgress } from "@
 import {
   listLocalServers,
   installMinecraftServer,
+  importExistingServer,
+  scanExternalServer,
   getJavaVersion,
   type ServerInfo,
   type ServerInstallProgress,
@@ -138,7 +140,13 @@ export function HostView({
     setSelectedServer,
     serverStatus,
     setServerStatus,
+    importedServerPaths,
+    addImportedServerPath,
+    removeImportedServerPath,
   } = useAppStore();
+
+  // --- Estado ---
+  const [isImporting, setIsImporting] = useState(false);
 
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
@@ -161,17 +169,57 @@ export function HostView({
     (async () => {
       if (!serverDir) {
         const docs = await documentDir();
-        setServerDir(`${docs}\\CubeForgeServers`);
+        setServerDir(`${docs}\\CubicaseServers`);
       }
     })();
   }, [serverDir, setServerDir]);
 
-  // Carregar servidores e RAM total
+  // Carregar servidores (locais + importados) e RAM total
   useEffect(() => {
     (async () => {
       try {
-        const servers = await listLocalServers();
-        onSetLocalServers(servers);
+        // 1. Servidores padrão (pasta CubicaseServers)
+        const defaultServers = await listLocalServers();
+
+        // 2. Servidores importados (paths salvos no store)
+        const importedResults: ServerInfo[] = [];
+        const validImportedPaths: string[] = [];
+        for (const path of importedServerPaths) {
+          try {
+            const scanned = await scanExternalServer(path);
+            if (scanned) {
+              importedResults.push(scanned);
+              validImportedPaths.push(path);
+            }
+          } catch (err) {
+            console.warn(`Erro ao escanear servidor importado em ${path}:`, err);
+            // Path não é mais acessível — remover da lista persistida
+          }
+        }
+
+        // Limpar paths de servidores importados que não existem mais (ex: deletados manualmente)
+        if (validImportedPaths.length !== importedServerPaths.length) {
+          const toRemove = importedServerPaths.filter(p => !validImportedPaths.includes(p));
+          for (const p of toRemove) {
+            removeImportedServerPath(p);
+          }
+        }
+
+        // 3. Merge: servidores importados não duplicam os padrão
+        const allServerPaths = new Set(defaultServers.map(s => s.path.toLowerCase()));
+        for (const imp of importedResults) {
+          if (!allServerPaths.has(imp.path.toLowerCase())) {
+            defaultServers.push(imp);
+            allServerPaths.add(imp.path.toLowerCase());
+          }
+        }
+
+        onSetLocalServers(defaultServers);
+
+        // 4. Se o servidor selecionado não existe mais, resetar seleção
+        if (selectedServer && !defaultServers.some(s => s.name === selectedServer)) {
+          setSelectedServer(null);
+        }
         const totalBytes = await invoke<number>("get_total_memory");
         const totalGb = Math.round(totalBytes / (1024 * 1024 * 1024));
         onSetTotalSystemRamGb(totalGb);
@@ -179,6 +227,7 @@ export function HostView({
         console.error("Erro ao carregar dados iniciais:", err);
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Recarregar servidores se a pasta mudar
@@ -259,7 +308,7 @@ export function HostView({
       onSetDownloadProgress(null);
       onSetLogs(prev => [...prev, "[INFO] Java 17 está pronto!"]);
 
-      onSetLogs(prev => [...prev, "[INFO] Autenticando sessão de rede no CubeForge..."]);
+      onSetLogs(prev => [...prev, "[INFO] Autenticando sessão de rede no Cubicase..."]);
       onSetNetStatus("connecting");
       await invoke("start_network_node", { mode: "host", targetIp: null, localPort: minecraftPort });
 
@@ -300,28 +349,28 @@ export function HostView({
     try {
       setServerStatus("starting");
       onSetMcLogs([]);
-      onSetMcLogs(prev => [...prev, `[CubeForge] Inicializando preparação do servidor "${selectedServer}"...`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${selectedServer}"...`]);
 
       const version = serverInfo.version || "1.20.1";
       const javaVer = getJavaVersion(version);
 
-      onSetMcLogs(prev => [...prev, `[CubeForge] Verificando compatibilidade com Java JRE ${javaVer}...`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase] Verificando compatibilidade com Java JRE ${javaVer}...`]);
       const installed = await isJREInstalled(javaVer);
       if (!installed) {
-        onSetMcLogs(prev => [...prev, `[CubeForge] JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`]);
+        onSetMcLogs(prev => [...prev, `[Cubicase] JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`]);
         await installJRE(javaVer, (p) => {
           onSetServerInstallProgress({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: p.percent });
         });
       }
       onSetServerInstallProgress(null);
-      onSetMcLogs(prev => [...prev, `[CubeForge] JRE ${javaVer} pronto!`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase] JRE ${javaVer} pronto!`]);
 
       const jrePath = await getJREPath(javaVer);
       const javaPath = `${jrePath}\\bin\\java.exe`;
 
       let ram = 4;
       try {
-        const metaPath = await join(serverInfo.path, 'cubeforge-meta.json');
+        const metaPath = await join(serverInfo.path, 'cubicase-meta.json');
         const metaContent = await readTextFile(metaPath);
         const meta = JSON.parse(metaContent) as { ramGb?: number };
         if (typeof meta.ramGb === 'number' && meta.ramGb >= 2) ram = meta.ramGb;
@@ -329,7 +378,7 @@ export function HostView({
         console.warn('Could not read RAM from meta file, using default 4GB:', e);
       }
 
-      onSetMcLogs(prev => [...prev, `[CubeForge] Iniciando Java runtime com ${ram}GB de RAM...`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase] Iniciando Java runtime com ${ram}GB de RAM...`]);
       await invoke("start_minecraft_server", {
         serverDir: serverInfo.path,
         javaPath: javaPath,
@@ -339,7 +388,7 @@ export function HostView({
     } catch (err) {
       console.error(err);
       setServerStatus("offline");
-      onSetMcLogs(prev => [...prev, `[CubeForge ERR] Falha ao iniciar: ${err}`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase ERR] Falha ao iniciar: ${err}`]);
       alert("Falha ao iniciar o Minecraft Server: " + err);
     }
   };
@@ -347,11 +396,11 @@ export function HostView({
   const handleStopMCServer = async () => {
     try {
       setServerStatus("stopping");
-      onSetMcLogs(prev => [...prev, `[CubeForge] Enviando comando "/stop" para o console do Minecraft...`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase] Enviando comando "/stop" para o console do Minecraft...`]);
       await invoke("stop_minecraft_server");
     } catch (err) {
       console.error(err);
-      onSetMcLogs(prev => [...prev, `[CubeForge ERR] Erro ao enviar comando de parada: ${err}`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase ERR] Erro ao enviar comando de parada: ${err}`]);
       alert("Falha ao encerrar o servidor: " + err);
     }
   };
@@ -362,7 +411,7 @@ export function HostView({
       await invoke("send_minecraft_command", { command });
     } catch (err) {
       console.error(err);
-      onSetMcLogs(prev => [...prev, `[CubeForge ERR] Falha ao enviar comando: ${err}`]);
+      onSetMcLogs(prev => [...prev, `[Cubicase ERR] Falha ao enviar comando: ${err}`]);
     }
   };
 
@@ -414,9 +463,24 @@ export function HostView({
     if (!deleteConfirmServer) return;
     try {
       onSetIsDeletingServer(deleteConfirmServer);
+      const serverInfo = localServers.find(s => s.name === deleteConfirmServer);
+      if (!serverInfo) throw new Error("Servidor não encontrado");
+
+      // Verificar se é um servidor importado (fora da pasta padrão)
       const docsDir = await documentDir();
-      const serverPath = `${docsDir}\\CubeForgeServers\\${deleteConfirmServer}`;
-      await remove(serverPath, { recursive: true });
+      const defaultPath = `${docsDir}\\CubicaseServers\\${deleteConfirmServer}`;
+      const isImported = serverInfo.path.toLowerCase() !== defaultPath.toLowerCase();
+
+      if (isImported) {
+        // Servidor importado: remover da lista de importados (não deleta arquivos)
+        onSetLogs(prev => [...prev, `[INFO] Removendo servidor importado "${deleteConfirmServer}" da lista.`]);
+        removeImportedServerPath(serverInfo.path);
+      } else {
+        // Servidor padrão: deletar a pasta permanentemente
+        await remove(serverInfo.path, { recursive: true });
+        onSetLogs(prev => [...prev, `[INFO] Servidor "${deleteConfirmServer}" deletado permanentemente.`]);
+      }
+
       if (selectedServer === deleteConfirmServer) setSelectedServer(null);
       const servers = await listLocalServers();
       onSetLocalServers(servers);
@@ -426,6 +490,43 @@ export function HostView({
     } finally {
       onSetIsDeletingServer(null);
       onSetDeleteConfirmServer(null);
+    }
+  };
+
+  const handleImportServer = async () => {
+    try {
+      setIsImporting(true);
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Selecione a pasta do servidor Minecraft",
+      });
+      if (!selected) { setIsImporting(false); return; }
+
+      const folderPath = selected as string;
+
+      // Verificar se já não está na lista (pela path)
+      const alreadyExists = localServers.some(s => s.path.toLowerCase() === folderPath.toLowerCase());
+      if (alreadyExists) {
+        alert("Este servidor já está na sua lista.");
+        setIsImporting(false);
+        return;
+      }
+
+      onSetLogs(prev => [...prev, `[INFO] Importando servidor de: ${folderPath}`]);
+      const imported = await importExistingServer(folderPath);
+      addImportedServerPath(folderPath);
+
+      // Merge com servidores locais e reordenar
+      const allServers = [...localServers, imported];
+      onSetLocalServers(allServers);
+      setSelectedServer(imported.name);
+      onSetLogs(prev => [...prev, `[INFO] Servidor "${imported.name}" (${imported.version || "versão desconhecida"}) importado com sucesso!`]);
+    } catch (err) {
+      console.error(err);
+      alert("Erro ao importar servidor: " + err);
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -692,9 +793,11 @@ export function HostView({
             serverStatus={serverStatus}
             onSelect={setSelectedServer}
             onCreate={() => onSetShowCreateServer(true)}
+            onImport={handleImportServer}
             onDelete={handleDeleteServer}
             onConfig={(path) => { onSetConfigServerDir(path); onSetShowConfigModal(true); }}
             isDeleting={isDeletingServer}
+            isImporting={isImporting}
           />
 
           {/* Parâmetros Globais */}
@@ -736,9 +839,9 @@ export function HostView({
 
           {/* Suporte */}
           <div className="bg-indigo-600 p-6 rounded-[2rem] text-white shadow-theme-xl">
-            <h3 className="font-bold text-white mb-2">Suporte ao CubeForge</h3>
+            <h3 className="font-bold text-white mb-2">Suporte ao Cubicase</h3>
             <p className="text-indigo-100 text-sm leading-relaxed mb-4">
-              O CubeForge Dash economiza taxas mensais de hosts cloud tradicionais. Apoie o projeto!
+              O Cubicase Dash economiza taxas mensais de hosts cloud tradicionais. Apoie o projeto!
             </p>
             <button
               type="button"
@@ -763,6 +866,12 @@ export function HostView({
         serverName={deleteConfirmServer}
         onClose={() => onSetDeleteConfirmServer(null)}
         onConfirm={handleConfirmDelete}
+        isImported={deleteConfirmServer ? localServers.some(s => {
+          if (s.name !== deleteConfirmServer) return false;
+          // Comparar: servidores dentro da pasta padrão não são importados
+          const defaultPath = `${serverDir || ''}\\${s.name}`;
+          return s.path.toLowerCase() !== defaultPath.toLowerCase();
+        }) : false}
       />
 
       <SettingsModal

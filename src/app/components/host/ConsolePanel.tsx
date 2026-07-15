@@ -32,19 +32,37 @@ export function ConsolePanel({
   const mcLogsEndRef = useRef<HTMLDivElement>(null);
   const networkLogsEndRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll quando logs mudam (apenas dentro do container, sem afetar scroll da página)
+  // Refs para o container de scroll
+  const mcScrollRef = useRef<HTMLDivElement>(null);
+  const networkScrollRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll inteligente: só rola para o final se o usuário já estiver no final.
+  // Usa scrollTop diretamente no container em vez de scrollIntoView para evitar
+  // que o scroll "vaze" para o scroll principal da página.
   useEffect(() => {
-    mcLogsEndRef.current?.scrollIntoView({ block: "nearest" });
+    const container = mcScrollRef.current;
+    if (!container) return;
+    const isAtBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 8;
+    if (isAtBottom) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [mcLogs]);
 
   useEffect(() => {
-    networkLogsEndRef.current?.scrollIntoView({ block: "nearest" });
+    const container = networkScrollRef.current;
+    if (!container) return;
+    const isAtBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 8;
+    if (isAtBottom) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [networkLogs]);
 
-  // Auto-scroll quando troca de aba (apenas dentro do container)
+  // Auto-scroll para o final quando troca de aba
   useEffect(() => {
-    const ref = activeTab === "minecraft" ? mcLogsEndRef : networkLogsEndRef;
-    setTimeout(() => ref.current?.scrollIntoView({ block: "nearest" }), 50);
+    const container = activeTab === "minecraft" ? mcScrollRef.current : networkScrollRef.current;
+    if (container) {
+      setTimeout(() => { container.scrollTop = container.scrollHeight; }, 50);
+    }
   }, [activeTab]);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -94,13 +112,16 @@ export function ConsolePanel({
       </div>
 
       {/* Tab Contents */}
-      <div className="h-72 overflow-y-auto mt-4 space-y-1.5 pr-2 custom-scrollbar">
+      <div
+        ref={activeTab === "minecraft" ? mcScrollRef : networkScrollRef}
+        className="h-72 overflow-y-auto mt-4 space-y-1.5 pr-2 custom-scrollbar"
+      >
         {activeTab === "minecraft" ? (
           mcLogs.length === 0 ? (
             <p className="text-slate-600 italic">Console do Minecraft inativo. Inicie o servidor Minecraft para monitorar.</p>
           ) : (
             mcLogs.map((log, idx) => {
-              const isErr = log.includes("[ERR]") || log.includes("ERROR") || log.includes("[CubeForge ERR]");
+              const isErr = log.includes("[ERR]") || log.includes("ERROR") || log.includes("[Cubicase ERR]");
               const isWarn = log.includes("WARN") || log.includes("WARNING");
               return (
                 <p key={idx} className={cn(
