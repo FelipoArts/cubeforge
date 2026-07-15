@@ -1,4 +1,5 @@
-const LEASE_DURATION_MS = 90_000;
+const LEASE_DURATION_MS = 90_000;  // 90s lease
+const SESSION_TTL_SECONDS = 90;    // 90s TTL (em vez de 14400s = 4h)
 const HEARTBEAT_RENEW_MS = 60_000;
 const AUTH_KEY_EXPIRY_MS = 300_000;
 const REQUEST_ID_CACHE_TTL = 300;
@@ -190,7 +191,7 @@ export default {
     const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CubeCase-Version' };
     if (m === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     try {
-      const cfg = { ttlSeconds: parseInt(env.SERVER_TTL_SECONDS || '14400'), leaseTtlSeconds: Math.ceil(LEASE_DURATION_MS / 1000), shortCodeLength: parseInt(env.SHORT_CODE_LENGTH || '6') };
+      const cfg = { ttlSeconds: SESSION_TTL_SECONDS, leaseTtlSeconds: Math.ceil(LEASE_DURATION_MS / 1000), shortCodeLength: parseInt(env.SHORT_CODE_LENGTH || '6') };
 
       // POST /api/v1/servers/{sc}/connection-sessions
       const m1 = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/connection-sessions$/);

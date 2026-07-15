@@ -56,6 +56,9 @@ export default function Home() {
   const [mode, setMode] = useState<"host" | "guest">("host");
   const [netStatus, setNetStatus] = useState<"offline" | "connecting" | "online">("offline");
   const [netIp, setNetIp] = useState<string | null>(null);
+  // Status unificado: recalcula sempre que mesh ou MC mudam
+  const [meshStatus, setMeshStatus] = useState<"offline" | "connecting" | "online">("offline");
+  const combinedStatus = (meshStatus === "online" && serverStatus === "online") ? "online" : "offline";
   const [isStarting, setIsStarting] = useState(false);
   const [copied, setCopied] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
@@ -132,6 +135,32 @@ export default function Home() {
   useEffect(() => {
     storeSetLocalServers(localServers);
   }, [localServers, storeSetLocalServers]);
+
+  // Status unificado: sempre que mesh ou MC mudarem, recalcula e envia heartbeat
+  // Isso é o CORAÇÃO da lógica de status combinado.
+  // Garante que NÃO IMPORTA qual listener disparou (mesh ou MC),
+  // o heartbeat sempre reflete o estado real combinado.
+  const prevCombinedRef = useRef<string>("offline");
+  useEffect(() => {
+    const shortCode = serverShortCodeRef.current;
+    if (!shortCode) return;
+
+    // Evitar enviar heartbeat repetido se o status combinado não mudou
+    if (combinedStatus === prevCombinedRef.current) return;
+    prevCombinedRef.current = combinedStatus;
+
+    // Fire-and-forget: heartbeat não usa SyncEngine.
+    // Se falhar, o próximo virá em 60s ou na próxima mudança de estado.
+    invoke("sync_send_heartbeat", {
+      shortCode: shortCode,
+      status: combinedStatus,
+      currentPlayers: null,
+    }).then(() => {
+      setLogs(prev => [...prev, `[API] Status combinado atualizado: ${combinedStatus}`]);
+    }).catch(() => {
+      // Fire-and-forget: falha é esperada, próximo heartbeat tentará de novo
+    });
+  }, [combinedStatus]);
 
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
@@ -216,8 +245,12 @@ export default function Home() {
       const { listen } = await import("@tauri-apps/api/event");
 
       unlistenStatus = await listen<{ status: string; ip: string | null }>("network-status", (event) => {
+        // Sincronizar meshStatus sempre que netStatus mudar
+        const newNetStatus = event.payload.status === "online" ? "online" : "offline";
+        setNetStatus(newNetStatus);
+        setMeshStatus(newNetStatus);
+
         if (event.payload.status === "online") {
-          setNetStatus("online");
           setNetIp(event.payload.ip);
           setIsStarting(false);
 
@@ -289,6 +322,7 @@ export default function Home() {
           }
         } else {
           setNetStatus("offline");
+          setMeshStatus("offline");
           setNetIp(null);
           setIsStarting(false);
           pendingMcStartRef.current = false;
@@ -317,25 +351,8 @@ export default function Home() {
       unlistenMcStatus = await listen<string>("minecraft-status-changed", (event) => {
         const status = event.payload as ServerStatus;
         setServerStatus(status);
-
-        const currentShortCode = serverShortCodeRef.current;
-        if (currentShortCode) {
-          // Status combinado: só "online" se AMBOS servidor MC e rede mesh estiverem online
-          const currentNetStatus = netStatusRef.current;
-          const effectiveStatus = (status === "online" && currentNetStatus === "online") ? "online" : status;
-
-          invoke("sync_send_heartbeat", {
-            shortCode: currentShortCode,
-            status: effectiveStatus,
-            hostIp: currentNetStatus === "online" ? netIp : "0.0.0.0",
-            currentPlayers: null,
-          }).then(() => {
-            setLogs(prev => [...prev, `[API] Status atualizado na API Central: ${effectiveStatus}`]);
-          }).catch((err: any) => {
-            console.warn("[API] Falha ao atualizar status na API Central:", err);
-            setLogs(prev => [...prev, `[WARN] API Central: falha ao atualizar status (${err})`]);
-          });
-        }
+        // O heartbeat é enviado automaticamente pelo useEffect do combinedStatus
+        // NÃO precisa enviar manualmente aqui.
 
         let statusMsg = "";
         switch (status) {
@@ -363,6 +380,7 @@ export default function Home() {
 
         if (status.netStatus === "online") {
           setNetStatus("online");
+          setMeshStatus("online");
           setNetIp(status.ip || null);
         }
         if (status.minecraftStatus === "online") {
