@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Plus, X, Loader2, ChevronRight, Server, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { pushDiagnostic } from "@/app/diagnostics";
 import {
   fetchVersionManifest,
   getRecommendedVersions,
@@ -11,22 +12,38 @@ import {
   getAllReleaseVersions,
   searchVersions,
   getJavaVersion,
+  getForgeVersions,
+  getFabricLoaderVersions,
+  getPaperBuilds,
   type VersionManifest,
   type ServerInstallProgress,
+  type ForgeBuild,
+  type FabricLoaderBuild,
+  type PaperBuild,
 } from "@/lib/server";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 
 // ============================================================
 // CreateServerModal
 // ============================================================
-// Modal para criar um novo servidor Minecraft Vanilla.
-// Inclui seletor de versão com busca, slider de RAM e
-// barra de progresso de instalação.
+// Modal para criar um novo servidor Minecraft: Vanilla, Forge/NeoForge,
+// Fabric ou Paper. Inclui seletor de versão com busca, seletor de
+// build/loader conforme o tipo, slider de RAM e barra de progresso.
 // ============================================================
+
+type UiServerType = "vanilla" | "forge" | "fabric" | "paper";
 
 interface CreateServerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onCreate: (name: string, version: string, ram: number) => Promise<void>;
+  onCreate: (
+    name: string,
+    version: string,
+    ram: number,
+    serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper",
+    // Forge/NeoForge: versão do Forge. Fabric: versão do loader. Paper: número da build (como string).
+    extraVersion?: string
+  ) => Promise<void>;
   installProgress: ServerInstallProgress | null;
   totalRamGb: number;
 }
@@ -38,9 +55,21 @@ export function CreateServerModal({
   installProgress,
   totalRamGb,
 }: CreateServerModalProps) {
+  useLockBodyScroll(isOpen);
+
   const [serverName, setServerName] = useState("");
   const [serverVersion, setServerVersion] = useState("1.20.1");
   const [serverRam, setServerRam] = useState(4);
+  const [serverType, setServerType] = useState<UiServerType>("vanilla");
+  const [forgeBuilds, setForgeBuilds] = useState<ForgeBuild[]>([]);
+  const [selectedForgeBuild, setSelectedForgeBuild] = useState<string>("");
+  const [forgeVersionsLoading, setForgeVersionsLoading] = useState(false);
+  const [fabricBuilds, setFabricBuilds] = useState<FabricLoaderBuild[]>([]);
+  const [selectedFabricLoader, setSelectedFabricLoader] = useState<string>("");
+  const [fabricVersionsLoading, setFabricVersionsLoading] = useState(false);
+  const [paperBuilds, setPaperBuilds] = useState<PaperBuild[]>([]);
+  const [selectedPaperBuild, setSelectedPaperBuild] = useState<number | null>(null);
+  const [paperVersionsLoading, setPaperVersionsLoading] = useState(false);
   const [versionManifest, setVersionManifest] = useState<VersionManifest | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
   const [manifestError, setManifestError] = useState<string | null>(null);
@@ -48,6 +77,81 @@ export function CreateServerModal({
   const [versionSearchQuery, setVersionSearchQuery] = useState("");
   const [showAllVersions, setShowAllVersions] = useState(false);
   const versionDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Carregar versões Forge quando tipo = forge e versão mudar
+  useEffect(() => {
+    if (!isOpen || serverType !== "forge") return;
+    (async () => {
+      setForgeVersionsLoading(true);
+      try {
+        const builds = await getForgeVersions(serverVersion);
+        setForgeBuilds(builds);
+        const recommended = builds.find(b => b.recommended);
+        if (recommended) {
+          setSelectedForgeBuild(recommended.forgeVersion);
+        } else if (builds.length > 0) {
+          setSelectedForgeBuild(builds[0].forgeVersion);
+        } else {
+          setSelectedForgeBuild("");
+        }
+      } catch (err) {
+        console.warn("Falha ao carregar versões Forge:", err);
+        setForgeBuilds([]);
+      } finally {
+        setForgeVersionsLoading(false);
+      }
+    })();
+  }, [isOpen, serverType, serverVersion]);
+
+  // Carregar versões do Fabric Loader quando tipo = fabric e versão mudar
+  useEffect(() => {
+    if (!isOpen || serverType !== "fabric") return;
+    (async () => {
+      setFabricVersionsLoading(true);
+      try {
+        const builds = await getFabricLoaderVersions(serverVersion);
+        setFabricBuilds(builds);
+        const recommended = builds.find(b => b.stable);
+        if (recommended) {
+          setSelectedFabricLoader(recommended.loaderVersion);
+        } else if (builds.length > 0) {
+          setSelectedFabricLoader(builds[0].loaderVersion);
+        } else {
+          setSelectedFabricLoader("");
+        }
+      } catch (err) {
+        console.warn("Falha ao carregar versões do Fabric:", err);
+        setFabricBuilds([]);
+      } finally {
+        setFabricVersionsLoading(false);
+      }
+    })();
+  }, [isOpen, serverType, serverVersion]);
+
+  // Carregar builds do Paper quando tipo = paper e versão mudar
+  useEffect(() => {
+    if (!isOpen || serverType !== "paper") return;
+    (async () => {
+      setPaperVersionsLoading(true);
+      try {
+        const builds = await getPaperBuilds(serverVersion);
+        setPaperBuilds(builds);
+        const recommended = builds.find(b => b.recommended);
+        if (recommended) {
+          setSelectedPaperBuild(recommended.build);
+        } else if (builds.length > 0) {
+          setSelectedPaperBuild(builds[0].build);
+        } else {
+          setSelectedPaperBuild(null);
+        }
+      } catch (err) {
+        console.warn("Falha ao carregar builds do Paper:", err);
+        setPaperBuilds([]);
+      } finally {
+        setPaperVersionsLoading(false);
+      }
+    })();
+  }, [isOpen, serverType, serverVersion]);
 
   // Carrega o manifest quando o modal abre
   useEffect(() => {
@@ -86,14 +190,54 @@ export function CreateServerModal({
       setVersionSearchQuery("");
       setShowAllVersions(false);
       setVersionDropdownOpen(false);
+      setServerType("vanilla");
+      setForgeBuilds([]);
+      setSelectedForgeBuild("");
+      setFabricBuilds([]);
+      setSelectedFabricLoader("");
+      setPaperBuilds([]);
+      setSelectedPaperBuild(null);
     }
   }, [isOpen]);
+
+  const typeLabel =
+    serverType === "forge"
+      ? (forgeBuilds.find(b => b.forgeVersion === selectedForgeBuild)?.provider === "neoforge" ? "NeoForge" : "Forge")
+      : serverType === "fabric"
+      ? "Fabric"
+      : serverType === "paper"
+      ? "Paper"
+      : "Vanilla";
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!serverName.trim()) return;
     const cleanName = serverName.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
-    await onCreate(cleanName, serverVersion, serverRam);
+    if (serverType === "forge") {
+      if (!selectedForgeBuild) {
+        pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Forge não selecionada", message: "Selecione uma versão do Forge." });
+        return;
+      }
+      // A build pode ter vindo do provider Forge clássico ou do NeoForge — o formato
+      // da URL de instalação é diferente entre os dois, então é preciso mandar o
+      // provider certo, não assumir sempre "forge".
+      const build = forgeBuilds.find(b => b.forgeVersion === selectedForgeBuild);
+      await onCreate(cleanName, serverVersion, serverRam, build?.provider ?? "forge", selectedForgeBuild);
+    } else if (serverType === "fabric") {
+      if (!selectedFabricLoader) {
+        pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Fabric não selecionada", message: "Selecione uma versão do Fabric Loader." });
+        return;
+      }
+      await onCreate(cleanName, serverVersion, serverRam, "fabric", selectedFabricLoader);
+    } else if (serverType === "paper") {
+      if (selectedPaperBuild === null) {
+        pushDiagnostic({ level: "warning", source: "Instalação", title: "Build do Paper não selecionada", message: "Selecione uma build do Paper." });
+        return;
+      }
+      await onCreate(cleanName, serverVersion, serverRam, "paper", String(selectedPaperBuild));
+    } else {
+      await onCreate(cleanName, serverVersion, serverRam);
+    }
   };
 
   return (
@@ -167,6 +311,61 @@ export function CreateServerModal({
                   />
                 </div>
 
+                {/* Tipo de Servidor */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Tipo do Servidor</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setServerType("vanilla")}
+                      className={cn(
+                        "h-10 rounded-xl text-xs font-bold transition-all border cursor-pointer",
+                        serverType === "vanilla"
+                          ? "bg-emerald-600 text-white border-emerald-600 shadow-sm"
+                          : "bg-transparent text-theme-secondary border-theme-card hover:border-emerald-300"
+                      )}
+                    >
+                      🟢 Vanilla
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerType("forge")}
+                      className={cn(
+                        "h-10 rounded-xl text-xs font-bold transition-all border cursor-pointer",
+                        serverType === "forge"
+                          ? "bg-amber-600 text-white border-amber-600 shadow-sm"
+                          : "bg-transparent text-theme-secondary border-theme-card hover:border-amber-300"
+                      )}
+                    >
+                      🟠 Forge
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerType("fabric")}
+                      className={cn(
+                        "h-10 rounded-xl text-xs font-bold transition-all border cursor-pointer",
+                        serverType === "fabric"
+                          ? "bg-purple-600 text-white border-purple-600 shadow-sm"
+                          : "bg-transparent text-theme-secondary border-theme-card hover:border-purple-300"
+                      )}
+                    >
+                      🧵 Fabric
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerType("paper")}
+                      className={cn(
+                        "h-10 rounded-xl text-xs font-bold transition-all border cursor-pointer",
+                        serverType === "paper"
+                          ? "bg-blue-600 text-white border-blue-600 shadow-sm"
+                          : "bg-transparent text-theme-secondary border-theme-card hover:border-blue-300"
+                      )}
+                    >
+                      📄 Paper
+                    </button>
+                  </div>
+                </div>
+
                 {/* Versão - Seletor Categorizado */}
                 <div className="space-y-1.5 relative" ref={versionDropdownRef}>
                   <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Minecraft</label>
@@ -181,7 +380,7 @@ export function CreateServerModal({
                     {manifestLoading ? (
                       <span className="text-theme-secondary">Carregando versões...</span>
                     ) : (
-                      <span>Vanilla {serverVersion}</span>
+                      <span>{typeLabel} {serverVersion}</span>
                     )}
                     <ChevronRight className={`w-4 h-4 text-theme-secondary transition-transform ${versionDropdownOpen ? 'rotate-90' : ''}`} />
                   </button>
@@ -271,7 +470,7 @@ export function CreateServerModal({
                                     serverVersion === id ? 'bg-theme-accent text-indigo-700 font-semibold' : 'text-theme-primary'
                                   }`}
                                 >
-                                  <span>Vanilla {id}</span>
+                                  <span>{typeLabel} {id}</span>
                                   <span className="text-[10px] text-theme-secondary font-mono">
                                     Java {getJavaVersion(id)}
                                   </span>
@@ -304,10 +503,140 @@ export function CreateServerModal({
                   {serverVersion && !manifestLoading && (
                     <div className="mt-2 px-3 py-2 bg-theme-accent border border-theme-accent rounded-xl text-xs font-semibold text-indigo-700 dark:text-indigo-300 flex items-center gap-2">
                       <Server className="w-3.5 h-3.5 flex-shrink-0" />
-                      Minecraft {serverVersion} • Java {getJavaVersion(serverVersion)} • Vanilla
+                      Minecraft {serverVersion} • Java {getJavaVersion(serverVersion)} •{" "}
+                      {serverType === "forge"
+                        ? `${typeLabel} ${selectedForgeBuild || "..."}`
+                        : serverType === "fabric"
+                        ? `Fabric ${selectedFabricLoader || "..."}`
+                        : serverType === "paper"
+                        ? `Paper build ${selectedPaperBuild ?? "..."}`
+                        : "Vanilla"}
                     </div>
                   )}
                 </div>
+
+                {/* Seletor de build Forge (só aparece quando tipo = forge) */}
+                {serverType === "forge" && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Forge</label>
+                    {forgeVersionsLoading ? (
+                      <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Carregando versões do Forge...
+                      </div>
+                    ) : forgeBuilds.length === 0 ? (
+                      <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
+                        Nenhuma versão do Forge encontrada para {serverVersion}.
+                      </div>
+                    ) : (
+                      <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
+                        {forgeBuilds.map((build, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setSelectedForgeBuild(build.forgeVersion)}
+                            className={cn(
+                              "w-full px-4 py-2.5 text-left text-sm transition-colors rounded-xl border flex items-center justify-between",
+                              selectedForgeBuild === build.forgeVersion
+                                ? "bg-amber-100 dark:bg-amber-900/30 border-amber-300 text-amber-800 dark:text-amber-200 font-semibold"
+                                : "border-theme-card text-theme-primary hover:bg-theme-accent"
+                            )}
+                          >
+                            <span>
+                              {build.recommended && <span className="mr-1">⭐</span>}
+                              {build.provider === "neoforge" ? "NeoForge" : "Forge"} {build.forgeVersion}
+                            </span>
+                            <span className="text-[10px] text-theme-secondary font-mono">
+                              Build {build.build}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Seletor de loader Fabric (só aparece quando tipo = fabric) */}
+                {serverType === "fabric" && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Fabric Loader</label>
+                    {fabricVersionsLoading ? (
+                      <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Carregando versões do Fabric...
+                      </div>
+                    ) : fabricBuilds.length === 0 ? (
+                      <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
+                        Nenhuma versão do Fabric encontrada para {serverVersion}.
+                      </div>
+                    ) : (
+                      <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
+                        {fabricBuilds.map((build, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setSelectedFabricLoader(build.loaderVersion)}
+                            className={cn(
+                              "w-full px-4 py-2.5 text-left text-sm transition-colors rounded-xl border flex items-center justify-between",
+                              selectedFabricLoader === build.loaderVersion
+                                ? "bg-purple-100 dark:bg-purple-900/30 border-purple-300 text-purple-800 dark:text-purple-200 font-semibold"
+                                : "border-theme-card text-theme-primary hover:bg-theme-accent"
+                            )}
+                          >
+                            <span>
+                              {build.stable && <span className="mr-1">⭐</span>}
+                              Fabric Loader {build.loaderVersion}
+                            </span>
+                            <span className="text-[10px] text-theme-secondary font-mono">
+                              {build.stable ? "Estável" : "Beta"}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Seletor de build Paper (só aparece quando tipo = paper) */}
+                {serverType === "paper" && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Build do Paper</label>
+                    {paperVersionsLoading ? (
+                      <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Carregando builds do Paper...
+                      </div>
+                    ) : paperBuilds.length === 0 ? (
+                      <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
+                        Nenhuma build do Paper encontrada para {serverVersion}.
+                      </div>
+                    ) : (
+                      <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
+                        {paperBuilds.slice(0, 25).map((build) => (
+                          <button
+                            key={build.build}
+                            type="button"
+                            onClick={() => setSelectedPaperBuild(build.build)}
+                            className={cn(
+                              "w-full px-4 py-2.5 text-left text-sm transition-colors rounded-xl border flex items-center justify-between",
+                              selectedPaperBuild === build.build
+                                ? "bg-blue-100 dark:bg-blue-900/30 border-blue-300 text-blue-800 dark:text-blue-200 font-semibold"
+                                : "border-theme-card text-theme-primary hover:bg-theme-accent"
+                            )}
+                          >
+                            <span>
+                              {build.recommended && <span className="mr-1">⭐</span>}
+                              Paper build {build.build}
+                            </span>
+                            <span className="text-[10px] text-theme-secondary font-mono">
+                              {build.channel === "STABLE" ? "Estável" : build.channel}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* RAM */}
                 <div className="space-y-2">

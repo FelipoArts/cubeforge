@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle } from "lucide-react";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 
 // ============================================================
 // DeleteConfirmModal
@@ -25,6 +26,8 @@ export function DeleteConfirmModal({
   isImported = false,
 }: DeleteConfirmModalProps) {
   const [confirmInput, setConfirmInput] = useState("");
+
+  useLockBodyScroll(!!serverName);
 
   const handleConfirm = async () => {
     await onConfirm();

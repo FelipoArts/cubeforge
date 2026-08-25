@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
 import { useAppStore, type KnownServer, type ServerStatus } from "@/app/store";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 
 // ============================================================
 // GuestView
@@ -55,6 +56,7 @@ export function GuestView({
   } = useAppStore();
 
   const [showAddModal, setShowAddModal] = useState(false);
+  useLockBodyScroll(showAddModal);
   const [inviteCodeInput, setInviteCodeInput] = useState("");
   const [isAdding, setIsAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
@@ -63,6 +65,24 @@ export function GuestView({
   const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [connectedShortCode, setConnectedShortCode] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Contador de tempo online é calculado localmente (a partir de onlineSince) e
+  // precisa de um "tick" próprio para atualizar a UI a cada segundo, já que o
+  // polling da API Central acontece só a cada 30s.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // `handleConnect` marca connectedShortCode otimisticamente antes da conexão real
+  // (assíncrona, tratada em page.tsx) terminar. Se ela falhar ou cair depois, netStatus
+  // volta para "offline" — sem isso, o card ficava travado mostrando "Desconectar"
+  // até o usuário clicar manualmente.
+  useEffect(() => {
+    if (netStatus === "offline" && connectedShortCode !== null) {
+      setConnectedShortCode(null);
+    }
+  }, [netStatus, connectedShortCode]);
 
   // Sincronizar servidores locais do host na biblioteca do guest
   // Adiciona servidores locais novos e remove os que foram deletados
@@ -87,6 +107,8 @@ export function GuestView({
           maxPlayers: 20,
           currentPlayers: 0,
           lastSeenOnline: null,
+          onlineSince: null,
+          lastConfirmedAt: null,
           addedAt: new Date().toISOString(),
           isOwnServer: true,
           networkProvider: "tailscale",
@@ -125,14 +147,20 @@ export function GuestView({
     for (const server of knownServers) {
       try {
         // Consultar API Central para obter status do servidor
-        const response = await fetch(`${API_BASE}/api/servers/${server.shortCode}`);
+        const response = await fetch(`${API_BASE}/api/v1/servers/${server.shortCode}`);
         if (response.ok) {
-          const data = await response.json();
-          console.log(`[GuestView] Servidor ${server.shortCode} (${server.name}): status da API = ${data.status}`);
+          // A API Central responde envelopado: os dados reais ficam em data.server
+          // (metadados) e data.session (status/jogadores) — não no nível raiz.
+          const envelope = await response.json();
+          // session vem null quando o host nunca teve uma sessão ativa (ou ela expirou) —
+          // trata como "offline" em vez de deixar o status como undefined.
+          const session = envelope?.data?.session ?? {};
+          const status = (session.status ?? "offline") as ServerStatus;
+          console.log(`[GuestView] Servidor ${server.shortCode} (${server.name}): status da API = ${status}`);
           updateKnownServerStatus(
             server.shortCode,
-            data.status as ServerStatus,
-            data.currentPlayers
+            status,
+            session.currentPlayers ?? undefined
           );
         } else {
           console.warn(`[GuestView] Servidor ${server.shortCode}: API retornou HTTP ${response.status}`);
@@ -174,28 +202,33 @@ export function GuestView({
     setAddError(null);
 
     try {
-      const response = await fetch(`${API_BASE}/api/servers/${code}`);
+      const response = await fetch(`${API_BASE}/api/v1/servers/${code}`);
       if (!response.ok) {
         setAddError("Servidor não encontrado. Verifique o código e tente novamente.");
         setIsAdding(false);
         return;
       }
 
-      const data = await response.json();
+      // Envelope da API Central: metadados em data.server, status/jogadores em data.session.
+      const envelope = await response.json();
+      const server = envelope?.data?.server ?? {};
+      const session = envelope?.data?.session ?? {};
       addKnownServer({
-        shortCode: data.shortCode,
-        name: data.name,
-        version: data.version,
-        serverType: data.serverType || "vanilla",
-        description: data.description || `Servidor Minecraft ${data.version}`,
-        status: data.status,
-        port: data.port || 25565,
-        maxPlayers: data.maxPlayers || 20,
-        currentPlayers: data.currentPlayers || 0,
-        lastSeenOnline: data.status === "online" ? new Date().toISOString() : null,
+        shortCode: server.shortCode,
+        name: server.name,
+        version: server.version,
+        serverType: server.serverType || "vanilla",
+        description: server.description || `Servidor Minecraft ${server.version}`,
+        status: session.status || "offline",
+        port: session.port || 25565,
+        maxPlayers: session.maxPlayers || 20,
+        currentPlayers: session.currentPlayers || 0,
+        lastSeenOnline: session.status === "online" ? new Date().toISOString() : null,
+        onlineSince: session.status === "online" ? new Date().toISOString() : null,
+        lastConfirmedAt: new Date().toISOString(),
         addedAt: new Date().toISOString(),
         isOwnServer: false,
-        networkProvider: data.networkProvider?.provider || "tailscale",
+        networkProvider: session.provider || "tailscale",
       });
 
       setShowAddModal(false);
@@ -208,7 +241,7 @@ export function GuestView({
   };
 
   const handleConnect = (server: KnownServer) => {
-    if (server.status !== "online") return;
+    if (server.status !== "online" || isServerStale(server)) return;
     setConnectedShortCode(server.shortCode);
     onConnect(`CF-${server.shortCode}`);
   };
@@ -241,6 +274,29 @@ export function GuestView({
     if (hours < 24) return `Há ${hours}h`;
     const days = Math.floor(hours / 24);
     return `Há ${days}d`;
+  };
+
+  // Tempo online desde a última vez que o status transicionou para "online"
+  // (calculado localmente a partir de onlineSince, sem depender do host).
+  const formatUptime = (iso: string | null): string => {
+    if (!iso) return "0min";
+    const diff = Math.max(0, now - new Date(iso).getTime());
+    const totalMinutes = Math.floor(diff / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours < 1) return `${minutes}min`;
+    return `${hours}h${minutes.toString().padStart(2, "0")}min`;
+  };
+
+  // Um servidor é considerado "obsoleto" se a última confirmação da API Central
+  // foi há mais tempo do que alguns ciclos de polling (30s cada). Sem isso, um
+  // status cacheado (ex: "online") continuaria sendo exibido como verdade mesmo
+  // que a API esteja fora do ar ou as requisições estejam falhando repetidamente —
+  // o que passaria informação falsa para o convidado.
+  const STALE_THRESHOLD_MS = 100_000; // ~3 ciclos de 30s
+  const isServerStale = (server: KnownServer): boolean => {
+    if (!server.lastConfirmedAt) return true;
+    return Date.now() - new Date(server.lastConfirmedAt).getTime() > STALE_THRESHOLD_MS;
   };
 
   const getStatusColor = (status: string): string => {
@@ -360,7 +416,9 @@ export function GuestView({
         </motion.div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-          {knownServers.map((server, index) => (
+          {knownServers.map((server, index) => {
+            const stale = isServerStale(server);
+            return (
             <motion.div
               key={server.shortCode}
               initial={{ opacity: 0, y: 20 }}
@@ -381,16 +439,19 @@ export function GuestView({
                     {/* Status indicator */}
                     <div className={cn(
                       "w-2.5 h-2.5 rounded-full",
-                      getStatusColor(server.status),
-                      server.status === "online" && "animate-pulse"
+                      stale ? "bg-slate-400" : getStatusColor(server.status),
+                      !stale && server.status === "online" && "animate-pulse"
                     )} />
                     <span className={cn(
                       "text-[10px] font-bold uppercase tracking-wider",
+                      stale ? "text-theme-secondary" :
                       server.status === "online" ? "text-emerald-600 dark:text-emerald-400" :
                       server.status === "crashed" ? "text-rose-600 dark:text-rose-400" :
                       "text-theme-secondary"
-                    )}>
-                      {getStatusLabel(server.status)}
+                    )} title={stale ? "Não foi possível confirmar o status recentemente com a API Central" : undefined}>
+                      {/* Status desatualizado: não sabemos mais se ainda é verdade, então
+                          não afirmamos online/offline — só que não está confirmado. */}
+                      {stale ? "Não confirmado" : getStatusLabel(server.status)}
                     </span>
                   </div>
 
@@ -401,8 +462,15 @@ export function GuestView({
                         Meu
                       </span>
                     )}
-                    {/* Badge de tipo */}
-                    <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">
+                    {/* Badge de tipo com cor */}
+                    <span className={cn(
+                      "text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full",
+                      server.serverType === "forge" ? "text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-900/30" :
+                      server.serverType === "neoforge" ? "text-violet-700 dark:text-violet-300 bg-violet-100 dark:bg-violet-900/30" :
+                      server.serverType === "fabric" ? "text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/30" :
+                      server.serverType === "paper" ? "text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/30" :
+                      "text-emerald-700 dark:text-emerald-300 bg-emerald-100 dark:bg-emerald-900/30"
+                    )}>
                       {server.serverType}
                     </span>
                   </div>
@@ -434,14 +502,42 @@ export function GuestView({
                   )}
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {formatLastSeen(server.lastSeenOnline)}
+                    {server.status === "online" && !stale
+                      ? `Online há ${formatUptime(server.onlineSince)}`
+                      : formatLastSeen(server.lastSeenOnline)}
                   </span>
+                </div>
+
+                {/* Endereço de conexão: o app tuneliza a porta local para o servidor via
+                    mesh, então o endereço que o convidado usa no Minecraft é sempre este
+                    localhost — só passa a rotear de fato depois de clicar em "Conectar". */}
+                <div className="flex items-center gap-2 bg-theme-muted rounded-xl px-3 py-2 border border-theme-card">
+                  <Globe className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                  <span className="font-mono font-bold text-theme-primary text-xs flex-1 truncate">
+                    localhost:{minecraftPort}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
+                    className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
+                    title="Copiar endereço de conexão"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
                 </div>
               </div>
 
               {/* Ações do card */}
               <div className="px-5 pb-5 pt-0 flex items-center gap-2">
-                {server.status === "online" ? (
+                {stale && connectedShortCode !== server.shortCode ? (
+                  // Não conseguimos confirmar o status recentemente com a API Central —
+                  // melhor não afirmar "Online" nem "Offline" (nenhuma das duas seria confiável)
+                  // e impedir uma tentativa de conexão baseada em dado potencialmente obsoleto.
+                  <div className="flex-1 h-10 rounded-xl bg-theme-muted border border-theme-card flex items-center justify-center gap-1.5 text-[10px] font-bold text-theme-secondary">
+                    <WifiOff className="w-3 h-3" />
+                    Status desatualizado
+                  </div>
+                ) : server.status === "online" ? (
                   server.isOwnServer ? (
                     // Servidor do próprio host: não permite conectar (não pode conectar na própria mesh)
                     <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
@@ -499,7 +595,8 @@ export function GuestView({
                 </button>
               </div>
             </motion.div>
-          ))}
+            );
+          })}
         </div>
       )}
 

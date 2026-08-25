@@ -27,6 +27,29 @@ type Config struct {
 	LocalPort int   `json:"localPort"`           // Local port to listen on or forward to
 }
 
+// ErrorPayload é o formato estruturado impresso no stdout antes de sair em caso
+// de erro fatal. O processo Rust pai parseia essa linha (procura por `"error"`
+// no JSON) e traduz `Code` para uma mensagem amigável na Central de Diagnósticos,
+// em vez de só saber que "o sidecar morreu" com um código de saída genérico.
+type ErrorPayload struct {
+	Error  string `json:"error"`
+	Detail string `json:"detail"`
+}
+
+// fatalWithCode imprime a causa do erro em stdout (como JSON, na mesma linha de
+// output que o Rust já escuta) e encerra o processo. Substitui log.Fatalf, cujo
+// texto ia para stderr como log solto sem estrutura reconhecível pelo Rust.
+func fatalWithCode(code string, err error) {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	if b, mErr := json.Marshal(ErrorPayload{Error: code, Detail: detail}); mErr == nil {
+		fmt.Println(string(b))
+	}
+	os.Exit(1)
+}
+
 func main() {
 	useStdin := flag.Bool("stdin", false, "Read config from stdin (first line)")
 	configPath := flag.String("config", "", "Path to JSON config file")
@@ -42,10 +65,10 @@ func main() {
 		if scanner.Scan() {
 			line := scanner.Text()
 			if err := json.Unmarshal([]byte(line), &cfg); err != nil {
-				log.Fatalf("Failed to decode config from stdin: %v", err)
+				fatalWithCode("config_decode_failed", err)
 			}
 		} else {
-			log.Fatalf("Failed to read config from stdin: %v", scanner.Err())
+			fatalWithCode("config_read_failed", scanner.Err())
 		}
 
 		// Continuar monitorando stdin para detectar quando o pai morrer
@@ -63,12 +86,12 @@ func main() {
 		// Modo legado: ler de arquivo
 		configFile, err := os.Open(*configPath)
 		if err != nil {
-			log.Fatalf("Failed to open config: %v", err)
+			fatalWithCode("config_read_failed", err)
 		}
 		defer configFile.Close()
 
 		if err := json.NewDecoder(configFile).Decode(&cfg); err != nil {
-			log.Fatalf("Failed to decode config: %v", err)
+			fatalWithCode("config_decode_failed", err)
 		}
 
 		// Monitor stdin to exit if parent process closes
@@ -82,7 +105,7 @@ func main() {
 			}
 		}()
 	} else {
-		log.Fatal("Either --stdin or --config is required")
+		fatalWithCode("config_missing", nil)
 	}
 
 	s := &tsnet.Server{
@@ -95,22 +118,38 @@ func main() {
 	// Up connects to the tailnet and blocks until the node is authorized and has its IP address
 	status, err := s.Up(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to start tsnet: %v", err)
+		fatalWithCode("mesh_auth_failed", err)
 	}
 
 	if len(status.TailscaleIPs) == 0 {
-		log.Fatalf("No Tailscale IPs assigned to the node")
+		fatalWithCode("no_ip_assigned", nil)
 	}
-
-	fmt.Printf("{\"status\": \"online\", \"ip\": \"%s\"}\n", status.TailscaleIPs[0])
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Confirmar que o listener local/mesh realmente abre ANTES de reportar "online".
+	// Reportar online cedo demais (e só descobrir o bind falho um instante depois)
+	// fazia a UI "piscar" online→offline sem explicação clara.
+	var ln net.Listener
 	if cfg.Mode == "host" {
-		startHostMode(ctx, s, cfg)
+		ln, err = s.Listen("tcp", ":25565")
+		if err != nil {
+			fatalWithCode("listen_mesh_failed", err)
+		}
 	} else {
-		startGuestMode(ctx, s, cfg)
+		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort))
+		if err != nil {
+			fatalWithCode("listen_local_failed", err)
+		}
+	}
+
+	fmt.Printf("{\"status\": \"online\", \"ip\": \"%s\"}\n", status.TailscaleIPs[0])
+
+	if cfg.Mode == "host" {
+		go startHostMode(ctx, s, cfg, ln)
+	} else {
+		go startGuestMode(ctx, s, cfg, ln)
 	}
 
 	// Wait for exit signal
@@ -119,12 +158,7 @@ func main() {
 	<-sigChan
 }
 
-func startHostMode(ctx context.Context, s *tsnet.Server, cfg Config) {
-	// Listen on the Tailscale network (Minecraft port 25565)
-	ln, err := s.Listen("tcp", ":25565")
-	if err != nil {
-		log.Fatalf("Failed to listen on tsnet: %v", err)
-	}
+func startHostMode(ctx context.Context, s *tsnet.Server, cfg Config, ln net.Listener) {
 	defer ln.Close()
 
 	fmt.Printf("{\"info\": \"Host listening on :25565\"}\n")
@@ -142,12 +176,7 @@ func startHostMode(ctx context.Context, s *tsnet.Server, cfg Config) {
 	}
 }
 
-func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config) {
-	// Listen on local machine to redirect to host
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort))
-	if err != nil {
-		log.Fatalf("Failed to listen locally: %v", err)
-	}
+func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config, ln net.Listener) {
 	defer ln.Close()
 
 	fmt.Printf("{\"info\": \"Guest listening on localhost:%d -> %s:25565\"}\n", cfg.LocalPort, cfg.TargetIP)
@@ -158,10 +187,14 @@ func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config) {
 			log.Printf("Local accept error: %v", err)
 			continue
 		}
-		
-		targetConn, err := s.Dial(ctx, "tcp", fmt.Sprintf("%s:25565", cfg.TargetIP))
+
+		// Timeout no Dial: sem isso, um host inalcançável na malha deixava esta
+		// goroutine pendurada indefinidamente em vez de falhar e liberar a conexão.
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		targetConn, err := s.Dial(dialCtx, "tcp", fmt.Sprintf("%s:25565", cfg.TargetIP))
+		cancel()
 		if err != nil {
-			log.Printf("Dial error: %v", targetConn)
+			log.Printf("Dial error: %v", err)
 			conn.Close()
 			continue
 		}

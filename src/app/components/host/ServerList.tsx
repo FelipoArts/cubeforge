@@ -1,8 +1,9 @@
 "use client";
 
-import { Server, Plus, Trash2, Loader2, FolderOpen } from "lucide-react";
+import { Server, Plus, Trash2, Loader2, FolderOpen, Package } from "lucide-react";
 import { cn } from "@/lib/utils";
 import SettingsButton from "@/app/components/SettingsButton";
+import { pushDiagnostic } from "@/app/diagnostics";
 import type { ServerInfo } from "@/lib/server";
 
 // ============================================================
@@ -19,6 +20,7 @@ interface ServerListProps {
   onSelect: (name: string) => void;
   onCreate: () => void;
   onImport: () => void;
+  onImportModpack: () => void;
   onDelete: (name: string, e: React.MouseEvent) => void;
   onConfig: (path: string) => void;
   isDeleting: string | null;
@@ -32,6 +34,7 @@ export function ServerList({
   onSelect,
   onCreate,
   onImport,
+  onImportModpack,
   onDelete,
   onConfig,
   isDeleting,
@@ -52,6 +55,14 @@ export function ServerList({
             title="Importar Servidor Existente"
           >
             {isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderOpen className="w-4 h-4" />}
+          </button>
+          <button
+            type="button"
+            onClick={onImportModpack}
+            className="p-1.5 hover:bg-theme-accent text-indigo-600 rounded-lg border border-theme-accent transition-colors cursor-pointer"
+            title="Importar Modpack (.zip/.mrpack)"
+          >
+            <Package className="w-4 h-4" />
           </button>
           <button
             type="button"
@@ -78,7 +89,7 @@ export function ServerList({
                 key={server.name}
                 onClick={() => {
                   if (serverStatus !== "offline" && serverStatus !== "crashed" && !isSelected) {
-                    alert("Pare o servidor atual antes de selecionar outro.");
+                    pushDiagnostic({ level: "warning", source: "Servidor", title: "Servidor em execução", message: "Pare o servidor atual antes de selecionar outro." });
                     return;
                   }
                   onSelect(server.name);

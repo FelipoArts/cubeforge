@@ -10,13 +10,21 @@ import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
 import { useAppStore, type ServerStatus } from "@/app/store";
-import type { DownloadProgress } from "@/lib/jre";
+import { join } from "@tauri-apps/api/path";
+import { readTextFile, remove } from "@tauri-apps/plugin-fs";
+import { installJRE, isJREInstalled, getJREPath, type DownloadProgress } from "@/lib/jre";
 import {
+  getJavaVersion,
   type ServerInfo,
   type ServerInstallProgress,
 } from "@/lib/server";
 import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/app/components/ThemeToggle";
+import { DiagnosticsToasts, DiagnosticsBell } from "@/app/components/DiagnosticsCenter";
+import { pushDiagnostic } from "@/app/diagnostics";
+import { analyzeCrashText } from "@/lib/crashAnalyzer";
+import { createLagMonitor } from "@/lib/lagDetector";
+import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
 
 // Componentes extraídos
 import { HostView } from "@/app/components/host/HostView";
@@ -50,6 +58,9 @@ export default function Home() {
     setSelectedServer,
     serverStatus,
     setServerStatus,
+    setLastCrashInfo,
+    mcLogsByServer,
+    setMcLogs: setMcLogsInStore,
   } = useAppStore();
 
   // --- Estados locais (compartilhados entre Host e Guest) ---
@@ -63,9 +74,29 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
-  const [mcLogs, setMcLogs] = useState<string[]>([]);
+  // O console do Minecraft (mcLogsByServer) vive no store (persistido por servidor);
+  // aqui derivamos apenas a sessão do servidor atualmente selecionado para exibição.
+  const mcLogs = selectedServer ? (mcLogsByServer[selectedServer] ?? []) : [];
 
-  // Carregar logs do localStorage na montagem e persistir em toda mudança
+  // Ações/comandos disparados pela UI (iniciar, parar, enviar comando, limpar)
+  // sempre dizem respeito ao servidor que o usuário está vendo no momento.
+  const onSetMcLogsForSelected = (logs: string[] | ((prev: string[]) => string[])) => {
+    if (!selectedServer) return;
+    setMcLogsInStore(selectedServer, logs);
+  };
+
+  // Eventos vindos do backend (linhas de log, mudanças de status) não sabem a
+  // qual servidor pertencem — são atribuídos ao servidor cujo processo está
+  // rodando (runningServer), que pode ser diferente do servidor selecionado
+  // na tela caso o usuário tenha navegado para outro servidor nesse meio tempo.
+  const appendMcLogToRunningServer = (line: string) => {
+    const state = useAppStore.getState();
+    const target = state.runningServer ?? state.selectedServer;
+    if (!target) return;
+    state.setMcLogs(target, prev => [...prev, line]);
+  };
+
+  // Carregar logs de rede do localStorage na montagem e persistir em toda mudança
   // IMPORTANTE: isso precisa acontecer em UM único useEffect para evitar que
   // o salvamento com array vazio sobrescreva os dados carregados.
   const logsLoadedRef = useRef(false);
@@ -75,10 +106,8 @@ export default function Home() {
       if (raw) {
         const parsed = JSON.parse(raw);
         const savedLogs = parsed?.state?.logs;
-        const savedMcLogs = parsed?.state?.mcLogs;
-        if (savedLogs?.length || savedMcLogs?.length) {
-          setLogs(savedLogs?.slice(-150) || []);
-          setMcLogs(savedMcLogs?.slice(-500) || []);
+        if (savedLogs?.length) {
+          setLogs(savedLogs.slice(-150));
           logsLoadedRef.current = true;
           return; // Não persiste de volta logo após carregar
         }
@@ -89,27 +118,24 @@ export default function Home() {
     logsLoadedRef.current = true;
   }, []);
 
-  // Persistir SEPARADAMENTE: só roda quando logs/mcLogs mudam (não na montagem)
+  // Persistir SEPARADAMENTE: só roda quando logs mudam (não na montagem)
   const prevLogsRef = useRef<string[]>([]);
-  const prevMcLogsRef = useRef<string[]>([]);
   useEffect(() => {
     // Ignorar a primeira execução (quando logsLoadedRef acabou de ficar true)
     if (!logsLoadedRef.current) return;
     // Só persistir se realmente mudou
-    if (logs === prevLogsRef.current && mcLogs === prevMcLogsRef.current) return;
+    if (logs === prevLogsRef.current) return;
     prevLogsRef.current = logs;
-    prevMcLogsRef.current = mcLogs;
     try {
       const raw = localStorage.getItem('cubeforge-storage');
       if (raw) {
         const parsed = JSON.parse(raw);
         parsed.state = parsed.state || {};
         parsed.state.logs = logs.slice(-150);
-        parsed.state.mcLogs = mcLogs.slice(-500);
         localStorage.setItem('cubeforge-storage', JSON.stringify(parsed));
       }
     } catch {}
-  }, [logs, mcLogs]);
+  }, [logs]);
 
   const [localServers, setLocalServers] = useState<ServerInfo[]>([]);
   const [showCreateServer, setShowCreateServer] = useState(false);
@@ -154,7 +180,7 @@ export default function Home() {
     invoke("sync_send_heartbeat", {
       shortCode: shortCode,
       status: combinedStatus,
-      currentPlayers: null,
+      currentPlayers: combinedStatus === "online" ? currentPlayersRef.current : null,
     }).then(() => {
       setLogs(prev => [...prev, `[API] Status combinado atualizado: ${combinedStatus}`]);
     }).catch(() => {
@@ -169,8 +195,32 @@ export default function Home() {
   const netStatusRef = useRef<"offline" | "connecting" | "online">("offline");
   const serverStatusRef = useRef<ServerStatus>("offline");
   const pendingMcStartRef = useRef(false);
+  // Nomes de servidores para os quais já tentamos a auto-correção de "JRE incompatível"
+  // nesta sessão — evita loop (reinstalar → crashar de novo → reinstalar → ...) se a
+  // causa real do crash for outra coisa que só parece o mesmo sintoma.
+  const jreAutoFixAttemptedRef = useRef<Set<string>>(new Set());
   const serverShortCodeRef = useRef<string>("");
   const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // shortCode do último servidor efetivamente registrado na API Central nesta sessão.
+  // Evita re-registrar (e re-logar) o mesmo servidor repetidamente.
+  const registeredShortCodeRef = useRef<string | null>(null);
+  // Contagem de jogadores online, derivada das linhas de log do Minecraft
+  // ("X joined/left the game"). Zerada sempre que o servidor sai do estado "online".
+  const currentPlayersRef = useRef(0);
+  // Detector de lag baseado em regras (ver src/lib/lagDetector.ts) — mantém uma
+  // janela deslizante de ocorrências de "Can't keep up!"/Watchdog no stream de
+  // log. Resetado a cada novo start para não arrastar contagem de uma sessão anterior.
+  const lagMonitorRef = useRef(createLagMonitor());
+  // Última amostra de RAM/CPU real da máquina (evento "mc-resource-sample",
+  // emitido pelo Rust a cada ~15s enquanto o servidor roda — ver resourceDiagnostics.ts).
+  // Usada para enriquecer o aviso de lag com a causa provável (CPU/RAM/mod).
+  const latestResourceSampleRef = useRef<ResourceSnapshot | null>(null);
+  // Detecta pressão SUSTENTADA de CPU/RAM (avisa antes mesmo do Minecraft
+  // acusar lag no log). Resetado junto com o lagMonitorRef a cada novo start.
+  const resourceMonitorRef = useRef(createResourceMonitor());
+  // Amostra mais recente exposta pra UI (indicador de saúde na HostView) —
+  // não precisa de histórico, só o valor mais atual.
+  const [resourceSample, setResourceSample] = useState<ResourceSnapshot | null>(null);
 
   // Sincronizar refs
   useEffect(() => { selectedServerRef.current = selectedServer; }, [selectedServer]);
@@ -178,6 +228,69 @@ export default function Home() {
   useEffect(() => { serverConfigPortRef.current = serverConfigPort; }, [serverConfigPort]);
   useEffect(() => { netStatusRef.current = netStatus; }, [netStatus]);
   useEffect(() => { serverStatusRef.current = serverStatus; }, [serverStatus]);
+
+  // Registra (ou associa) um servidor local na API Central: guarda o shortCode nos
+  // refs usados pelos heartbeats e envia sync_register_server. Idempotente por
+  // shortCode (via registeredShortCodeRef) para não reenviar a cada re-render.
+  //
+  // Antes isso só acontecia dentro do listener de "network-status" ficar online —
+  // ou seja, só no exato momento em que a rede mesh conectava. Se o usuário criasse
+  // ou selecionasse um servidor DEPOIS da mesh já estar online (ou desse Ctrl+R com
+  // tudo já rodando), nenhum evento de rede disparava de novo e esse servidor nunca
+  // era registrado — a API Central nunca ficava sabendo que ele existia, e o convidado
+  // via 404 mesmo com o host e a mesh online. Por isso agora essa função também é
+  // chamada por um efeito reativo (abaixo) sempre que o servidor selecionado muda
+  // com a mesh já online.
+  const registerServerWithCentral = (serverInfo: ServerInfo) => {
+    if (!serverInfo.shortCode) return;
+    const metaShortCode = serverInfo.shortCode;
+    serverShortCodeRef.current = metaShortCode;
+    setShortCode(metaShortCode);
+
+    if (registeredShortCodeRef.current === metaShortCode) return;
+    registeredShortCodeRef.current = metaShortCode;
+
+    setLogs(prev => [...prev, `[INFO] Código do servidor: CF-${metaShortCode}`]);
+
+    const type = serverInfo.serverType || "vanilla";
+    const typeLabel =
+      type === "vanilla" ? "Vanilla" :
+      type === "neoforge" ? "NeoForge" :
+      type === "forge" ? "Forge" :
+      type === "fabric" ? "Fabric" :
+      type === "paper" ? "Paper" :
+      type;
+    invoke("sync_register_server", {
+      name: serverInfo.name,
+      version: serverInfo.version || "1.20.1",
+      serverType: type,
+      description: serverInfo.description || `Servidor Minecraft ${typeLabel} ${serverInfo.version || "1.20.1"}`,
+      shortCode: metaShortCode,
+      owner: null,
+    }).then((responseJson: any) => {
+      try {
+        const response = typeof responseJson === "string" ? JSON.parse(responseJson) : responseJson;
+        if (response.code === "SERVER_CREATED") {
+          setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central! Código: CF-${metaShortCode}`]);
+        } else if (response.code === "QUEUED") {
+          setLogs(prev => [...prev, `[INFO] ⏳ Servidor enfileirado para sincronização. Código: CF-${metaShortCode}`]);
+        }
+      } catch {
+        setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central!`]);
+      }
+    }).catch(() => {
+      setLogs(prev => [...prev, `[INFO] ⚠ API Central indisponível. Servidor funcionando em modo offline.`]);
+    });
+  };
+
+  // Reage a: mesh já online + servidor selecionado mudou (server novo criado,
+  // troca manual de servidor, ou Ctrl+R com tudo já rodando). Cobre os casos que o
+  // listener de "network-status" sozinho não cobre (ver comentário acima).
+  useEffect(() => {
+    if (netStatus !== "online" || !selectedServer) return;
+    const serverInfo = localServersRef.current.find(s => s.name === selectedServer);
+    if (serverInfo) registerServerWithCentral(serverInfo);
+  }, [selectedServer, netStatus]);
 
   // --- Heartbeat periódico para manter servidor "vivo" na API Central ---
   // A API Central tem um heartbeat timeout de 300s (5 min).
@@ -194,31 +307,23 @@ export default function Home() {
       heartbeatIntervalRef.current = null;
     }
 
-    // Só iniciar heartbeat se o servidor estiver online e tiver shortCode
+    // Só iniciar heartbeat se o status COMBINADO (mesh + MC) estiver online e tiver shortCode.
+    // Antes este efeito considerava apenas serverStatus (MC), ignorando o mesh: se o mesh
+    // caísse com o MC ainda rodando, este intervalo continuava reenviando "online" a cada
+    // 60s e sobrescrevia o "offline" correto enviado pelo efeito do combinedStatus acima.
     const currentShortCode = serverShortCodeRef.current;
-    if (serverStatus === "online" && currentShortCode) {
+    if (combinedStatus === "online" && currentShortCode) {
       setLogs(prev => [...prev, `[INFO] ❤️ Iniciando heartbeat (a cada 60s) para CF-${currentShortCode}...`]);
-
-      // Enviar um heartbeat imediatamente ao iniciar
-      invoke("sync_send_heartbeat", {
-        shortCode: currentShortCode,
-        status: "online",
-        currentPlayers: null,
-      }).then(() => {
-        setLogs(prev => [...prev, `[INFO] ❤️ Heartbeat inicial enviado para CF-${currentShortCode}`]);
-      }).catch((err: any) => {
-        console.warn("[Heartbeat] Falha no heartbeat inicial:", err);
-        setLogs(prev => [...prev, `[WARN] ❤️ Heartbeat inicial falhou: ${err}`]);
-      });
 
       heartbeatIntervalRef.current = setInterval(() => {
         const sc = serverShortCodeRef.current;
-        const st = serverStatusRef.current;
-        if (sc && st === "online") {
+        // Reavalia o status combinado no momento do tick, não apenas o MC.
+        const stillCombinedOnline = netStatusRef.current === "online" && serverStatusRef.current === "online";
+        if (sc && stillCombinedOnline) {
           invoke("sync_send_heartbeat", {
             shortCode: sc,
-            status: st,
-            currentPlayers: null,
+            status: "online",
+            currentPlayers: currentPlayersRef.current,
           }).catch((err: any) => {
             console.warn("[Heartbeat] Falha ao enviar heartbeat:", err);
           });
@@ -232,7 +337,56 @@ export default function Home() {
         heartbeatIntervalRef.current = null;
       }
     };
-  }, [serverStatus, shortCode, setLogs]);
+  }, [combinedStatus, shortCode, setLogs]);
+
+  // Inicia o processo Java para um servidor: resolve (e instala se preciso) a JRE
+  // correta para a versão do MC, lê a RAM configurada em cubicase-meta.json, e invoca
+  // start_minecraft_server. Compartilhada entre o auto-start pós-conexão da rede mesh
+  // e a auto-correção de "JRE incompatível" (que reinstala a JRE e chama de novo).
+  const startMinecraftForServer = async (serverInfo: ServerInfo) => {
+    setServerStatus("starting");
+    useAppStore.getState().setRunningServer(serverInfo.name);
+    useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${serverInfo.name}"...`]);
+
+    try {
+      const version = serverInfo.version || "1.20.1";
+      const javaVer = getJavaVersion(version);
+
+      const installed = await isJREInstalled(javaVer);
+      if (!installed) {
+        useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`]);
+        await installJRE(javaVer, (p) => {
+          setServerInstallProgress({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: p.percent });
+        });
+        setServerInstallProgress(null);
+      }
+      const jrePath = await getJREPath(javaVer);
+      const javaPath = `${jrePath}\\bin\\java.exe`;
+
+      let ram = 4;
+      try {
+        const metaPath = await join(serverInfo.path, 'cubicase-meta.json');
+        const metaContent = await readTextFile(metaPath);
+        const meta = JSON.parse(metaContent) as { ramGb?: number };
+        if (typeof meta.ramGb === 'number' && meta.ramGb >= 2) ram = meta.ramGb;
+      } catch (e) {
+        console.warn('Could not read RAM from meta file, using default 4GB:', e);
+      }
+
+      await invoke("start_minecraft_server", {
+        serverDir: serverInfo.path,
+        javaPath,
+        ramGb: ram,
+        localPort: minecraftPort,
+        serverJarName: serverInfo.serverJar || null,
+        launchArgsDir: serverInfo.launchArgsDir || null,
+      });
+    } catch (err: any) {
+      console.error(err);
+      useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase ERR] Falha ao iniciar automaticamente: ${err}`]);
+      setServerStatus("offline");
+    }
+  };
 
   // --- Listeners Tauri (registrados UMA vez no page.tsx) ---
   useEffect(() => {
@@ -240,6 +394,9 @@ export default function Home() {
     let unlistenLogs: (() => void) | null = null;
     let unlistenMcStatus: (() => void) | null = null;
     let unlistenMcLogs: (() => void) | null = null;
+    let unlistenMcDiagnostic: (() => void) | null = null;
+    let unlistenNetDiagnostic: (() => void) | null = null;
+    let unlistenResourceSample: (() => void) | null = null;
 
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
@@ -261,54 +418,14 @@ export default function Home() {
           if (currentSelectedServer) {
             const serverInfo = currentLocalServers.find(s => s.name === currentSelectedServer);
             if (serverInfo && serverInfo.shortCode) {
-              // Usar o shortCode do meta.json como identificador fixo na API
-              const metaShortCode = serverInfo.shortCode;
-              serverShortCodeRef.current = metaShortCode;
-              setShortCode(metaShortCode);
-              setLogs(prev => [...prev, `[INFO] Código do servidor: CF-${metaShortCode}`]);
-
-              // Registrar servidor na API Central (entidade permanente)
-              const currentMcStatus = serverStatusRef.current;
-              invoke("sync_register_server", {
-                name: currentSelectedServer,
-                version: serverInfo.version || "1.20.1",
-                serverType: "vanilla",
-                description: `Servidor Minecraft Vanilla ${serverInfo.version || "1.20.1"}`,
-                shortCode: metaShortCode,
-                owner: null,
-              }).then((responseJson: any) => {
-                try {
-                  const response = typeof responseJson === "string" ? JSON.parse(responseJson) : responseJson;
-                  if (response.code === "SERVER_CREATED") {
-                    setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central! Código: CF-${metaShortCode}, Status: ${currentMcStatus}`]);
-                  } else if (response.code === "QUEUED") {
-                    setLogs(prev => [...prev, `[INFO] ⏳ Servidor enfileirado para sincronização. Código: CF-${metaShortCode}`]);
-                  }
-                } catch {
-                  setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central! Status: ${currentMcStatus}`]);
-                }
-              }).catch(() => {
-                setLogs(prev => [...prev, `[INFO] ⚠ API Central indisponível. Servidor funcionando em modo offline.`]);
-              });
+              registerServerWithCentral(serverInfo);
 
               if (pendingMcStartRef.current && currentSelectedServer) {
                 pendingMcStartRef.current = false;
                 setTimeout(() => {
-                  // Dispara o start do MC server via invoke direto
                   const serverInfo2 = localServersRef.current.find(s => s.name === currentSelectedServer);
-                  if (serverInfo2) {
-                    setServerStatus("starting");
-                    setMcLogs(prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${currentSelectedServer}"...`]);
-                    invoke("start_minecraft_server", {
-                      serverDir: serverInfo2.path,
-                      javaPath: "",
-                      ramGb: 4,
-                      localPort: minecraftPort,
-                    }).catch((err: any) => {
-                      console.error(err);
-                      setServerStatus("offline");
-                    });
-                  }
+                  if (!serverInfo2) return;
+                  startMinecraftForServer(serverInfo2);
                 }, 500);
               }
             } else {
@@ -346,13 +463,120 @@ export default function Home() {
           const newLogs = [...prev, `[${event.payload.is_error ? 'ERR' : 'INFO'}] ${event.payload.message}`];
           return newLogs.slice(-150);
         });
+        if (event.payload.is_error) {
+          pushDiagnostic({
+            level: "error",
+            source: "Rede",
+            title: "Falha na rede mesh",
+            message: event.payload.message,
+          });
+        }
       });
+
+      // Diagnósticos estruturados vindos do backend Rust (causa específica de
+      // crash do Minecraft: porta ocupada, falta de RAM, JRE incompatível, etc)
+      // e do sidecar Go (auth inválida, sem internet, hostname duplicado, etc).
+      unlistenMcDiagnostic = await listen<{
+        level: "info" | "warning" | "error" | "critical";
+        title: string;
+        message: string;
+        detail?: string;
+        code?: string;
+        crashReportText?: string;
+        crashReportFile?: string;
+        resourceSnapshot?: { totalRamMb: number; availableRamMb: number; cpuUsagePercent: number; processRamMb?: number; processCpuPercent?: number };
+        allocatedRamMb?: number;
+      }>(
+        "mc-diagnostic",
+        (event) => {
+          // Analisador de regras (src/lib/crashAnalyzer.ts) examina o texto completo
+          // do crash-report/latest.log — mais rico que a causa de 1 linha do Rust
+          // (ex: reconhece conflito de mod, dependência faltando, watchdog/trava).
+          // Se nenhuma regra bater, mantém o título/mensagem genéricos vindos do backend.
+          // O retrato de RAM/CPU (resourceDiagnostics.ts) refina especificamente a
+          // regra de OOM: "aumente a alocação" vs. "o PC não tem RAM suficiente".
+          const analysis = analyzeCrashText(event.payload.crashReportText, {
+            ...event.payload.resourceSnapshot,
+            allocatedRamMb: event.payload.allocatedRamMb,
+          });
+          const title = analysis?.title ?? event.payload.title;
+          const message = analysis?.message ?? event.payload.message;
+          const detail = event.payload.crashReportText
+            ? event.payload.crashReportText.slice(0, 2000)
+            : event.payload.detail;
+
+          pushDiagnostic({
+            level: event.payload.level,
+            title,
+            message,
+            detail,
+            source: "Servidor",
+          });
+
+          // "mc-diagnostic" só é emitido pelo Rust no caso de crash do servidor —
+          // guarda a causa já traduzida para a HostView mostrar no banner de crash.
+          setLastCrashInfo({ title, message, detail });
+
+          // Auto-correção: "UnsupportedClassVersionError" quase sempre significa uma
+          // instalação de JRE corrompida/incompleta para esta versão (a versão CORRETA
+          // já é escolhida deterministicamente por getJavaVersion antes de cada start).
+          // Reinstalar do zero e tentar iniciar de novo, uma única vez por servidor
+          // nesta sessão, evita que o usuário precise diagnosticar isso manualmente.
+          if (event.payload.code === "java_version_incompatible") {
+            const crashedServerName = useAppStore.getState().runningServer;
+            const serverInfo = crashedServerName
+              ? localServersRef.current.find(s => s.name === crashedServerName)
+              : null;
+            if (serverInfo && !jreAutoFixAttemptedRef.current.has(serverInfo.name)) {
+              jreAutoFixAttemptedRef.current.add(serverInfo.name);
+              (async () => {
+                try {
+                  const javaVer = getJavaVersion(serverInfo.version || "1.20.1");
+                  pushDiagnostic({
+                    level: "info",
+                    source: "Servidor",
+                    title: "Corrigindo automaticamente",
+                    message: `Reinstalando a JRE ${javaVer} (provável instalação corrompida) e tentando iniciar "${serverInfo.name}" novamente...`,
+                  });
+                  useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] Detectada JRE ${javaVer} incompatível/corrompida — reinstalando automaticamente...`]);
+                  const jrePath = await getJREPath(javaVer);
+                  await remove(jrePath, { recursive: true }).catch(() => {});
+                  await startMinecraftForServer(serverInfo);
+                } catch (err) {
+                  console.error("[AutoFix JRE] Falha ao corrigir automaticamente:", err);
+                }
+              })();
+            }
+          }
+        }
+      );
+      unlistenNetDiagnostic = await listen<{ level: "info" | "warning" | "error" | "critical"; title: string; message: string; detail?: string }>(
+        "network-diagnostic",
+        (event) => {
+          pushDiagnostic({ ...event.payload, source: "Rede" });
+        }
+      );
 
       unlistenMcStatus = await listen<string>("minecraft-status-changed", (event) => {
         const status = event.payload as ServerStatus;
         setServerStatus(status);
         // O heartbeat é enviado automaticamente pelo useEffect do combinedStatus
         // NÃO precisa enviar manualmente aqui.
+
+        // Fora do estado "online" não há jogadores conectados: zera a contagem
+        // para não reportar um número desatualizado na próxima vez que ficar online.
+        if (status !== "online") {
+          currentPlayersRef.current = 0;
+        }
+
+        // Novo start: zera a janela do detector de lag e do monitor de
+        // recursos para não arrastar contagem de uma sessão anterior do processo.
+        if (status === "starting") {
+          lagMonitorRef.current.reset();
+          resourceMonitorRef.current.reset();
+          latestResourceSampleRef.current = null;
+          setResourceSample(null);
+        }
 
         let statusMsg = "";
         switch (status) {
@@ -362,14 +586,49 @@ export default function Home() {
           case "stopping": statusMsg = "[Cubicase] Servidor de Minecraft está PARANDO..."; break;
           case "crashed": statusMsg = "[Cubicase ERR] O servidor de Minecraft fechou de forma inesperada (CRASHED)!"; break;
         }
-        if (statusMsg) setMcLogs(prev => [...prev, statusMsg]);
+        if (statusMsg) appendMcLogToRunningServer(statusMsg);
       });
 
       unlistenMcLogs = await listen<string>("minecraft-log", (event) => {
-        setMcLogs(prev => {
-          const newLogs = [...prev, event.payload];
-          return newLogs.slice(-500);
-        });
+        const line = event.payload.trim();
+        // Não há RCON/consulta de estado disponível — a contagem de jogadores é
+        // derivada das mensagens padrão do servidor vanilla ("X joined/left the game").
+        if (/ joined the game$/.test(line)) {
+          currentPlayersRef.current += 1;
+        } else if (/ left the game$/.test(line)) {
+          currentPlayersRef.current = Math.max(0, currentPlayersRef.current - 1);
+        }
+
+        // Detecção de lag/trava baseada em regras sobre o próprio aviso do
+        // Minecraft (ver src/lib/lagDetector.ts) — não precisa de RCON. A
+        // mensagem é enriquecida com o retrato de RAM/CPU real da máquina
+        // (resourceDiagnostics.ts) pra apontar se o gargalo é CPU, RAM do
+        // sistema, ou provavelmente um mod específico.
+        const lagDiagnostic = lagMonitorRef.current.ingestLine(line);
+        if (lagDiagnostic) {
+          const bottleneck = explainResourceBottleneck(latestResourceSampleRef.current);
+          pushDiagnostic({
+            ...lagDiagnostic,
+            message: bottleneck ? `${lagDiagnostic.message} ${bottleneck}` : lagDiagnostic.message,
+            source: "Servidor",
+          });
+        }
+
+        appendMcLogToRunningServer(event.payload);
+      });
+
+      // Amostra periódica de RAM/CPU real da máquina (a cada ~15s enquanto o
+      // servidor roda — ver a thread de amostragem em src-tauri/src/lib.rs).
+      // Alimenta o indicador de saúde na UI e o monitor de pressão sustentada
+      // (aviso proativo antes mesmo do Minecraft acusar lag no log).
+      unlistenResourceSample = await listen<ResourceSnapshot>("mc-resource-sample", (event) => {
+        latestResourceSampleRef.current = event.payload;
+        setResourceSample(event.payload);
+
+        const resourceDiagnostic = resourceMonitorRef.current.ingestSample(event.payload);
+        if (resourceDiagnostic) {
+          pushDiagnostic({ ...resourceDiagnostic, source: "Servidor" });
+        }
       });
 
       // Restaurar estado real APÓS os listeners estarem registrados.
@@ -385,10 +644,10 @@ export default function Home() {
         }
         if (status.minecraftStatus === "online") {
           setServerStatus("online");
-          setMcLogs(prev => [...prev, "[Cubicase] ✅ Servidor Minecraft já estava ONLINE (detectado após recarga)."]);
+          appendMcLogToRunningServer("[Cubicase] ✅ Servidor Minecraft já estava ONLINE (detectado após recarga).");
         } else if (status.minecraftStatus === "crashed") {
           setServerStatus("crashed");
-          setMcLogs(prev => [...prev, "[Cubicase] ❌ Servidor Minecraft estava CRASHADO (detectado após recarga)."]);
+          appendMcLogToRunningServer("[Cubicase] ❌ Servidor Minecraft estava CRASHADO (detectado após recarga).");
         }
       } catch (err) {
         console.warn("[Restore] Erro ao verificar estado do sistema:", err);
@@ -400,8 +659,11 @@ export default function Home() {
       unlistenLogs?.();
       unlistenMcStatus?.();
       unlistenMcLogs?.();
+      unlistenMcDiagnostic?.();
+      unlistenNetDiagnostic?.();
+      unlistenResourceSample?.();
     };
-  }, [setServerStatus, minecraftPort]);
+  }, [setServerStatus, setLastCrashInfo, minecraftPort]);
 
   // --- Guest Handlers ---
   const handleGuestConnect = async (inviteCode: string) => {
@@ -412,15 +674,18 @@ export default function Home() {
 
     try {
       const shortCodeClean = inviteCode.replace("CF-", "");
-      const response = await fetch(`https://cubeforge-api.cubeforge.workers.dev/api/servers/${shortCodeClean}`);
+      const response = await fetch(`https://cubeforge-api.cubeforge.workers.dev/api/v1/servers/${shortCodeClean}`);
       if (response.ok) {
-        const data = await response.json();
-        setLogs(prev => [...prev, `[INFO] Servidor encontrado: ${data.name} (${data.version})`]);
+        // Envelope da API Central: metadados em data.server, status em data.session.
+        const envelope = await response.json();
+        const server = envelope?.data?.server ?? {};
+        const session = envelope?.data?.session ?? {};
+        setLogs(prev => [...prev, `[INFO] Servidor encontrado: ${server.name} (${server.version})`]);
         setDiscoveredServer({
-          name: data.name,
-          version: data.version,
-          status: data.status,
-          description: data.description,
+          name: server.name,
+          version: server.version,
+          status: session.status,
+          description: server.description,
         });
       } else {
         setLogs(prev => [...prev, `[INFO] API Central indisponível. Conectando diretamente...`]);
@@ -441,7 +706,12 @@ export default function Home() {
       console.error(err);
       setNetStatus("offline");
       setLogs(prev => [...prev, `[ERR] Falha ao conectar: ${err}`]);
-      alert("Falha ao conectar: " + err);
+      pushDiagnostic({
+        level: "error",
+        source: "Rede",
+        title: "Falha ao conectar ao servidor",
+        message: String(err),
+      });
     }
   };
 
@@ -459,6 +729,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-theme-bg transition-colors duration-300">
+      <DiagnosticsToasts />
       {/* Cabeçalho */}
       <header className="sticky top-0 z-40 bg-theme-card/80 backdrop-blur-xl border-b border-theme-card">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -501,6 +772,7 @@ export default function Home() {
               </button>
             </div>
 
+            <DiagnosticsBell />
             <ThemeToggle />
           </div>
         </div>
@@ -529,12 +801,13 @@ export default function Home() {
             settingsPort={settingsPort}
             copied={copied}
             shortCode={shortCode}
+            resourceSample={resourceSample}
             onSetNetStatus={setNetStatus}
             onSetNetIp={setNetIp}
             onSetIsStarting={setIsStarting}
             onSetDownloadProgress={setDownloadProgress}
             onSetLogs={setLogs}
-            onSetMcLogs={setMcLogs}
+            onSetMcLogs={onSetMcLogsForSelected}
             onSetLocalServers={setLocalServers}
             onSetShowCreateServer={setShowCreateServer}
             onSetShowSettings={setShowSettings}

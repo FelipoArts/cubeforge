@@ -24,6 +24,15 @@ src-tauri/binaries/
 src-tauri/gen/
 src-tauri/sidecars/**/*.exe
 
+# Resto de instalação local de servidor Forge de teste (não é código-fonte)
+src-tauri/libraries/
+src-tauri/run.bat
+src-tauri/run.sh
+src-tauri/user_jvm_args.txt
+
+# Config local do Claude Code (específica da máquina, não do projeto)
+.claude/settings.local.json
+
 # Logs
 *.log
 

@@ -13,6 +13,8 @@ interface Env {
   API_BASE_URL: string;
   ENVIRONMENT: string;
   TAILSCALE_API_KEY: string;
+  // Secret — nunca em wrangler.toml. Configurar com: wrangler secret put CURSEFORGE_API_KEY
+  CURSEFORGE_API_KEY?: string;
 }
 
 type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
@@ -182,6 +184,63 @@ async function handleLegacyDiscover(shortCode: string, env: Env, cors: Record<st
 }
 
 // ============================================================
+// CURSEFORGE PROXY — resolve modpacks .zip da CurseForge
+// ============================================================
+//
+// A API da CurseForge exige uma API key (x-api-key) para qualquer chamada.
+// Essa key nunca pode ir para o cliente desktop, já que o CubeForge Dash é
+// distribuído publicamente. Este proxy injeta a key aqui no Worker (via
+// Cloudflare secret, `wrangler secret put CURSEFORGE_API_KEY` — nunca em
+// wrangler.toml/git) e só repassa um allowlist fixo de endpoints
+// somente-leitura que o import de modpacks precisa:
+//
+//  - POST /v1/mods/files   → resolve {fileIds:[...]} em downloadUrl/fileName
+//  - POST /v1/mods         → resolve {modIds:[...]} em slug (link manual
+//                             quando o autor desabilitou distribuição 3rd-party)
+//  - GET  /v1/mods/{modId}/files/{fileId}/download-url → fallback pontual
+//
+// Não é um proxy genérico de propósito — qualquer outro path da CurseForge
+// retorna 404. CORS segue igual ao resto do Worker (cliente é um app
+// desktop via Tauri, não um navegador, então a origem não é um limite de
+// segurança real aqui); não há autenticação própria do Worker além desse
+// allowlist, já que os endpoints expostos são somente-leitura e o pior caso
+// de abuso é consumir a cota de rate-limit da key, não expor/alterar dados.
+// Se isso virar um problema, uma regra de rate-limit por IP no dashboard da
+// Cloudflare (sem mudança de código) é o próximo passo natural.
+
+const CURSEFORGE_BASE = 'https://api.curseforge.com';
+
+function isCurseForgePathAllowed(method: string, subpath: string): boolean {
+  if (method === 'POST' && (subpath === '/v1/mods/files' || subpath === '/v1/mods')) return true;
+  if (method === 'GET' && /^\/v1\/mods\/\d+\/files\/\d+\/download-url$/.test(subpath)) return true;
+  return false;
+}
+
+async function handleCurseForgeProxy(req: Request, env: Env, subpath: string, cors: Record<string, string>): Promise<Response> {
+  const method = req.method;
+  if (!isCurseForgePathAllowed(method, subpath)) {
+    return json(fail(ResponseCodes.NOT_FOUND, 'Endpoint CurseForge não permitido.'), 404, cors);
+  }
+  if (!env.CURSEFORGE_API_KEY) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Import de modpacks CurseForge não está configurado neste servidor.'), 503, cors);
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${CURSEFORGE_BASE}${subpath}`, {
+      method,
+      headers: { 'x-api-key': env.CURSEFORGE_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: method === 'GET' ? undefined : await req.text(),
+    });
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar a CurseForge.', { error: String(e) }), 502, cors);
+  }
+
+  const bodyText = await upstream.text();
+  return new Response(bodyText, { status: upstream.status, headers: { 'Content-Type': 'application/json', ...cors } });
+}
+
+// ============================================================
 // MAIN ROUTER
 // ============================================================
 
@@ -229,6 +288,10 @@ export default {
         if (sj && body.status) { const s: SessionEntity = JSON.parse(sj); s.status = body.status; if (body.currentPlayers !== undefined) s.currentPlayers = body.currentPlayers; s.lastHeartbeat = new Date().toISOString(); s.expiresAt = new Date(Date.now() + cfg.ttlSeconds * 1000).toISOString(); await env.CUBEFORGE_REGISTRY.put(`session:${sc}`, JSON.stringify(s), { expirationTtl: cfg.ttlSeconds }); }
         return new Response(JSON.stringify({ status: 'updated' }), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });
       }
+
+      // Proxy CurseForge: /api/v1/curseforge/{subpath}
+      const mcf = p.match(/^\/api\/v1\/curseforge(\/.*)$/);
+      if (mcf) return await handleCurseForgeProxy(req, env, mcf[1], cors);
 
       if (m === 'GET' && p === '/health') return new Response(JSON.stringify(ok(ResponseCodes.SUCCESS, 'OK', { status: 'ok', version: 'v1' })), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });
 

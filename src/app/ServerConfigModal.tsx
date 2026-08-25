@@ -3,8 +3,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
 import { join } from '@tauri-apps/api/path';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
-import { Check, X, AlertTriangle } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { Check, X, AlertTriangle, Image as ImageIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useLockBodyScroll } from '@/lib/useLockBodyScroll';
 
 interface ServerConfigModalProps {
   /** Full filesystem path to the server directory */
@@ -37,11 +39,27 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
   const [allocatedRam, setAllocatedRam] = useState(4);
   const [totalSystemRam, setTotalSystemRam] = useState(8);
   const [portError, setPortError] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [saveError, setSaveError] = useState('');
+  const [iconDataUrl, setIconDataUrl] = useState<string | null>(null);
+  const [iconSaving, setIconSaving] = useState(false);
+  const [iconError, setIconError] = useState('');
+
+  useLockBodyScroll(isOpen);
 
   // Load current properties when modal opens
   useEffect(() => {
     if (!isOpen) return;
+    setLoadError('');
+    setSaveError('');
+    setIconError('');
     (async () => {
+      try {
+        const icon = await invoke<string | null>('get_server_icon', { serverDir });
+        setIconDataUrl(icon);
+      } catch (e) {
+        console.warn('Could not load server icon:', e);
+      }
       try {
         const props = await invoke<Record<string, any>>('read_server_properties', { serverDir });
         // All values come from Rust as strings — convert booleans and numbers explicitly
@@ -64,9 +82,9 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
         setEnforceSecureProfile(props['enforce-secure-profile'] !== 'false'); // default true
         setPortError('');
 
-        // Load RAM from cubeforge-meta.json
+        // Load RAM from cubicase-meta.json
         try {
-          const metaPath = await join(serverDir, 'cubeforge-meta.json');
+          const metaPath = await join(serverDir, 'cubicase-meta.json');
           const metaContent = await readTextFile(metaPath);
           const meta = JSON.parse(metaContent) as { ramGb?: number; totalRamGb?: number };
           if (typeof meta.ramGb === 'number' && meta.ramGb >= 2) {
@@ -82,7 +100,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
             } catch { /* ignore */ }
           }
         } catch (e) {
-          console.warn('Could not read cubeforge-meta.json, using defaults:', e);
+          console.warn('Could not read cubicase-meta.json, using defaults:', e);
           // If meta file doesn't exist, try to get total system RAM
           try {
             const totalBytes = await invoke<number>('get_total_memory');
@@ -92,17 +110,23 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
         }
       } catch (e) {
         console.error('Failed to read server properties:', e);
+        // Sem os valores reais, o formulário ficaria com defaults genéricos —
+        // bloquear "Salvar" para não sobrescrever o server.properties real com lixo.
+        setLoadError(`Não foi possível carregar as configurações atuais do servidor: ${e}`);
       }
     })();
   }, [isOpen, serverDir]);
 
   const handleSave = async () => {
+    if (loadError) return;
+
     // Validate server port
     if (serverPort < 1024 || serverPort > 65535) {
       setPortError('A porta deve estar entre 1024 e 65535.');
       return;
     }
     setPortError('');
+    setSaveError('');
 
     // All values must be strings — the Rust command expects HashMap<String, String>
     const properties: Record<string, string> = {
@@ -127,9 +151,9 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
     try {
       await invoke('write_server_properties', { serverDir, props: properties });
 
-      // Also save RAM allocation to cubeforge-meta.json
+      // Also save RAM allocation to cubicase-meta.json
       try {
-        const metaPath = await join(serverDir, 'cubeforge-meta.json');
+        const metaPath = await join(serverDir, 'cubicase-meta.json');
         const metaContent = await readTextFile(metaPath);
         const meta = JSON.parse(metaContent);
         meta.ramGb = allocatedRam;
@@ -139,7 +163,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
         // If meta file doesn't exist, create it
         console.warn('Could not update existing meta file, creating new one:', e);
         try {
-          const metaPath = await join(serverDir, 'cubeforge-meta.json');
+          const metaPath = await join(serverDir, 'cubicase-meta.json');
           await writeTextFile(metaPath, JSON.stringify({ ramGb: allocatedRam }, null, 2));
           console.log(`RAM saved (new file): ${allocatedRam}GB -> ${metaPath}`);
         } catch (e2) {
@@ -151,10 +175,47 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
       onClose();
     } catch (e) {
       console.error('Failed to write server properties:', e);
+      setSaveError(`Falha ao salvar as configurações: ${e}`);
+    }
+  };
+
+  const handlePickIcon = async () => {
+    const selected = await open({
+      multiple: false,
+      title: 'Selecione a imagem do ícone do servidor',
+      filters: [{ name: 'Imagem', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'] }],
+    });
+    if (!selected) return;
+    setIconError('');
+    setIconSaving(true);
+    try {
+      await invoke('set_server_icon', { serverDir, imagePath: selected as string });
+      const icon = await invoke<string | null>('get_server_icon', { serverDir });
+      setIconDataUrl(icon);
+    } catch (e) {
+      console.error('Failed to set server icon:', e);
+      setIconError(`Não foi possível definir o ícone: ${e}`);
+    } finally {
+      setIconSaving(false);
+    }
+  };
+
+  const handleRemoveIcon = async () => {
+    setIconError('');
+    setIconSaving(true);
+    try {
+      await invoke('remove_server_icon', { serverDir });
+      setIconDataUrl(null);
+    } catch (e) {
+      console.error('Failed to remove server icon:', e);
+      setIconError(`Não foi possível remover o ícone: ${e}`);
+    } finally {
+      setIconSaving(false);
     }
   };
 
   const isServerRunning = serverStatus === "online" || serverStatus === "starting" || serverStatus === "stopping";
+  const formDisabled = isServerRunning || !!loadError;
 
   return (
     <AnimatePresence>
@@ -185,6 +246,23 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
             </div>
 
             <div className="px-8 overflow-y-auto flex-1 custom-scrollbar">
+              {loadError && (
+                <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
+                  <AlertTriangle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold">Não foi possível carregar as configurações reais deste servidor.</span> Os campos abaixo NÃO refletem a configuração atual — salvar agora sobrescreveria o servidor com valores incorretos, então o formulário foi bloqueado. Feche e tente novamente.
+                    <div className="mt-1 text-xs opacity-80">{loadError}</div>
+                  </div>
+                </div>
+              )}
+
+              {saveError && (
+                <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
+                  <AlertTriangle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
+                  <div>{saveError}</div>
+                </div>
+              )}
+
               {isServerRunning && (
                 <div className="p-4 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
                   <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
@@ -195,6 +273,50 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
               )}
 
               <form className="space-y-4 pb-4" onSubmit={e => { e.preventDefault(); handleSave(); }}>
+                {/* Ícone do Servidor */}
+                <div>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">Ícone do Servidor</label>
+                  <div className="flex items-center gap-4">
+                    <div className="w-16 h-16 rounded-xl overflow-hidden border border-theme-card bg-theme-muted flex items-center justify-center flex-shrink-0">
+                      {iconDataUrl ? (
+                        <img src={iconDataUrl} alt="Ícone do servidor" className="w-full h-full object-cover" />
+                      ) : (
+                        <ImageIcon className="w-6 h-6 text-theme-secondary" />
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={handlePickIcon}
+                          disabled={iconSaving}
+                          className="px-4 h-9 rounded-xl bg-theme-muted hover:bg-theme-card text-theme-primary text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                        >
+                          {iconDataUrl ? 'Trocar Imagem' : 'Escolher Imagem'}
+                        </button>
+                        {iconDataUrl && (
+                          <button
+                            type="button"
+                            onClick={handleRemoveIcon}
+                            disabled={iconSaving}
+                            className="px-4 h-9 rounded-xl text-rose-500 hover:bg-theme-danger text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                          >
+                            Remover
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-theme-secondary">
+                        Aparece na lista de servidores do Minecraft de qualquer jogador. Imagens não-quadradas são recortadas ao centro e redimensionadas para 64×64.
+                        {isServerRunning && ' Se o servidor estiver em execução, reinicie para o novo ícone valer.'}
+                      </p>
+                    </div>
+                  </div>
+                  {iconError && (
+                    <p className="mt-1 text-xs text-rose-500 flex items-center gap-1">
+                      <AlertTriangle className="w-3 h-3" /> {iconError}
+                    </p>
+                  )}
+                </div>
                 {/* MOTD */}
                 <div>
                   <label className="block text-sm font-medium text-theme-primary mb-1">Mensagem do Dia (motd)</label>
@@ -202,7 +324,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                     type="text"
                     value={motd}
                     onChange={e => setMotd(e.target.value)}
-                    disabled={isServerRunning}
+                    disabled={formDisabled}
                     className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                   />
                 </div>
@@ -213,7 +335,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                     <select
                       value={gamemode}
                       onChange={e => setGamemode(e.target.value)}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <option value="survival">Sobrevivência</option>
@@ -227,7 +349,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                     <select
                       value={difficulty}
                       onChange={e => setDifficulty(e.target.value)}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <option value="peaceful">Pacífico</option>
@@ -240,43 +362,43 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                 {/* Toggles */}
                 <div className="grid grid-cols-2 gap-4">
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={hardcore} onChange={e => setHardcore(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={hardcore} onChange={e => setHardcore(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Hardcore</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={whitelist} onChange={e => setWhitelist(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={whitelist} onChange={e => setWhitelist(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Lista de Aprovados</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={pvp} onChange={e => setPvp(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={pvp} onChange={e => setPvp(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">PVP</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={allowFlight} onChange={e => setAllowFlight(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={allowFlight} onChange={e => setAllowFlight(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Permitir Voo</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={allowNether} onChange={e => setAllowNether(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={allowNether} onChange={e => setAllowNether(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Permitir Nether</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={spawnMonsters} onChange={e => setSpawnMonsters(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={spawnMonsters} onChange={e => setSpawnMonsters(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Gerar Monstros</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={spawnAnimals} onChange={e => setSpawnAnimals(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={spawnAnimals} onChange={e => setSpawnAnimals(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Gerar Animais</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={spawnNpcs} onChange={e => setSpawnNpcs(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={spawnNpcs} onChange={e => setSpawnNpcs(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Gerar Aldeões</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={onlineMode} onChange={e => setOnlineMode(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={onlineMode} onChange={e => setOnlineMode(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Modo Online</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={enforceSecureProfile} onChange={e => setEnforceSecureProfile(e.target.checked)} disabled={isServerRunning} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input type="checkbox" checked={enforceSecureProfile} onChange={e => setEnforceSecureProfile(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
                     <span className="text-sm text-theme-primary">Perfil Seguro</span>
                   </label>
                 </div>
@@ -290,7 +412,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                       max={100}
                       value={maxPlayers}
                       onChange={e => setMaxPlayers(Number(e.target.value))}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
@@ -300,13 +422,13 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                       type="number"
                       value={serverPort}
                       onChange={e => setServerPort(Number(e.target.value))}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className={cn(
                         "w-full rounded-2xl border px-3 py-2 focus:outline-none transition-colors bg-transparent text-theme-primary",
                         portError
                           ? "border-rose-400 focus:border-rose-500 bg-rose-50 dark:bg-rose-900/20"
                           : "border-theme-card focus:border-indigo-500",
-                        isServerRunning && "opacity-50 cursor-not-allowed"
+                        formDisabled && "opacity-50 cursor-not-allowed"
                       )}
                     />
                     {portError && (
@@ -323,7 +445,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                       type="text"
                       value={levelSeed}
                       onChange={e => setLevelSeed(e.target.value)}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
@@ -339,7 +461,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                       step={1}
                       value={viewDistance}
                       onChange={e => setViewDistance(Number(e.target.value))}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="flex-1 accent-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                     <span className="w-12 text-center font-medium text-theme-primary">{viewDistance}</span>
@@ -356,7 +478,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                       step={1}
                       value={allocatedRam}
                       onChange={e => setAllocatedRam(Number(e.target.value))}
-                      disabled={isServerRunning}
+                      disabled={formDisabled}
                       className="flex-1 accent-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                     <span className="w-16 text-center font-medium text-theme-primary font-mono">{allocatedRam} GB</span>
@@ -391,7 +513,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                 <button type="button" onClick={onClose} className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer">
                   Cancelar
                 </button>
-                <button type="submit" disabled={isServerRunning} onClick={handleSave} className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-theme-shadow cursor-pointer">
+                <button type="submit" disabled={formDisabled} onClick={handleSave} className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-theme-shadow cursor-pointer">
                   <Check className="w-4 h-4" /> Salvar
                 </button>
               </div>

@@ -1,7 +1,11 @@
 import { Command } from "@tauri-apps/plugin-shell";
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
-import { exists, mkdir } from "@tauri-apps/plugin-fs";
+import { exists, mkdir, remove } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export type JREVersion = 8 | 17 | 21 | 25;
 
@@ -21,9 +25,34 @@ export async function isJREInstalled(version: JREVersion): Promise<boolean> {
   return await exists(javaExe);
 }
 
+const MAX_INSTALL_ATTEMPTS = 3;
+
 export async function installJRE(
-  version: JREVersion, 
+  version: JREVersion,
   onProgress: (p: DownloadProgress) => void
+): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_INSTALL_ATTEMPTS; attempt++) {
+    try {
+      await installJREOnce(version, onProgress, attempt, MAX_INSTALL_ATTEMPTS);
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[JRE] Tentativa ${attempt}/${MAX_INSTALL_ATTEMPTS} falhou:`, err);
+      if (attempt < MAX_INSTALL_ATTEMPTS) {
+        onProgress({ status: `Falha no download, tentando novamente (${attempt}/${MAX_INSTALL_ATTEMPTS})...`, percent: 5 });
+        await sleep(1000 * 2 ** (attempt - 1));
+      }
+    }
+  }
+  throw new Error(`Falha ao instalar a JRE ${version} após ${MAX_INSTALL_ATTEMPTS} tentativas: ${lastErr}`);
+}
+
+async function installJREOnce(
+  version: JREVersion,
+  onProgress: (p: DownloadProgress) => void,
+  attempt: number,
+  maxAttempts: number
 ): Promise<void> {
   const jrePath = await getJREPath(version);
   const runtimeDir = await join(await appLocalDataDir(), "runtime");
@@ -32,7 +61,8 @@ export async function installJRE(
     await mkdir(runtimeDir, { recursive: true });
   }
 
-  onProgress({ status: "Consultando API Adoptium...", percent: 10 });
+  const attemptSuffix = maxAttempts > 1 ? ` (tentativa ${attempt}/${maxAttempts})` : "";
+  onProgress({ status: `Consultando API Adoptium...${attemptSuffix}`, percent: 10 });
 
   // 1. Get Download URL from Adoptium
   const response = await fetch(
@@ -80,9 +110,13 @@ export async function installJRE(
   onProgress({ status: "Instalando e extraindo...", percent: 70 });
   
   const output = await command.execute();
-  
+
   if (output.code !== 0) {
     console.error(output.stderr);
+    // Não deixar um zip parcial ou uma pasta de JRE pela metade entre tentativas —
+    // sem isso, a tentativa seguinte podia herdar lixo do download interrompido.
+    await remove(tempZip, { recursive: false }).catch(() => {});
+    await remove(jrePath, { recursive: true }).catch(() => {});
     throw new Error(`Erro na instalação do JRE: ${output.stderr}`);
   }
 

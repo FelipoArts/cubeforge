@@ -9,19 +9,22 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 use std::collections::HashMap;
 use tauri::{Manager, Emitter};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use std::thread;
 use std::path::PathBuf;
+use sysinfo::{System, Pid};
 
-// Módulos da nova arquitetura de rede
+// Módulos da nova arquitetura de rede (scaffold — serão integrados futuramente)
+#[allow(dead_code)]
 mod api_client;
+#[allow(dead_code)]
 mod session_manager;
+#[allow(dead_code)]
 mod provider_manager;
-
-use api_client::{ApiClient, ApiConfig};
-use session_manager::SessionManager;
-use provider_manager::ProviderManager;
+mod job_object;
 
 fn log_to_file(app: &tauri::AppHandle, message: &str) {
     let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -69,6 +72,20 @@ struct AppState {
     sidecar_process: Mutex<Option<CommandChild>>,
     is_mock_active: Mutex<bool>,
 
+    // Mesmo padrão de minecraft_stop_requested abaixo, mas para o sidecar de rede:
+    // diferencia "usuário pediu para desconectar" de "o sidecar morreu sozinho"
+    // no handler de CommandEvent::Terminated, para não reportar uma desconexão
+    // manual como se fosse um erro de rede na Central de Diagnósticos.
+    network_stop_requested: AtomicBool,
+
+    // Causa específica do último erro fatal do sidecar Go (auth inválida, sem
+    // internet, hostname duplicado, porta ocupada, etc), extraída do JSON
+    // estruturado `{"error": "<código>", "detail": "..."}` que o Go agora imprime
+    // no stdout antes de sair. Guarda (título, mensagem) já traduzidos para o
+    // usuário; consumida pelo handler de CommandEvent::Terminated para não
+    // duplicar um segundo aviso genérico sobre o mesmo evento.
+    network_last_error: Mutex<Option<(String, String)>>,
+
     // Processo do servidor Minecraft (java.exe)
     // stdin é guardado separadamente pois `std::process::Child` não é Clone
     minecraft_process: Mutex<Option<std::process::Child>>,
@@ -86,10 +103,43 @@ struct AppState {
     // já foi detectado como online pelo stdout "Done (").
     minecraft_was_online: AtomicBool,
 
-    // Flag para evitar loop infinito no CloseRequested:
-    // Quando o shutdown gracioso termina e chama win.close(), o evento
-    // CloseRequested é disparado novamente. Esta flag impede reentrância.
+    // Causa específica do último crash detectada por padrões conhecidos no
+    // stdout/stderr do processo Java (OutOfMemoryError, UnsupportedClassVersionError,
+    // BindException, EULA não aceito, etc). Guarda (código, título, mensagem); é lida
+    // e limpa pela thread de monitoramento ao detectar que o processo encerrou,
+    // para emitir um diagnóstico específico em vez do "crashed" genérico.
+    minecraft_last_error: Mutex<Option<(String, String, String)>>,
+
+    // Evita rodar o shutdown gracioso (parar MC, parar mesh, notificar API) mais de
+    // uma vez, caso o usuário clique "Sair" no tray mais de uma vez rapidamente.
     is_shutting_down: AtomicBool,
+
+    // shortCode do servidor atualmente registrado na API Central (se houver).
+    // Usado no shutdown gracioso para notificar a API de que o servidor ficou
+    // offline mesmo quando o fechamento acontece antes de qualquer heartbeat do JS.
+    active_short_code: Mutex<Option<String>>,
+
+    // Última amostra de RAM/CPU do sistema (e do processo java.exe), atualizada
+    // pela thread de amostragem periódica enquanto o servidor está rodando.
+    // Usada tanto para o evento "mc-resource-sample" (indicador de saúde na UI)
+    // quanto para enriquecer o diagnóstico de crash com o retrato de hardware
+    // pouco antes do problema (ver ResourceSample).
+    minecraft_last_resource_sample: Mutex<Option<ResourceSample>>,
+}
+
+/// Retrato de RAM/CPU do sistema (e do processo do servidor) em um instante,
+/// usado para diferenciar "pouca RAM alocada mas o PC tem de sobra" de
+/// "o computador não tem RAM/CPU suficiente" nos diagnósticos de OOM e lag.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ResourceSample {
+    total_ram_mb: u64,
+    available_ram_mb: u64,
+    cpu_usage_percent: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_ram_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_cpu_percent: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +177,41 @@ struct NetworkStatusPayload {
 struct NetworkLogPayload {
     message: String,
     is_error: bool,
+}
+
+/// Traduz o código de erro estruturado emitido pelo sidecar Go (ver main.go,
+/// função fatalWithCode) para um título/mensagem amigáveis em PT-BR.
+fn map_sidecar_error_code(code: &str, detail: &str) -> (String, String) {
+    match code {
+        "config_missing" | "config_read_failed" | "config_decode_failed" => (
+            "Configuração de rede inválida".to_string(),
+            "Não foi possível ler a configuração da rede mesh. Tente reiniciar o app; se persistir, reinstale o Cubicase.".to_string(),
+        ),
+        "mesh_auth_failed" => (
+            "Falha de autenticação na rede mesh".to_string(),
+            "Não foi possível autenticar na rede mesh (Tailscale). Verifique sua conexão com a internet e tente novamente.".to_string(),
+        ),
+        "no_ip_assigned" => (
+            "Nenhum IP atribuído pela rede mesh".to_string(),
+            "A rede mesh não atribuiu um endereço para este dispositivo. Tente reconectar em alguns instantes.".to_string(),
+        ),
+        "listen_mesh_failed" => (
+            "Falha ao abrir a porta na rede mesh".to_string(),
+            "Não foi possível abrir a porta do servidor na rede mesh. Tente reconectar; se persistir, pode haver conflito de hostname na malha.".to_string(),
+        ),
+        "listen_local_failed" => (
+            "Porta local já em uso".to_string(),
+            format!("Não foi possível abrir a porta local necessária para a conexão — provavelmente já está em uso por outro programa. Detalhe técnico: {}", detail),
+        ),
+        other => (
+            "Erro inesperado na rede mesh".to_string(),
+            if detail.is_empty() {
+                format!("Código: {}", other)
+            } else {
+                detail.to_string()
+            },
+        ),
+    }
 }
 
 #[tauri::command]
@@ -311,6 +396,10 @@ async fn start_network_node(
                 err_msg
             })?;
 
+        // Amarrar ao job object: se o app morrer (fechado ou finalizado à força),
+        // o Windows mata este sidecar junto em vez de deixá-lo órfão.
+        job_object::track_process(child.pid());
+
         // Guardar o processo filho no estado global
         *state.sidecar_process.lock().unwrap() = Some(child);
 
@@ -344,7 +433,33 @@ async fn start_network_node(
                                 }
                             }
                         }
-                        
+
+                        // Parsear erro fatal estruturado do sidecar Go (ver fatalWithCode em main.go).
+                        // Diferente do "status", isso chega pouco antes do processo sair — guardamos
+                        // a causa para o handler de Terminated usar em vez do aviso genérico.
+                        if trimmed.starts_with('{') && trimmed.contains("\"error\"") {
+                            if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                if let Some(code) = err_val.get("error").and_then(|v| v.as_str()) {
+                                    let detail = err_val.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                                    let (title, message) = map_sidecar_error_code(code, detail);
+                                    log_to_file(&app_clone, &format!("[Sidecar] Erro estruturado: código={}, detail={}", code, detail));
+                                    *app_clone.state::<AppState>().network_last_error.lock().unwrap() =
+                                        Some((title.clone(), message.clone()));
+                                    let _ = app_clone.emit("network-diagnostic", DiagnosticPayload {
+                                        level: "critical".to_string(),
+                                        title,
+                                        message,
+                                        detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
+                                        code: Some(code.to_string()),
+                                        crash_report_text: None,
+                                        crash_report_file: None,
+                                        resource_snapshot: None,
+                                        allocated_ram_mb: None,
+                                    });
+                                }
+                            }
+                        }
+
                         // Filtrar logs técnicos poluídos do Tailscale na interface, repassando logs informativos
                         let display_message = if trimmed.contains("magicsock:") || trimmed.contains("control:") || trimmed.contains("derp:") {
                             // Suprime logs muito detalhados de debug do Tailscale
@@ -377,14 +492,38 @@ async fn start_network_node(
                     }
                     CommandEvent::Terminated(payload) => {
                         log_to_file(&app_clone, &format!("[Sidecar-Terminated] Código: {:?}", payload.code));
+                        let app_state = app_clone.state::<AppState>();
+                        // Limpar o handle guardado no estado global — sem isso, get_system_status
+                        // continua reportando a rede como "online" para sempre após o sidecar morrer.
+                        *app_state.sidecar_process.lock().unwrap() = None;
+                        // Diferenciar "usuário pediu para desconectar" (network_stop_requested)
+                        // de "o sidecar morreu sozinho" (crash real) para não marcar uma
+                        // desconexão manual como erro na Central de Diagnósticos.
+                        let was_requested = app_state.network_stop_requested.swap(false, Ordering::SeqCst);
+                        // Causa específica já reportada via "network-diagnostic" enquanto o
+                        // sidecar ainda rodava (ver parsing do stdout acima)? Se sim, evitar
+                        // duplicar um segundo aviso genérico sobre o mesmo evento.
+                        let known_cause = app_state.network_last_error.lock().unwrap().take();
                         let _ = app_clone.emit("network-status", NetworkStatusPayload {
                             status: "offline".to_string(),
                             ip: None,
                         });
-                        let _ = app_clone.emit("network-log", NetworkLogPayload {
-                            message: format!("Conexão de rede encerrada (Código: {:?})", payload.code),
-                            is_error: true,
-                        });
+                        if was_requested {
+                            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                                message: "Rede mesh desconectada.".to_string(),
+                                is_error: false,
+                            });
+                        } else if let Some((title, _)) = known_cause {
+                            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                                message: format!("Conexão de rede encerrada: {} (ver Central de Diagnósticos)", title),
+                                is_error: false,
+                            });
+                        } else {
+                            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                                message: format!("Conexão de rede encerrada inesperadamente (Código: {:?})", payload.code),
+                                is_error: true,
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -470,6 +609,9 @@ async fn stop_network_node_internal(
     };
     let had_child = child_to_kill.is_some();
     if let Some(child) = child_to_kill {
+        // Marcar ANTES de matar o processo: o handler de CommandEvent::Terminated
+        // roda em outra task assíncrona e precisa saber que esta morte foi solicitada.
+        state.network_stop_requested.store(true, Ordering::SeqCst);
         let _ = child.kill();
     }
 
@@ -507,21 +649,159 @@ async fn stop_network_node(
 /// Baixa o server.jar diretamente via reqwest em Rust.
 /// Remove qualquer dependência de PowerShell para o download.
 #[tauri::command]
-async fn download_server_jar(url: String, dest_path: String) -> Result<(), String> {
+async fn download_server_jar(url: String, dest_path: String, expected_sha1: Option<String>, expected_sha256: Option<String>) -> Result<(), String> {
+    // Cria o diretório de destino se necessário (ex: pasta "mods"/"plugins" de um
+    // servidor recém-criado, que só existe fisicamente quando o primeiro arquivo é
+    // adicionado). A raiz do servidor já existe nos usos originais (server.jar/builds
+    // do Paper), então isso é um no-op nesses casos.
+    if let Some(parent) = std::path::Path::new(&dest_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    const MAX_ATTEMPTS: u32 = 3;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300)) // 5 minutos de timeout para arquivos grandes
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("Falha no download: HTTP {}", response.status()));
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let result: Result<(), String> = async {
+            let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("Falha no download: HTTP {}", response.status()));
+            }
+            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+
+            // Verificar integridade contra o checksum esperado (SHA1 para o manifest da
+            // Mojang, SHA256 para builds do PaperMC). Sem isso, um download
+            // truncado/corrompido só era percebido bem depois, quando o servidor
+            // falhava ao iniciar com um erro genérico e opaco.
+            if let Some(expected) = &expected_sha1 {
+                let mut hasher = sha1_smol::Sha1::new();
+                hasher.update(&bytes);
+                let actual = hasher.digest().to_string();
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(format!("Checksum SHA1 não confere (esperado {}, obtido {})", expected, actual));
+                }
+            }
+            if let Some(expected) = &expected_sha256 {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let actual = format!("{:x}", hasher.finalize());
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(format!("Checksum SHA256 não confere (esperado {}, obtido {})", expected, actual));
+                }
+            }
+
+            let mut file = File::create(&dest_path).map_err(|e| e.to_string())?;
+            file.write_all(&bytes).map_err(|e| e.to_string())?;
+            Ok(())
+        }.await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Não deixar um arquivo truncado/corrompido no disco entre tentativas.
+                let _ = std::fs::remove_file(&dest_path);
+                last_err = e;
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt - 1))).await;
+                }
+            }
+        }
     }
 
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    let mut file = File::create(&dest_path).map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    Ok(())
+    Err(format!("Falha ao baixar após {} tentativas: {}", MAX_ATTEMPTS, last_err))
+}
+
+#[derive(Serialize, Clone)]
+struct DiagnosticPayload {
+    level: String, // "info" | "warning" | "error" | "critical"
+    title: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    // Código estável (ex: "java_version_incompatible") para o frontend reagir
+    // programaticamente (ex: disparar uma auto-correção) sem parsear o título/mensagem
+    // em português, que pode mudar de texto sem aviso.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    // Texto bruto do crash-report novo (ou, na ausência dele, a cauda de
+    // logs/latest.log) para o analisador de causas do frontend (crashAnalyzer.ts)
+    // examinar padrões que uma única linha de stdout não revela (ex: conflito de mod).
+    #[serde(rename = "crashReportText", skip_serializing_if = "Option::is_none")]
+    crash_report_text: Option<String>,
+    #[serde(rename = "crashReportFile", skip_serializing_if = "Option::is_none")]
+    crash_report_file: Option<String>,
+    // Retrato de RAM/CPU do sistema pouco antes do crash (última amostra da
+    // thread de monitoramento de recursos) + quanto foi alocado (-Xmx) para o
+    // servidor — permite ao frontend (resourceDiagnostics.ts) diferenciar
+    // "aumente a RAM alocada" de "seu computador não tem RAM suficiente".
+    #[serde(rename = "resourceSnapshot", skip_serializing_if = "Option::is_none")]
+    resource_snapshot: Option<ResourceSample>,
+    #[serde(rename = "allocatedRamMb", skip_serializing_if = "Option::is_none")]
+    allocated_ram_mb: Option<u64>,
+}
+
+/// Reconhece padrões conhecidos de causa de crash em uma linha de stdout/stderr
+/// do processo Java e retorna (código, título, mensagem) prontos para exibição
+/// ao usuário — e para o frontend decidir se há uma auto-correção aplicável.
+/// Retorna `None` se a linha não corresponder a nenhuma causa conhecida — nesse
+/// caso o chamador cai no diagnóstico genérico de "crashed".
+fn detect_known_mc_error(line: &str) -> Option<(String, String, String)> {
+    if line.contains("OutOfMemoryError") || line.contains("Could not reserve enough space") {
+        return Some((
+            "out_of_memory".to_string(),
+            "Sem memória suficiente (OutOfMemoryError)".to_string(),
+            "O servidor Minecraft ficou sem memória durante a execução. Tente aumentar a RAM alocada nas configurações do servidor, ou feche outros programas para liberar memória.".to_string(),
+        ));
+    }
+    if line.contains("UnsupportedClassVersionError") {
+        return Some((
+            "java_version_incompatible".to_string(),
+            "Versão do Java incompatível".to_string(),
+            "A versão do Java instalada não é compatível com esta versão do Minecraft. Reinstale a JRE recomendada para este servidor nas configurações.".to_string(),
+        ));
+    }
+    if line.contains("Address already in use") || line.contains("BindException") {
+        return Some((
+            "port_in_use".to_string(),
+            "Porta já em uso".to_string(),
+            "Não foi possível abrir a porta do servidor porque ela já está sendo usada por outro processo. Fecha o processo ou altere a porta do servidor nas configurações.".to_string(),
+        ));
+    }
+    if line.contains("You need to agree to the EULA") {
+        return Some((
+            "eula_not_accepted".to_string(),
+            "EULA não aceito".to_string(),
+            "O arquivo eula.txt não está marcado como aceito. Isso normalmente é feito automaticamente pelo Cubicase — se persistir, abra a pasta do servidor e defina eula=true em eula.txt.".to_string(),
+        ));
+    }
+    None
+}
+
+/// Trunca uma string em um limite de caracteres (não bytes, para não quebrar
+/// UTF-8) — usado para caber o texto de crash-reports/logs no payload do evento.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}\n... (truncado)", truncated)
+    }
+}
+
+/// Lê as últimas `max_lines` linhas de `<server_dir>/logs/latest.log`, usado
+/// como fallback do crash-report quando o crash não gerou um (ex: crash nativo
+/// da JVM antes do world carregar, ou OOM muito cedo na inicialização).
+fn read_log_tail(server_dir: &str, max_lines: usize) -> Option<String> {
+    let log_path = std::path::Path::new(server_dir).join("logs").join("latest.log");
+    let content = std::fs::read_to_string(&log_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].join("\n"))
 }
 
 /// Inicia o servidor Minecraft usando o Java instalado pelo CubeForge.
@@ -536,112 +816,42 @@ async fn start_minecraft_server(
     java_path: String,
     ram_gb: u32,
     local_port: u16,
+    server_jar_name: Option<String>,  // "forge-1.20.1-47.1.0-shim.jar" para Forge (versões antigas)
+    launch_args_dir: Option<String>,  // "libraries/net/minecraftforge/forge/1.20.1-47.1.0" para Forge/NeoForge modernos (1.17+), sem JAR único
 ) -> Result<(), String> {
-    log_to_file(&app, &format!("=== INICIANDO SERVIDOR MC (dir={}, porta={}, ram={}GB) ===", server_dir, local_port, ram_gb));
+    let jar_name = server_jar_name.unwrap_or_else(|| "server.jar".to_string());
+    log_to_file(&app, &format!(
+        "=== INICIANDO SERVIDOR MC (dir={}, porta={}, ram={}GB, jar={}, argsDir={:?}) ===",
+        server_dir, local_port, ram_gb, jar_name, launch_args_dir
+    ));
 
     // Parar qualquer servidor que já esteja rodando
     stop_minecraft_server_internal(&app, &state).await;
 
     // Construir argumentos do Java
-    let args = vec![
+    let mut args = vec![
         format!("-Xms512M"),
         format!("-Xmx{}G", ram_gb),
-        "-jar".to_string(),
-        "server.jar".to_string(),
-        "nogui".to_string(),
     ];
+    if let Some(args_dir) = &launch_args_dir {
+        // Forge/NeoForge 1.17+: não há JAR único, o instalador gera libraries/ + run.bat/run.sh
+        // que invocam `java @user_jvm_args.txt @libraries/.../win_args.txt` (ver run.bat/run.sh gerados)
+        let args_file_name = if cfg!(target_os = "windows") { "win_args.txt" } else { "unix_args.txt" };
+        args.push("@user_jvm_args.txt".to_string());
+        args.push(format!("@{}/{}", args_dir, args_file_name));
+    } else {
+        args.push("-jar".to_string());
+        args.push(jar_name.clone());
+    }
+    args.push("nogui".to_string());
 
     log_to_file(&app, &format!("Executando: {} {:?}", java_path, args));
 
-    // Iniciar processo Java com stdin/stdout/stderr redirecionados
-    let mut child = std::process::Command::new(&java_path)
-        .args(&args)
-        .current_dir(&server_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            let msg = format!("Falha ao iniciar Java: {}", e);
-            log_to_file(&app, &msg);
-            msg
-        })?;
-
-    // Extrair stdin antes de mover `child` para o Mutex
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Guardar processo e stdin no estado global
-    {
-        state.minecraft_stop_requested.store(false, Ordering::SeqCst);
-        *state.minecraft_stdin.lock().unwrap() = stdin;
-        *state.minecraft_process.lock().unwrap() = Some(child);
-    }
-
-    // --- Contagem de crash-reports ANTES de o servidor iniciar ---
-    // Salvamos o número de arquivos na pasta crash-reports (se existir)
-    // para comparar quando o servidor fechar. Se houver MAIS arquivos
-    // no momento do fechamento, significa que houve um crash.
-    let crash_reports_before = {
-        let crash_dir = std::path::Path::new(&server_dir).join("crash-reports");
-        if crash_dir.exists() && crash_dir.is_dir() {
-            match std::fs::read_dir(&crash_dir) {
-                Ok(entries) => entries.flatten().filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false)).count(),
-                Err(_) => 0,
-            }
-        } else {
-            0
-        }
-    };
-    log_to_file(&app, &format!("[MC] Contagem de crash-reports antes de iniciar: {}", crash_reports_before));
-
-    // --- Thread de leitura de stdout ---
-    let app_stdout = app.clone();
-    let state_stdout_handle = app.state::<AppState>().inner() as *const AppState as usize;
-    if let Some(stdout_pipe) = stdout {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout_pipe);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        log_to_file(&app_stdout, &format!("[MC-Stdout] {}", l));
-                        let _ = app_stdout.emit("minecraft-log", &l);
-                        // Detect server ready line
-                        if l.contains("Done (") && l.contains("INFO") {
-                            // Marcar que o servidor ficou online (para a thread de polling TCP
-                            // não emitir "crashed" quando o servidor for parado depois)
-                            let state_ref = unsafe { &*(state_stdout_handle as *const AppState) };
-                            state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
-                            let _ = app_stdout.emit("minecraft-status-changed", "online");
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    // --- Thread de leitura de stderr ---
-    let app_stderr = app.clone();
-    if let Some(stderr_pipe) = stderr {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr_pipe);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        log_to_file(&app_stderr, &format!("[MC-Stderr] {}", l));
-                        let _ = app_stderr.emit("minecraft-log", &l);
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    // --- Rotina de polling TCP para detectar quando o servidor está online ---
-    // Primeiro tenta ler a porta configurada em server.properties, se existir.
-    // Caso falhe, usa a porta fornecida via parâmetro `local_port`.
+    // --- Checar porta ocupada ANTES de iniciar o processo ---
+    // Lê a porta configurada em server.properties (cai para `local_port` se ausente/ilegível)
+    // e testa se algo já está escutando nela. Se estiver, o Java vai falhar ao dar bind
+    // (BindException) de qualquer forma — detectar isso antes evita subir o processo à toa
+    // e permite uma mensagem de causa específica em vez do "crashed" genérico.
     let server_port = {
         let properties_path = format!("{}/server.properties", server_dir);
         match std::fs::read_to_string(&properties_path) {
@@ -660,7 +870,147 @@ async fn start_minecraft_server(
             Err(_) => local_port,
         }
     };
+    // Retry com backoff: é comum a porta aparecer "ocupada" por um instante logo após
+    // parar um servidor anterior (socket ainda em TIME_WAIT) — sem isso, o usuário via
+    // um erro de porta ocupada mesmo tendo acabado de clicar em "Parar" um segundo antes.
+    // Só falha de verdade se continuar ocupada depois de todas as tentativas.
+    const PORT_CHECK_ATTEMPTS: u32 = 4;
+    let port_addr = format!("127.0.0.1:{}", server_port);
+    if let Ok(parsed_addr) = port_addr.parse() {
+        for attempt in 1..=PORT_CHECK_ATTEMPTS {
+            if TcpStream::connect_timeout(&parsed_addr, Duration::from_millis(300)).is_err() {
+                break; // Nada escutando na porta — livre para iniciar.
+            }
+            if attempt == PORT_CHECK_ATTEMPTS {
+                let msg = format!(
+                    "A porta {} já está em uso por outro processo. Pare-o ou altere a porta do servidor antes de iniciar.",
+                    server_port
+                );
+                log_to_file(&app, &format!("[MC] Porta ocupada após {} tentativas, abortando início: {}", PORT_CHECK_ATTEMPTS, msg));
+                return Err(msg);
+            }
+            log_to_file(&app, &format!("[MC] Porta {} ainda ocupada (tentativa {}/{}), aguardando...", server_port, attempt, PORT_CHECK_ATTEMPTS));
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+    }
 
+    // Iniciar processo Java com stdin/stdout/stderr redirecionados
+    let mut child = std::process::Command::new(&java_path)
+        .args(&args)
+        .current_dir(&server_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("Falha ao iniciar Java: {}", e);
+            log_to_file(&app, &msg);
+            msg
+        })?;
+
+    // Amarrar ao job object: se o app morrer (fechado ou finalizado à força),
+    // o Windows mata o servidor Minecraft junto em vez de deixá-lo órfão.
+    job_object::track_process(child.id());
+    // PID capturado aqui (antes de `child` ser movido pro Mutex abaixo) para a
+    // thread de amostragem de recursos poder consultar o processo específico.
+    let mc_pid = child.id();
+
+    // Extrair stdin antes de mover `child` para o Mutex
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Guardar processo e stdin no estado global
+    {
+        state.minecraft_stop_requested.store(false, Ordering::SeqCst);
+        *state.minecraft_stdin.lock().unwrap() = stdin;
+        *state.minecraft_process.lock().unwrap() = Some(child);
+        *state.minecraft_last_error.lock().unwrap() = None;
+    }
+
+    // --- Nomes dos crash-reports ANTES de o servidor iniciar ---
+    // Guardamos os NOMES (não só a contagem) dos arquivos na pasta crash-reports
+    // (se existir) para comparar quando o servidor fechar. Isso permite, além de
+    // detectar que houve um crash, identificar QUAL arquivo é o novo e ler seu
+    // conteúdo para o analisador de causas (crashAnalyzer.ts no frontend).
+    let crash_reports_before: std::collections::HashSet<String> = {
+        let crash_dir = std::path::Path::new(&server_dir).join("crash-reports");
+        if crash_dir.exists() && crash_dir.is_dir() {
+            match std::fs::read_dir(&crash_dir) {
+                Ok(entries) => entries
+                    .flatten()
+                    .filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect(),
+                Err(_) => std::collections::HashSet::new(),
+            }
+        } else {
+            std::collections::HashSet::new()
+        }
+    };
+    log_to_file(&app, &format!("[MC] Contagem de crash-reports antes de iniciar: {}", crash_reports_before.len()));
+
+    // --- Thread de leitura de stdout ---
+    let app_stdout = app.clone();
+    let state_stdout_handle = app.state::<AppState>().inner() as *const AppState as usize;
+    if let Some(stdout_pipe) = stdout {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        log_to_file(&app_stdout, &format!("[MC-Stdout] {}", l));
+                        let _ = app_stdout.emit("minecraft-log", &l);
+                        let state_ref = unsafe { &*(state_stdout_handle as *const AppState) };
+                        // Detect server ready line
+                        if l.contains("Done (") && l.contains("INFO") {
+                            // Marcar que o servidor ficou online (para a thread de polling TCP
+                            // não emitir "crashed" quando o servidor for parado depois)
+                            state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
+                            let _ = app_stdout.emit("minecraft-status-changed", "online");
+                        }
+                        // Guardar a causa raiz do crash (primeiro padrão reconhecido vence —
+                        // erros em cascata depois costumam ser só consequência do primeiro).
+                        if let Some(cause) = detect_known_mc_error(&l) {
+                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap();
+                            if last_error.is_none() {
+                                *last_error = Some(cause);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // --- Thread de leitura de stderr ---
+    let app_stderr = app.clone();
+    let state_stderr_handle = app.state::<AppState>().inner() as *const AppState as usize;
+    if let Some(stderr_pipe) = stderr {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        log_to_file(&app_stderr, &format!("[MC-Stderr] {}", l));
+                        let _ = app_stderr.emit("minecraft-log", &l);
+                        if let Some(cause) = detect_known_mc_error(&l) {
+                            let state_ref = unsafe { &*(state_stderr_handle as *const AppState) };
+                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap();
+                            if last_error.is_none() {
+                                *last_error = Some(cause);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // --- Rotina de polling TCP para detectar quando o servidor está online ---
+    // Reusa `server_port` já resolvido acima (server.properties, com fallback em local_port).
     let app_tcp = app.clone();
     let state_tcp_handle = app.state::<AppState>().inner() as *const AppState as usize;
     tauri::async_runtime::spawn(async move {
@@ -703,6 +1053,55 @@ async fn start_minecraft_server(
         }
     });
 
+    // --- Thread de amostragem periódica de RAM/CPU (saúde de hardware) ---
+    // Alimenta o evento "mc-resource-sample" (indicador de saúde na UI) e
+    // `minecraft_last_resource_sample` (usado para enriquecer o diagnóstico
+    // de crash com o retrato de hardware do sistema pouco antes do problema).
+    // Um único `System` é mantido vivo entre iterações para que o cálculo de
+    // uso de CPU seja um delta correto (não a média desde o boot da máquina).
+    let app_resources = app.clone();
+    let state_resources_handle = app.state::<AppState>().inner() as *const AppState as usize;
+    std::thread::spawn(move || {
+        let mut sys = System::new_all();
+        let pid = Pid::from_u32(mc_pid);
+        loop {
+            let state_ref = unsafe { &*(state_resources_handle as *const AppState) };
+            let process_alive = {
+                let mut guard = state_ref.minecraft_process.lock().unwrap();
+                if let Some(ref mut child) = *guard {
+                    matches!(child.try_wait(), Ok(None))
+                } else {
+                    false
+                }
+            };
+            if !process_alive {
+                break;
+            }
+
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+
+            let (process_ram_mb, process_cpu_percent) = match sys.process(pid) {
+                Some(p) => (Some(p.memory() / 1024 / 1024), Some(p.cpu_usage())),
+                None => (None, None),
+            };
+
+            let sample = ResourceSample {
+                total_ram_mb: sys.total_memory() / 1024 / 1024,
+                available_ram_mb: sys.available_memory() / 1024 / 1024,
+                cpu_usage_percent: sys.global_cpu_usage(),
+                process_ram_mb,
+                process_cpu_percent,
+            };
+
+            *state_ref.minecraft_last_resource_sample.lock().unwrap() = Some(sample.clone());
+            let _ = app_resources.emit("mc-resource-sample", sample);
+
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    });
+
     // --- Thread de monitoramento de saída (detecção de crash pós-inicialização) ---
     // Usamos TRÊS estratégias para distinguir parada normal de crash:
     //
@@ -724,8 +1123,9 @@ async fn start_minecraft_server(
     let app_monitor = app.clone();
     let server_dir_monitor = server_dir.clone();
     let state_monitor_handle = app.state::<AppState>().inner() as *const AppState as usize;
+    let ram_gb_monitor = ram_gb;
     std::thread::spawn(move || {
-        log_to_file(&app_monitor, &format!("[MC-DEBUG] Thread de monitoramento iniciada. crash_reports_before={}", crash_reports_before));
+        log_to_file(&app_monitor, &format!("[MC-DEBUG] Thread de monitoramento iniciada. crash_reports_before={}", crash_reports_before.len()));
         
         // Aguarda o processo terminar (bloqueante)
         log_to_file(&app_monitor, "[MC-DEBUG] Aguardando child.wait()...");
@@ -754,21 +1154,43 @@ async fn start_minecraft_server(
         let exit_code_ok = exit_code == Some(0);
         log_to_file(&app_monitor, &format!("[MC-DEBUG] exit_code_ok (== Some(0)): {}", exit_code_ok));
 
-        // Estratégia 2: Comparar crash-reports antes vs depois
-        let crash_reports_after = {
-            let crash_dir = std::path::Path::new(&server_dir_monitor).join("crash-reports");
-            if crash_dir.exists() && crash_dir.is_dir() {
-                match std::fs::read_dir(&crash_dir) {
-                    Ok(entries) => entries.flatten().filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false)).count(),
-                    Err(_) => 0,
-                }
-            } else {
-                0
+        // Estratégia 2: Comparar crash-reports antes vs depois (por NOME, não só
+        // contagem — assim identificamos QUAL arquivo é novo para ler seu conteúdo).
+        let crash_dir_monitor = std::path::Path::new(&server_dir_monitor).join("crash-reports");
+        let crash_reports_after: std::collections::HashSet<String> = if crash_dir_monitor.exists() && crash_dir_monitor.is_dir() {
+            match std::fs::read_dir(&crash_dir_monitor) {
+                Ok(entries) => entries
+                    .flatten()
+                    .filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect(),
+                Err(_) => std::collections::HashSet::new(),
             }
+        } else {
+            std::collections::HashSet::new()
         };
-        let has_new_crash_report = crash_reports_after > crash_reports_before;
+        let new_crash_report_names: Vec<&String> = crash_reports_after.difference(&crash_reports_before).collect();
+        let has_new_crash_report = !new_crash_report_names.is_empty();
         log_to_file(&app_monitor, &format!("[MC-DEBUG] crash_reports_after={}, crash_reports_before={}, has_new_crash_report={}",
-            crash_reports_after, crash_reports_before, has_new_crash_report));
+            crash_reports_after.len(), crash_reports_before.len(), has_new_crash_report));
+
+        // Entre os arquivos novos (normalmente só um), pega o mais recente por
+        // data de modificação e lê seu conteúdo para o analisador de causas do frontend.
+        const CRASH_TEXT_CAP: usize = 60_000;
+        let newest_crash_report: Option<(String, std::path::PathBuf)> = new_crash_report_names
+            .iter()
+            .filter_map(|name| {
+                let path = crash_dir_monitor.join(name);
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                modified.map(|m| (m, (*name).clone(), path))
+            })
+            .max_by_key(|(m, _, _)| *m)
+            .map(|(_, name, path)| (name, path));
+        let crash_report_file = newest_crash_report.as_ref().map(|(name, _)| name.clone());
+        let crash_report_text = newest_crash_report
+            .as_ref()
+            .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+            .map(|s| truncate_chars(&s, CRASH_TEXT_CAP));
 
         // Estratégia 3: Flag de parada solicitada (AtomicBool - lock-free)
         let stop_requested = {
@@ -789,19 +1211,164 @@ async fn start_minecraft_server(
         log_to_file(&app_monitor, &format!("[MC-DEBUG] Decisão final: is_normal_shutdown={}, is_crash_by_report={}",
             is_normal_shutdown, is_crash_by_report));
 
+        // Causa específica capturada pelas threads de stdout/stderr (se alguma).
+        let known_cause = {
+            let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
+            state_ref.minecraft_last_error.lock().unwrap().take()
+        };
+
         if is_normal_shutdown && !is_crash_by_report {
             log_to_file(&app_monitor, "[MC] Parada NORMAL detectada. Emitindo 'offline'.");
             let _ = app_monitor.emit("minecraft-status-changed", "offline");
-        } else if is_crash_by_report {
-            log_to_file(&app_monitor, "[MC] CRASH detectado via crash-reports. Emitindo 'crashed'.");
-            let _ = app_monitor.emit("minecraft-status-changed", "crashed");
         } else {
-            log_to_file(&app_monitor, &format!("[MC] CRASH detectado: exit_code={:?}, stop_requested={}, crash_reports_aumentou={}. Emitindo 'crashed'.",
-                exit_code, stop_requested, has_new_crash_report));
+            let reason = if is_crash_by_report {
+                "via crash-reports".to_string()
+            } else {
+                format!("exit_code={:?}, stop_requested={}, crash_reports_aumentou={}", exit_code, stop_requested, has_new_crash_report)
+            };
+            log_to_file(&app_monitor, &format!("[MC] CRASH detectado ({}). Causa conhecida: {:?}. Emitindo 'crashed'.", reason, known_cause));
             let _ = app_monitor.emit("minecraft-status-changed", "crashed");
+
+            // Sem crash-report novo (crash nativo da JVM, OOM muito cedo, etc):
+            // cai para a cauda de logs/latest.log, que ainda dá contexto pro analisador.
+            let crash_report_text = crash_report_text.or_else(|| read_log_tail(&server_dir_monitor, 200));
+
+            // Última amostra de RAM/CPU do sistema (thread de amostragem periódica) —
+            // dá ao frontend o retrato de hardware de pouco antes do crash, para
+            // diferenciar "aumente a RAM alocada" de "o computador não tem RAM suficiente".
+            let resource_snapshot = {
+                let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
+                state_ref.minecraft_last_resource_sample.lock().unwrap().clone()
+            };
+
+            let (code, title, message) = known_cause.unwrap_or_else(|| (
+                "unknown_crash".to_string(),
+                "O servidor Minecraft travou".to_string(),
+                "O processo encerrou de forma inesperada. Veja o console do servidor para mais detalhes.".to_string(),
+            ));
+            let _ = app_monitor.emit("mc-diagnostic", DiagnosticPayload {
+                level: "critical".to_string(),
+                title,
+                message,
+                detail: Some(format!("exit_code={:?}", exit_code)),
+                code: Some(code),
+                crash_report_text,
+                crash_report_file,
+                resource_snapshot,
+                allocated_ram_mb: Some((ram_gb_monitor as u64) * 1024),
+            });
         }
     });
 
+    Ok(())
+}
+
+/// Executa o instalador do Forge (java -jar installer.jar --installServer).
+/// Como o processo de instalação pode demorar vários minutos, este comando
+/// roda em background e emite eventos de progresso.
+#[tauri::command]
+async fn run_forge_installer(
+    app: tauri::AppHandle,
+    java_path: String,
+    installer_path: String,
+) -> Result<(), String> {
+    log_to_file(&app, &format!("=== INSTALANDO FORGE (java={}, installer={}) ===", java_path, installer_path));
+    
+    // Extrair diretório do installer
+    let server_dir = std::path::Path::new(&installer_path)
+        .parent()
+        .ok_or_else(|| "Caminho do instalador inválido".to_string())?
+        .to_string_lossy()
+        .to_string();
+    
+    // Construir argumentos
+    let args = vec![
+        "-jar".to_string(),
+        installer_path.clone(),
+        "--installServer".to_string(),
+    ];
+    
+    log_to_file(&app, &format!("Executando: {} {:?} em {}", java_path, args, server_dir));
+    
+    // Iniciar processo Java com stdin/stdout/stderr redirecionados
+    let mut child = std::process::Command::new(&java_path)
+        .args(&args)
+        .current_dir(&server_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("Falha ao iniciar instalador do Forge: {}", e);
+            log_to_file(&app, &msg);
+            msg
+        })?;
+
+    job_object::track_process(child.id());
+
+    // Thread de leitura de stdout
+    let app_stdout = app.clone();
+    if let Some(stdout_pipe) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        log_to_file(&app_stdout, &format!("[Forge-Installer] {}", l));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    
+    // Thread de leitura de stderr
+    let app_stderr = app.clone();
+    if let Some(stderr_pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        log_to_file(&app_stderr, &format!("[Forge-Installer-ERR] {}", l));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    
+    // Aguardar o instalador terminar (pode levar vários minutos)
+    // Timeout de 10 minutos
+    let start = Instant::now();
+    let timeout = Duration::from_secs(600); // 10 minutos
+    let app_wait = app.clone();
+    
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    log_to_file(&app_wait, "[Forge-Installer] Timeout de 10 minutos excedido. Matando processo...");
+                    let _ = child.kill();
+                    return Err("Instalador do Forge excedeu o tempo limite de 10 minutos.".to_string());
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(e) => {
+                log_to_file(&app_wait, &format!("[Forge-Installer] Erro ao aguardar: {}", e));
+                return Err(format!("Erro ao aguardar instalador do Forge: {}", e));
+            }
+        }
+    };
+    
+    if !exit_status.success() {
+        let msg = format!("Instalador do Forge falhou com código: {:?}", exit_status.code());
+        log_to_file(&app, &msg);
+        return Err(msg);
+    }
+    
+    log_to_file(&app, "[Forge-Installer] Instalação concluída com sucesso!");
     Ok(())
 }
 
@@ -971,33 +1538,13 @@ async fn get_system_status(
 /// Retorna o total de memória RAM do sistema em bytes.
 #[tauri::command]
 fn get_total_memory() -> Result<u64, String> {
-    if cfg!(target_os = "windows") {
-        let output = std::process::Command::new("wmic")
-            .args(&["computersystem", "get", "totalphysicalmemory"])
-            .output();
-        if let Ok(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                let clean = line.trim();
-                if !clean.is_empty() && clean.chars().all(|c| c.is_digit(10)) {
-                    if let Ok(bytes) = clean.parse::<u64>() {
-                        return Ok(bytes);
-                    }
-                }
-            }
-        }
-        // Fallback para PowerShell se wmic falhar
-        let output = std::process::Command::new("powershell")
-            .args(&["-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
-            .output();
-        if let Ok(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Ok(bytes) = stdout.trim().parse::<u64>() {
-                return Ok(bytes);
-            }
-        }
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total > 0 {
+        return Ok(total);
     }
-    // Default fallback (8GB)
+    // Default fallback (8GB) — só deve acontecer se a leitura falhar de vez.
     Ok(8 * 1024 * 1024 * 1024)
 }
 
@@ -1045,6 +1592,666 @@ async fn write_server_properties(server_dir: String, props: HashMap<String, Stri
     }
     let new_content = lines.join("\n");
     std::fs::write(&path, new_content).map_err(|e| e.to_string())
+}
+
+/// Recorta a imagem para um quadrado centralizado e redimensiona para o tamanho
+/// de ícone do Minecraft (64x64), evitando distorção em imagens não-quadradas.
+fn crop_and_resize_icon(img: image::DynamicImage) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let side = w.min(h);
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    img.crop_imm(x, y, side, side)
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+}
+
+/// Define o ícone exibido na lista de servidores do Minecraft (server-icon.png).
+/// A imagem de origem pode estar em qualquer formato suportado (PNG, JPEG, WEBP, BMP, GIF);
+/// é recortada em um quadrado central e redimensionada para 64x64 antes de salvar.
+#[tauri::command]
+async fn set_server_icon(server_dir: String, image_path: String) -> Result<(), String> {
+    let img = image::open(&image_path)
+        .map_err(|e| format!("Não foi possível abrir a imagem: {}", e))?;
+    let icon = crop_and_resize_icon(img);
+    let dest = PathBuf::from(&server_dir).join("server-icon.png");
+    icon.save_with_format(&dest, image::ImageFormat::Png)
+        .map_err(|e| format!("Não foi possível salvar o ícone: {}", e))
+}
+
+/// Lê o server-icon.png atual (se existir) e retorna como data URL base64 para preview no frontend.
+#[tauri::command]
+async fn get_server_icon(server_dir: String) -> Result<Option<String>, String> {
+    let path = PathBuf::from(&server_dir).join("server-icon.png");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(Some(format!("data:image/png;base64,{}", encoded)))
+}
+
+/// Remove o ícone customizado do servidor, voltando ao ícone padrão do Minecraft.
+#[tauri::command]
+async fn remove_server_icon(server_dir: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("server-icon.png");
+    if path.is_file() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ============================================================
+// Gerenciamento de Mods e Mundo (backups)
+// ============================================================
+//
+// Comandos nativos em Rust (não usam @tauri-apps/plugin-fs no frontend) para que
+// funcionem igualmente em servidores criados pelo app e em servidores importados
+// (fora do escopo de capabilities/default.json).
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ModInfo {
+    file_name: String,
+    display_name: String,
+    size_bytes: u64,
+    enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BackupInfo {
+    file_name: String,
+    size_bytes: u64,
+    created_at: String,
+}
+
+/// Lê o `level-name` do server.properties; usa "world" como padrão.
+fn read_level_name(server_dir: &str) -> String {
+    let path = format!("{}/server.properties", server_dir);
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                if k.trim() == "level-name" {
+                    let name = v.trim();
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "world".to_string()
+}
+
+/// Retorna os caminhos das pastas de mundo existentes (principal + nether + the_end).
+fn world_folder_paths(server_dir: &str, level_name: &str) -> Vec<PathBuf> {
+    [
+        level_name.to_string(),
+        format!("{}_nether", level_name),
+        format!("{}_the_end", level_name),
+    ]
+    .iter()
+    .map(|name| PathBuf::from(server_dir).join(name))
+    .filter(|p| p.is_dir())
+    .collect()
+}
+
+#[tauri::command]
+async fn list_mods(server_dir: String, folder_name: Option<String>) -> Result<Vec<ModInfo>, String> {
+    let mods_dir = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods"));
+    if !mods_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut mods = Vec::new();
+    let entries = std::fs::read_dir(&mods_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let lower = file_name.to_lowercase();
+        if !lower.ends_with(".jar") && !lower.ends_with(".jar.disabled") {
+            continue;
+        }
+        let enabled = !lower.ends_with(".disabled");
+        let display_name = if enabled {
+            file_name.clone()
+        } else {
+            file_name.trim_end_matches(".disabled").to_string()
+        };
+        let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        mods.push(ModInfo { file_name, display_name, size_bytes, enabled });
+    }
+    mods.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    Ok(mods)
+}
+
+#[tauri::command]
+async fn toggle_mod(server_dir: String, file_name: String, folder_name: Option<String>) -> Result<(), String> {
+    let mods_dir = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods"));
+    let from = mods_dir.join(&file_name);
+    if !from.is_file() {
+        return Err(format!("Mod não encontrado: {}", file_name));
+    }
+    let to = if file_name.to_lowercase().ends_with(".disabled") {
+        mods_dir.join(file_name.trim_end_matches(".disabled"))
+    } else {
+        mods_dir.join(format!("{}.disabled", file_name))
+    };
+    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_mod(server_dir: String, file_name: String, folder_name: Option<String>) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods")).join(&file_name);
+    if !path.is_file() {
+        return Err(format!("Mod não encontrado: {}", file_name));
+    }
+    std::fs::remove_file(&path).map_err(|e| e.to_string())
+}
+
+/// Abre uma pasta no gerenciador de arquivos do sistema, criando-a se ainda não existir.
+#[tauri::command]
+fn open_path_in_explorer(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    }
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&path).spawn()
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_world_backups(server_dir: String) -> Result<Vec<BackupInfo>, String> {
+    let backups_dir = PathBuf::from(&server_dir).join("backups");
+    if !backups_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut backups = Vec::new();
+    let entries = std::fs::read_dir(&backups_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().map(|e| e != "zip").unwrap_or(true) {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        let size_bytes = metadata.len();
+        let created_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        backups.push(BackupInfo { file_name, size_bytes, created_at });
+    }
+    backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(backups)
+}
+
+fn zip_add_dir(
+    zip: &mut zip::ZipWriter<File>,
+    base_dir: &PathBuf,
+    dir: &PathBuf,
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let relative = path.strip_prefix(base_dir).map_err(|e| e.to_string())?;
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if name.is_empty() {
+            continue;
+        }
+        if path.is_dir() {
+            zip.add_directory(name, options).map_err(|e| e.to_string())?;
+        } else {
+            zip.start_file(name, options).map_err(|e| e.to_string())?;
+            let mut f = File::open(path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Compacta as pastas do mundo atual (principal + nether + the_end, as que existirem)
+/// em um novo arquivo .zip dentro de `{server_dir}/backups`.
+#[tauri::command]
+async fn backup_world(server_dir: String) -> Result<BackupInfo, String> {
+    let level_name = read_level_name(&server_dir);
+    let folders = world_folder_paths(&server_dir, &level_name);
+    if folders.is_empty() {
+        return Err("Nenhuma pasta de mundo encontrada para fazer backup.".to_string());
+    }
+
+    let backups_dir = PathBuf::from(&server_dir).join("backups");
+    std::fs::create_dir_all(&backups_dir).map_err(|e| e.to_string())?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let file_name = format!("{}_{}.zip", level_name, timestamp);
+    let zip_path = backups_dir.join(&file_name);
+
+    let file = File::create(&zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let server_root = PathBuf::from(&server_dir);
+    for folder in &folders {
+        zip_add_dir(&mut zip, &server_root, folder, options)?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+
+    let size_bytes = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
+    Ok(BackupInfo {
+        file_name,
+        size_bytes,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Substitui o mundo atual pelo conteúdo do backup escolhido.
+///
+/// Antes de tocar no mundo atual, o zip é aberto e todas as entradas são
+/// validadas (backup corrompido é rejeitado sem apagar nada). O mundo atual
+/// é movido para uma pasta de staging (não apagado) durante a extração; se a
+/// extração falhar no meio, o mundo original é restaurado automaticamente.
+#[tauri::command]
+async fn restore_world_backup(server_dir: String, file_name: String) -> Result<(), String> {
+    let zip_path = PathBuf::from(&server_dir).join("backups").join(&file_name);
+    if !zip_path.is_file() {
+        return Err(format!("Backup não encontrado: {}", file_name));
+    }
+
+    // 1. Validar integridade do backup ANTES de tocar no mundo atual.
+    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o backup: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Backup corrompido ou inválido — mundo atual preservado: {}", e))?;
+    for i in 0..archive.len() {
+        archive.by_index(i).map_err(|e| {
+            format!("Backup corrompido (entrada {} ilegível) — mundo atual preservado: {}", i, e)
+        })?;
+    }
+
+    let level_name = read_level_name(&server_dir);
+    let folders = world_folder_paths(&server_dir, &level_name);
+
+    // 2. Mover (não apagar) as pastas do mundo atual para uma área de staging,
+    //    permitindo rollback caso a extração falhe no meio.
+    let staging_dir = PathBuf::from(&server_dir)
+        .join(format!(".restore_staging_{}", chrono::Utc::now().timestamp_millis()));
+    std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for folder in &folders {
+        let dest = staging_dir.join(folder.file_name().unwrap());
+        if let Err(e) = std::fs::rename(folder, &dest) {
+            // Rollback do que já foi movido antes de propagar o erro.
+            for (original, staged) in moved.iter().rev() {
+                let _ = std::fs::rename(staged, original);
+            }
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(format!("Não foi possível preparar a restauração (mundo atual preservado): {}", e));
+        }
+        moved.push((folder.clone(), dest));
+    }
+
+    // 3. Extrair o backup; em caso de falha, restaurar o mundo original a partir do staging.
+    let server_root = PathBuf::from(&server_dir);
+    let extract_result: Result<(), String> = (|| {
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let out_path = match entry.enclosed_name() {
+                Some(p) => server_root.join(p),
+                None => continue,
+            };
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })();
+
+    match extract_result {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            Ok(())
+        }
+        Err(e) => {
+            for (original, staged) in moved.iter().rev() {
+                let _ = std::fs::remove_dir_all(original);
+                let _ = std::fs::rename(staged, original);
+            }
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            Err(format!("Falha ao extrair o backup — mundo original restaurado: {}", e))
+        }
+    }
+}
+
+#[tauri::command]
+async fn delete_world_backup(server_dir: String, file_name: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("backups").join(&file_name);
+    if !path.is_file() {
+        return Err(format!("Backup não encontrado: {}", file_name));
+    }
+    std::fs::remove_file(&path).map_err(|e| e.to_string())
+}
+
+/// Apaga as pastas do mundo atual sem gerar backup; o Minecraft regenera no próximo start.
+#[tauri::command]
+async fn reset_world(server_dir: String) -> Result<(), String> {
+    let level_name = read_level_name(&server_dir);
+    let folders = world_folder_paths(&server_dir, &level_name);
+    if folders.is_empty() {
+        return Err("Nenhuma pasta de mundo encontrada para resetar.".to_string());
+    }
+    for folder in folders {
+        std::fs::remove_dir_all(&folder).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ============================================================
+// Import de Modpacks — CurseForge (.zip) e Modrinth (.mrpack)
+// ============================================================
+//
+// Ambos os formatos são arquivos zip com um manifest na raiz:
+// - CurseForge: "manifest.json" ({projectID, fileID} por mod — a resolução
+//   em URL de download passa pelo proxy da API central, já que a CurseForge
+//   exige uma API key que não pode ir no cliente distribuído publicamente)
+// - Modrinth: "modrinth.index.json" (já traz URL de download direta por
+//   arquivo + hash, nenhuma resolução externa necessária)
+//
+// Este módulo só lê o manifest (preview antes de baixar qualquer coisa) e
+// extrai a pasta de overrides; o download dos mods em si reusa o comando
+// genérico `download_server_jar` já existente, chamado em loop pelo lado TS
+// (mesmo padrão que a instalação de mods individuais via Modrinth já usa).
+
+#[derive(Serialize, Clone)]
+struct CurseForgeManifestFile {
+    project_id: u32,
+    file_id: u32,
+    required: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct ModrinthManifestFile {
+    path: String,
+    url: String,
+    sha1: Option<String>,
+    file_size: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+struct ModpackManifestSummary {
+    format: String, // "curseforge" | "modrinth"
+    pack_name: String,
+    pack_version: String,
+    mc_version: String,
+    loader: String, // "forge" | "neoforge" | "fabric"
+    loader_version: String,
+    curseforge_files: Vec<CurseForgeManifestFile>,
+    modrinth_files: Vec<ModrinthManifestFile>,
+    overrides_folders: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CfManifest {
+    minecraft: CfMinecraft,
+    name: Option<String>,
+    version: Option<String>,
+    files: Vec<CfFileEntry>,
+    overrides: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CfMinecraft {
+    version: String,
+    #[serde(rename = "modLoaders")]
+    mod_loaders: Vec<CfModLoader>,
+}
+
+#[derive(Deserialize)]
+struct CfModLoader {
+    id: String,
+    #[serde(default)]
+    primary: bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Deserialize)]
+struct CfFileEntry {
+    #[serde(rename = "projectID")]
+    project_id: u32,
+    #[serde(rename = "fileID")]
+    file_id: u32,
+    #[serde(default = "default_true")]
+    required: bool,
+}
+
+#[derive(Deserialize)]
+struct MrIndex {
+    name: Option<String>,
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
+    files: Vec<MrFileEntry>,
+    dependencies: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct MrFileEntry {
+    path: String,
+    hashes: Option<MrHashes>,
+    #[serde(default)]
+    downloads: Vec<String>,
+    #[serde(rename = "fileSize")]
+    file_size: Option<u64>,
+    env: Option<MrEnv>,
+}
+
+#[derive(Deserialize)]
+struct MrHashes {
+    sha1: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MrEnv {
+    server: Option<String>,
+}
+
+/// Checa se existe alguma entrada no zip cujo nome comece com o prefixo dado
+/// (usado para detectar se uma pasta de overrides realmente existe).
+fn zip_has_prefix(archive: &mut zip::ZipArchive<File>, prefix: &str) -> bool {
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            if entry.name().starts_with(prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lê o manifest de um modpack (.zip da CurseForge ou .mrpack do Modrinth)
+/// sem extrair nada — usado para a tela de confirmação antes do import real.
+#[tauri::command]
+async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummary, String> {
+    use std::io::Read;
+
+    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+
+    if archive.by_name("manifest.json").is_ok() {
+        let manifest: CfManifest = {
+            let mut entry = archive.by_name("manifest.json").map_err(|e| e.to_string())?;
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).map_err(|e| e.to_string())?;
+            serde_json::from_str(&contents).map_err(|e| format!("manifest.json inválido: {}", e))?
+        };
+
+        let primary = manifest.minecraft.mod_loaders.iter()
+            .find(|l| l.primary)
+            .or_else(|| manifest.minecraft.mod_loaders.first())
+            .ok_or("Modpack não especifica um mod loader (Forge/Fabric/NeoForge).")?;
+
+        let (loader_raw, loader_version) = primary.id.split_once('-')
+            .map(|(l, v)| (l.to_string(), v.to_string()))
+            .ok_or_else(|| format!("Não foi possível interpretar o mod loader \"{}\".", primary.id))?;
+
+        let loader = match loader_raw.as_str() {
+            "forge" => "forge",
+            "neoforge" => "neoforge",
+            "fabric" => "fabric",
+            other => return Err(format!("Mod loader \"{}\" não é suportado pelo CubeForge.", other)),
+        }.to_string();
+
+        let overrides_dir = manifest.overrides.clone().unwrap_or_else(|| "overrides".to_string());
+        let overrides_prefix = format!("{}/", overrides_dir);
+        let overrides_folders = if zip_has_prefix(&mut archive, &overrides_prefix) {
+            vec![overrides_dir]
+        } else {
+            vec![]
+        };
+
+        Ok(ModpackManifestSummary {
+            format: "curseforge".to_string(),
+            pack_name: manifest.name.unwrap_or_else(|| "Modpack".to_string()),
+            pack_version: manifest.version.unwrap_or_default(),
+            mc_version: manifest.minecraft.version,
+            loader,
+            loader_version,
+            curseforge_files: manifest.files.into_iter().map(|f| CurseForgeManifestFile {
+                project_id: f.project_id,
+                file_id: f.file_id,
+                required: f.required,
+            }).collect(),
+            modrinth_files: vec![],
+            overrides_folders,
+        })
+    } else if archive.by_name("modrinth.index.json").is_ok() {
+        let index: MrIndex = {
+            let mut entry = archive.by_name("modrinth.index.json").map_err(|e| e.to_string())?;
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).map_err(|e| e.to_string())?;
+            serde_json::from_str(&contents).map_err(|e| format!("modrinth.index.json inválido: {}", e))?
+        };
+
+        let mc_version = index.dependencies.get("minecraft").cloned()
+            .ok_or("Modpack não especifica a versão do Minecraft.")?;
+
+        let (loader, loader_version) = if let Some(v) = index.dependencies.get("forge") {
+            ("forge".to_string(), v.clone())
+        } else if let Some(v) = index.dependencies.get("neoforge") {
+            ("neoforge".to_string(), v.clone())
+        } else if let Some(v) = index.dependencies.get("fabric-loader") {
+            ("fabric".to_string(), v.clone())
+        } else if index.dependencies.contains_key("quilt-loader") {
+            return Err("Modpacks Quilt não são suportados pelo CubeForge no momento.".to_string());
+        } else {
+            return Err("Modpack não especifica um mod loader suportado (Forge/Fabric/NeoForge).".to_string());
+        };
+
+        let modrinth_files: Vec<ModrinthManifestFile> = index.files.into_iter()
+            .filter(|f| f.env.as_ref().and_then(|e| e.server.as_deref()) != Some("unsupported"))
+            .filter_map(|f| {
+                let url = f.downloads.first().cloned()?;
+                Some(ModrinthManifestFile {
+                    path: f.path,
+                    url,
+                    sha1: f.hashes.and_then(|h| h.sha1),
+                    file_size: f.file_size,
+                })
+            })
+            .collect();
+
+        let mut overrides_folders = vec![];
+        if zip_has_prefix(&mut archive, "overrides/") {
+            overrides_folders.push("overrides".to_string());
+        }
+        if zip_has_prefix(&mut archive, "server-overrides/") {
+            overrides_folders.push("server-overrides".to_string());
+        }
+
+        Ok(ModpackManifestSummary {
+            format: "modrinth".to_string(),
+            pack_name: index.name.unwrap_or_else(|| "Modpack".to_string()),
+            pack_version: index.version_id.unwrap_or_default(),
+            mc_version,
+            loader,
+            loader_version,
+            curseforge_files: vec![],
+            modrinth_files,
+            overrides_folders,
+        })
+    } else {
+        Err("Arquivo não é um modpack CurseForge (.zip) ou Modrinth (.mrpack) válido — manifest.json ou modrinth.index.json não encontrado.".to_string())
+    }
+}
+
+/// Extrai o conteúdo de uma pasta de overrides (ex.: "overrides", "server-overrides")
+/// de dentro do zip do modpack diretamente para a raiz da pasta do servidor.
+///
+/// Sempre aplicado sobre uma pasta de servidor recém-criada e ainda vazia — em
+/// caso de erro, o chamador (TS) apaga a pasta inteira, então não há rollback
+/// próprio aqui (diferente de `restore_world_backup`, que precisa preservar um
+/// mundo já existente enquanto restaura).
+#[tauri::command]
+async fn extract_modpack_overrides(zip_path: String, dest_dir: String, overrides_folder: String) -> Result<u32, String> {
+    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+
+    let prefix = format!("{}/", overrides_folder);
+    let dest_root = PathBuf::from(&dest_dir);
+    let mut extracted: u32 = 0;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        if !entry.name().starts_with(&prefix) {
+            continue;
+        }
+        // enclosed_name() valida e normaliza o caminho (bloqueia "../" e paths
+        // absolutos) antes de qualquer escrita em disco.
+        let enclosed = match entry.enclosed_name() {
+            Some(p) => p,
+            None => continue,
+        };
+        let relative = match enclosed.strip_prefix(&overrides_folder) {
+            Ok(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => continue,
+        };
+        let out_path = dest_root.join(&relative);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            extracted += 1;
+        }
+    }
+
+    Ok(extracted)
 }
 
 // ============================================================
@@ -1830,6 +3037,7 @@ async fn process_sync_queue(
 #[tauri::command]
 async fn sync_register_server(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
     name: String,
     version: String,
@@ -1839,7 +3047,13 @@ async fn sync_register_server(
     owner: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_to_file(&app, &format!("[SYNC] sync_register_server: name={}, version={}", name, version));
-    
+
+    // Guarda o shortCode ativo para que o shutdown gracioso saiba qual servidor
+    // notificar como offline caso o app seja fechado sem um heartbeat prévio.
+    if let Some(ref sc) = short_code {
+        *state.active_short_code.lock().unwrap() = Some(sc.clone());
+    }
+
     let payload = serde_json::json!({
         "name": name,
         "version": version,
@@ -1935,11 +3149,19 @@ async fn sync_update_server(
 #[tauri::command]
 async fn sync_delete_server(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
     short_code: String,
 ) -> Result<serde_json::Value, String> {
     log_to_file(&app, &format!("[SYNC] sync_delete_server: short_code={}", short_code));
-    
+
+    {
+        let mut active = state.active_short_code.lock().unwrap();
+        if active.as_deref() == Some(short_code.as_str()) {
+            *active = None;
+        }
+    }
+
     let payload = serde_json::json!({ "shortCode": short_code });
     let op_id = enqueue_operation(&app, SyncOperationType::DeleteServer, payload);
     
@@ -2086,13 +3308,16 @@ async fn sync_delete_session(
 #[tauri::command]
 async fn sync_send_heartbeat(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
     short_code: String,
     status: String,
     current_players: Option<u16>,
 ) -> Result<serde_json::Value, String> {
     log_to_file(&app, &format!("[SYNC] sync_send_heartbeat: short_code={}, status={}", short_code, status));
-    
+
+    *state.active_short_code.lock().unwrap() = Some(short_code.clone());
+
     let payload = serde_json::json!({
         "shortCode": short_code,
         "status": status,
@@ -2191,6 +3416,105 @@ async fn get_sync_telemetry(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Shutdown gracioso completo: para o servidor Minecraft, encerra o sidecar
+/// Tailscale, notifica a API Central e então finaliza o processo do app de vez.
+/// Só é chamado a partir do "Sair" do tray — fechar a janela (X) agora apenas
+/// esconde o app para o system tray, mantendo servidor e rede mesh no ar.
+async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
+  log_to_file(&app, "=== SHUTDOWN GRACIOSO (Sair pelo tray) ===");
+
+  // 1. Encerrar servidor Minecraft se ainda estiver rodando
+  {
+    let state_ref = app.state::<AppState>();
+    state_ref.minecraft_stop_requested.store(true, Ordering::SeqCst);
+
+    let has_stdin = {
+      let mut stdin_guard = state_ref.minecraft_stdin.lock().unwrap();
+      if let Some(ref mut stdin) = *stdin_guard {
+        let _ = stdin.write_all(b"stop\n");
+        let _ = stdin.flush();
+        true
+      } else {
+        false
+      }
+    };
+
+    if has_stdin {
+      log_to_file(&app, "[SHUTDOWN] Comando stop enviado ao servidor Minecraft. Aguardando 5s...");
+      // Aguarda até 5 segundos pelo servidor fechar
+      for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let still_running = {
+          let mut guard = state_ref.minecraft_process.lock().unwrap();
+          if let Some(ref mut child) = *guard {
+            matches!(child.try_wait(), Ok(None))
+          } else {
+            false
+          }
+        };
+        if !still_running { break; }
+      }
+
+      // Forçar kill se ainda estiver rodando
+      let mut guard = state_ref.minecraft_process.lock().unwrap();
+      if let Some(ref mut child) = *guard {
+        if matches!(child.try_wait(), Ok(None)) {
+          log_to_file(&app, "[SHUTDOWN] Forçando kill do servidor Minecraft.");
+          let _ = child.kill();
+        }
+      }
+      *guard = None;
+      *state_ref.minecraft_stdin.lock().unwrap() = None;
+    }
+  }
+
+  // 2. Parar sidecar Tailscale
+  {
+    let state_ref = app.state::<AppState>();
+    let mut process = state_ref.sidecar_process.lock().unwrap();
+    if let Some(child) = process.take() {
+      log_to_file(&app, "[SHUTDOWN] Encerrando sidecar Tailscale.");
+      let _ = child.kill();
+    }
+  }
+
+  // 3. Remover arquivo JSON temporário do Tailscale
+  if let Ok(data_dir) = app.path().app_local_data_dir() {
+    let config_path = data_dir.join("tsnet_config.json");
+    if config_path.exists() {
+      let _ = std::fs::remove_file(&config_path);
+    }
+  }
+
+  // 4. Notificar a API Central que o servidor ficou offline (best-effort,
+  // timeout curto para não travar o fechamento em caso de rede lenta/indisponível).
+  // Sem isso, fechar o app deixava o status "online" na API até o timeout de
+  // 5min do lado do servidor, mostrando informação falsa para os convidados.
+  let short_code_opt = {
+    let state_ref = app.state::<AppState>();
+    let sc = state_ref.active_short_code.lock().unwrap().clone();
+    sc
+  };
+  if let Some(short_code) = short_code_opt {
+    log_to_file(&app, &format!("[SHUTDOWN] Notificando API Central: {} está offline...", short_code));
+    let payload = serde_json::json!({
+      "shortCode": short_code,
+      "status": "offline",
+      "currentPlayers": null,
+    });
+    if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
+      let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
+      match client.post(&url).json(&payload).send().await {
+        Ok(_) => log_to_file(&app, "[SHUTDOWN] API Central notificada com sucesso."),
+        Err(e) => log_to_file(&app, &format!("[SHUTDOWN] Falha ao notificar API Central (offline): {}", e)),
+      }
+    }
+  }
+
+  log_to_file(&app, "[SHUTDOWN] Cleanup concluído. Encerrando processo.");
+  app.exit(0);
+}
+
 pub fn run() {
   let registry = Arc::new(ServerRegistry {
       entries: Mutex::new(BTreeMap::new()),
@@ -2252,7 +3576,54 @@ pub fn run() {
           process_sync_queue(app_handle.clone(), telemetry.clone()).await;
         }
       });
-      
+
+      // --- System tray ---
+      // Fechar a janela (X) esconde o app em vez de encerrá-lo (ver on_window_event);
+      // o tray é o que fica visível para o usuário voltar ao app ou realmente sair.
+      let tray_menu = MenuBuilder::new(app)
+        .text("show", "Abrir Cubicase")
+        .separator()
+        .text("quit", "Sair (encerra servidor e rede mesh)")
+        .build()?;
+
+      TrayIconBuilder::new()
+        .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("Cubicase")
+        .menu(&tray_menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+          match event.id().as_ref() {
+            "show" => {
+              if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+              }
+            }
+            "quit" => {
+              let state_ref = app.state::<AppState>();
+              // swap garante que o cleanup só roda uma vez mesmo se o usuário
+              // clicar "Sair" mais de uma vez rapidamente.
+              if !state_ref.is_shutting_down.swap(true, Ordering::SeqCst) {
+                let app_clone = app.clone();
+                tauri::async_runtime::spawn(graceful_shutdown_and_exit(app_clone));
+              }
+            }
+            _ => {}
+          }
+        })
+        .on_tray_icon_event(|tray, event| {
+          // Clique esquerdo no ícone reabre a janela (padrão de apps como
+          // Discord/Steam), sem precisar abrir o menu do tray.
+          if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+            let app = tray.app_handle();
+            if let Some(win) = app.get_webview_window("main") {
+              let _ = win.show();
+              let _ = win.set_focus();
+            }
+          }
+        })
+        .build(app)?;
+
       Ok(())
     })
     .manage(AppState::default())
@@ -2263,15 +3634,32 @@ pub fn run() {
        stop_network_node,
        download_server_jar,
        start_minecraft_server,
+       run_forge_installer,
        stop_minecraft_server,
        send_minecraft_command,
        get_system_status,
        get_total_memory,
        read_server_properties,
        write_server_properties,
+       set_server_icon,
+       get_server_icon,
+       remove_server_icon,
        update_server_registry,
        remove_server_registry,
        discover_server,
+       // Comandos de gerenciamento de mods e mundo
+       list_mods,
+       toggle_mod,
+       delete_mod,
+       open_path_in_explorer,
+       list_world_backups,
+       backup_world,
+       restore_world_backup,
+       delete_world_backup,
+       reset_world,
+       // Comandos de import de modpacks (CurseForge/Modrinth)
+       read_modpack_manifest,
+       extract_modpack_overrides,
        // Comandos de sincronização com API Central
        sync_register_server,
        sync_update_server,
@@ -2285,102 +3673,14 @@ pub fn run() {
        get_sync_telemetry,
     ])
     .on_window_event(|window, event| {
-      // Interceptar CloseRequested para fazer shutdown gracioso:
-      // 1. Parar servidor Minecraft (enviar comando stop)
-      // 2. Parar rede mesh (sidecar Tailscale)
-      // 3. Só então permitir o fechamento da janela
+      // Fechar a janela (X) não encerra mais o app: só esconde para o system tray.
+      // Servidor Minecraft e rede mesh continuam rodando em segundo plano — só param
+      // de verdade pelo "Sair" do menu do tray (ver setup() para o tray) ou se o
+      // processo for finalizado à força (o job_object garante que os filhos também
+      // morrem nesse caso, ver job_object.rs).
       if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        let app = window.app_handle();
-        let state_ref = app.state::<AppState>();
-        
-        // Verificar se já estamos no processo de shutdown (evita loop infinito
-        // quando chamamos win.close() após o cleanup)
-        if state_ref.is_shutting_down.load(Ordering::SeqCst) {
-          // Já estamos desligando, permitir o fechamento
-          return;
-        }
-        
-        // Marcar que estamos em shutdown e prevenir fechamento imediato
-        state_ref.is_shutting_down.store(true, Ordering::SeqCst);
         api.prevent_close();
-        
-        // Spawnar uma task assíncrona para fazer o shutdown gracioso
-        let app_clone = app.clone();
-        tauri::async_runtime::spawn(async move {
-          log_to_file(&app_clone, "=== SHUTDOWN GRACIOSO (fechamento de janela) ===");
-          
-          // 1. Encerrar servidor Minecraft se ainda estiver rodando
-          {
-            let state_ref = app_clone.state::<AppState>();
-            state_ref.minecraft_stop_requested.store(true, Ordering::SeqCst);
-            
-            let has_stdin = {
-              let mut stdin_guard = state_ref.minecraft_stdin.lock().unwrap();
-              if let Some(ref mut stdin) = *stdin_guard {
-                let _ = stdin.write_all(b"stop\n");
-                let _ = stdin.flush();
-                true
-              } else {
-                false
-              }
-            };
-            
-            if has_stdin {
-              log_to_file(&app_clone, "[SHUTDOWN] Comando stop enviado ao servidor Minecraft. Aguardando 5s...");
-              // Aguarda até 5 segundos pelo servidor fechar
-              for _ in 0..5 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let still_running = {
-                  let mut guard = state_ref.minecraft_process.lock().unwrap();
-                  if let Some(ref mut child) = *guard {
-                    matches!(child.try_wait(), Ok(None))
-                  } else {
-                    false
-                  }
-                };
-                if !still_running { break; }
-              }
-              
-              // Forçar kill se ainda estiver rodando
-              let mut guard = state_ref.minecraft_process.lock().unwrap();
-              if let Some(ref mut child) = *guard {
-                if matches!(child.try_wait(), Ok(None)) {
-                  log_to_file(&app_clone, "[SHUTDOWN] Forçando kill do servidor Minecraft.");
-                  let _ = child.kill();
-                }
-              }
-              *guard = None;
-              *state_ref.minecraft_stdin.lock().unwrap() = None;
-            }
-          }
-          
-          // 2. Parar sidecar Tailscale
-          {
-            let state_ref = app_clone.state::<AppState>();
-            let mut process = state_ref.sidecar_process.lock().unwrap();
-            if let Some(child) = process.take() {
-              log_to_file(&app_clone, "[SHUTDOWN] Encerrando sidecar Tailscale.");
-              let _ = child.kill();
-            }
-          }
-          
-          // 3. Remover arquivo JSON temporário do Tailscale
-          if let Ok(data_dir) = app_clone.path().app_local_data_dir() {
-            let config_path = data_dir.join("tsnet_config.json");
-            if config_path.exists() {
-              let _ = std::fs::remove_file(&config_path);
-            }
-          }
-          
-          log_to_file(&app_clone, "[SHUTDOWN] Cleanup concluído. Fechando janela.");
-          
-          // Agora podemos fechar a janela de verdade
-          // A flag is_shutting_down já está true, então o próximo CloseRequested
-          // será ignorado e a janela fechará normalmente.
-          if let Some(win) = app_clone.get_webview_window("main") {
-            let _ = win.close();
-          }
-        });
+        let _ = window.hide();
       }
     })
     .run(tauri::generate_context!())

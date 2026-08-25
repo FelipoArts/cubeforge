@@ -36,14 +36,24 @@ export function ConsolePanel({
   const mcScrollRef = useRef<HTMLDivElement>(null);
   const networkScrollRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll inteligente: só rola para o final se o usuário já estiver no final.
-  // Usa scrollTop diretamente no container em vez de scrollIntoView para evitar
-  // que o scroll "vaze" para o scroll principal da página.
+  // Guarda se o usuário estava no final ANTES dos novos logs chegarem (atualizado
+  // via evento de scroll). Medir isso depois que os logs já cresceram o scrollHeight
+  // dá falso negativo, por isso não pode ser calculado dentro do useEffect abaixo.
+  const mcAtBottomRef = useRef(true);
+  const networkAtBottomRef = useRef(true);
+
+  const handleScroll = (ref: React.RefObject<boolean>) => (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    ref.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  };
+
+  // Auto-scroll inteligente: só rola para o final se o usuário já estava no final
+  // antes dos novos logs chegarem. Usa scrollTop diretamente no container em vez de
+  // scrollIntoView para evitar que o scroll "vaze" para o scroll principal da página.
   useEffect(() => {
     const container = mcScrollRef.current;
     if (!container) return;
-    const isAtBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 8;
-    if (isAtBottom) {
+    if (mcAtBottomRef.current) {
       container.scrollTop = container.scrollHeight;
     }
   }, [mcLogs]);
@@ -51,8 +61,7 @@ export function ConsolePanel({
   useEffect(() => {
     const container = networkScrollRef.current;
     if (!container) return;
-    const isAtBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 8;
-    if (isAtBottom) {
+    if (networkAtBottomRef.current) {
       container.scrollTop = container.scrollHeight;
     }
   }, [networkLogs]);
@@ -60,7 +69,9 @@ export function ConsolePanel({
   // Auto-scroll para o final quando troca de aba
   useEffect(() => {
     const container = activeTab === "minecraft" ? mcScrollRef.current : networkScrollRef.current;
+    const atBottomRef = activeTab === "minecraft" ? mcAtBottomRef : networkAtBottomRef;
     if (container) {
+      atBottomRef.current = true;
       setTimeout(() => { container.scrollTop = container.scrollHeight; }, 50);
     }
   }, [activeTab]);
@@ -114,6 +125,7 @@ export function ConsolePanel({
       {/* Tab Contents */}
       <div
         ref={activeTab === "minecraft" ? mcScrollRef : networkScrollRef}
+        onScroll={handleScroll(activeTab === "minecraft" ? mcAtBottomRef : networkAtBottomRef)}
         className="h-72 overflow-y-auto mt-4 space-y-1.5 pr-2 custom-scrollbar"
       >
         {activeTab === "minecraft" ? (

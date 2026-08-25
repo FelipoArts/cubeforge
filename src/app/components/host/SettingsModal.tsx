@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Settings, X } from "lucide-react";
+import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 
 // ============================================================
 // SettingsModal
@@ -26,6 +27,8 @@ export function SettingsModal({
   onSave,
 }: SettingsModalProps) {
   const [port, setPort] = useState(currentPort);
+
+  useLockBodyScroll(isOpen);
 
   useEffect(() => {
     if (isOpen) setPort(currentPort);

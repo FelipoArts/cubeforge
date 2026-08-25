@@ -14,6 +14,7 @@ import {
   Loader2,
   AlertTriangle,
   Database,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -21,20 +22,28 @@ import { documentDir, join } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
 import { readTextFile, remove } from "@tauri-apps/plugin-fs";
 import { useAppStore, type ServerStatus } from "@/app/store";
+import { pushDiagnostic } from "@/app/diagnostics";
 import { installJRE, isJREInstalled, getJREPath, type DownloadProgress } from "@/lib/jre";
 import {
   listLocalServers,
   installMinecraftServer,
+  installForgeServer,
+  installFabricServer,
+  installPaperServer,
   importExistingServer,
   scanExternalServer,
   getJavaVersion,
   type ServerInfo,
   type ServerInstallProgress,
 } from "@/lib/server";
+import type { ResourceSnapshot } from "@/lib/resourceDiagnostics";
+import { installModpack, type ParsedModpack } from "@/lib/modpackImport";
 import { ServerConfigModal } from "@/app/ServerConfigModal";
 import { ConsolePanel } from "./ConsolePanel";
+import { ServerManagePanel } from "./ServerManagePanel";
 import { ServerList } from "./ServerList";
 import { CreateServerModal } from "./CreateServerModal";
+import { ImportModpackModal } from "./ImportModpackModal";
 import { DeleteConfirmModal } from "./DeleteConfirmModal";
 import { SettingsModal } from "./SettingsModal";
 
@@ -66,6 +75,7 @@ interface HostViewProps {
   settingsPort: number;
   copied: boolean;
   shortCode: string;
+  resourceSample: ResourceSnapshot | null;
 
   // Callbacks
   onSetNetStatus: (status: "offline" | "connecting" | "online") => void;
@@ -109,6 +119,7 @@ export function HostView({
   settingsPort,
   copied,
   shortCode,
+  resourceSample,
 
   onSetNetStatus,
   onSetNetIp,
@@ -138,8 +149,10 @@ export function HostView({
     setMinecraftPort,
     selectedServer,
     setSelectedServer,
+    setRunningServer,
     serverStatus,
     setServerStatus,
+    lastCrashInfo,
     importedServerPaths,
     addImportedServerPath,
     removeImportedServerPath,
@@ -147,6 +160,8 @@ export function HostView({
 
   // --- Estado ---
   const [isImporting, setIsImporting] = useState(false);
+  const [showCrashDetail, setShowCrashDetail] = useState(false);
+  const [showImportModpack, setShowImportModpack] = useState(false);
 
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
@@ -276,7 +291,7 @@ export function HostView({
         pendingMcStartRef.current = false;
       } catch (err) {
         console.error(err);
-        alert("Erro ao parar rede: " + err);
+        pushDiagnostic({ level: "error", source: "Rede", title: "Erro ao parar a rede mesh", message: String(err) });
       }
       return;
     }
@@ -327,7 +342,7 @@ export function HostView({
       onSetDownloadProgress(null);
       pendingMcStartRef.current = false;
       onSetLogs(prev => [...prev, `[ERR] Falha ao iniciar host: ${error}`]);
-      alert("Falha ao iniciar servidor: " + error);
+      pushDiagnostic({ level: "error", source: "Rede", title: "Falha ao iniciar a rede mesh", message: String(error) });
     }
   };
 
@@ -336,18 +351,19 @@ export function HostView({
     const currentLocalServers = localServersRef.current.length > 0 ? localServersRef.current : localServers;
 
     if (!currentSelectedServer) {
-      alert("Selecione um servidor primeiro.");
+      pushDiagnostic({ level: "warning", source: "Servidor", title: "Nenhum servidor selecionado", message: "Selecione um servidor primeiro." });
       return;
     }
 
     const serverInfo = currentLocalServers.find(s => s.name === currentSelectedServer);
     if (!serverInfo) {
-      alert("Servidor selecionado não encontrado.");
+      pushDiagnostic({ level: "warning", source: "Servidor", title: "Servidor não encontrado", message: "O servidor selecionado não foi encontrado na lista local." });
       return;
     }
 
     try {
       setServerStatus("starting");
+      setRunningServer(currentSelectedServer);
       onSetMcLogs([]);
       onSetMcLogs(prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${selectedServer}"...`]);
 
@@ -378,18 +394,24 @@ export function HostView({
         console.warn('Could not read RAM from meta file, using default 4GB:', e);
       }
 
+      // serverJarName opcional: null = server.jar (Vanilla), ou "forge-1.20.1-47.1.0-shim.jar" (Forge antigo)
+      // launchArgsDir opcional: pasta com win_args.txt/unix_args.txt (Forge/NeoForge modernos, sem JAR único)
+      const serverJarName = serverInfo.serverJar || null;
+      const launchArgsDir = serverInfo.launchArgsDir || null;
       onSetMcLogs(prev => [...prev, `[Cubicase] Iniciando Java runtime com ${ram}GB de RAM...`]);
       await invoke("start_minecraft_server", {
         serverDir: serverInfo.path,
         javaPath: javaPath,
         ramGb: ram,
         localPort: minecraftPort,
+        serverJarName: serverJarName,
+        launchArgsDir: launchArgsDir,
       });
     } catch (err) {
       console.error(err);
       setServerStatus("offline");
       onSetMcLogs(prev => [...prev, `[Cubicase ERR] Falha ao iniciar: ${err}`]);
-      alert("Falha ao iniciar o Minecraft Server: " + err);
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Falha ao iniciar o servidor Minecraft", message: String(err) });
     }
   };
 
@@ -401,7 +423,7 @@ export function HostView({
     } catch (err) {
       console.error(err);
       onSetMcLogs(prev => [...prev, `[Cubicase ERR] Erro ao enviar comando de parada: ${err}`]);
-      alert("Falha ao encerrar o servidor: " + err);
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Falha ao encerrar o servidor", message: String(err) });
     }
   };
 
@@ -430,14 +452,25 @@ export function HostView({
     setTimeout(() => onSetCopied(false), 2000);
   };
 
-  const handleCreateServer = async (name: string, version: string, ram: number) => {
+  const handleCreateServer = async (name: string, version: string, ram: number, serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper", extraVersion?: string) => {
     if (localServers.some(s => s.name.toLowerCase() === name.toLowerCase())) {
-      alert(`Já existe um servidor com o nome "${name}". Escolha outro nome.`);
+      pushDiagnostic({ level: "warning", source: "Instalação", title: "Nome já em uso", message: `Já existe um servidor com o nome "${name}". Escolha outro nome.` });
       return;
     }
     try {
-      onSetServerInstallProgress({ status: "Iniciando download da Mojang...", percent: 5 });
-      await installMinecraftServer(name, version, ram, (p) => onSetServerInstallProgress(p));
+      if ((serverType === "forge" || serverType === "neoforge") && extraVersion) {
+        onSetServerInstallProgress({ status: "Iniciando instalação do Forge...", percent: 5 });
+        await installForgeServer(name, version, extraVersion, serverType, ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+      } else if (serverType === "fabric" && extraVersion) {
+        onSetServerInstallProgress({ status: "Iniciando instalação do Fabric...", percent: 5 });
+        await installFabricServer(name, version, extraVersion, ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+      } else if (serverType === "paper" && extraVersion) {
+        onSetServerInstallProgress({ status: "Iniciando instalação do Paper...", percent: 5 });
+        await installPaperServer(name, version, Number(extraVersion), ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+      } else {
+        onSetServerInstallProgress({ status: "Iniciando download da Mojang...", percent: 5 });
+        await installMinecraftServer(name, version, ram, (p) => onSetServerInstallProgress(p));
+      }
       const servers = await listLocalServers();
       onSetLocalServers(servers);
       setSelectedServer(name);
@@ -445,7 +478,27 @@ export function HostView({
       onSetServerInstallProgress(null);
     } catch (err) {
       console.error(err);
-      alert("Erro ao criar servidor: " + err);
+      pushDiagnostic({ level: "error", source: "Instalação", title: "Erro ao criar servidor", message: String(err) });
+      onSetServerInstallProgress(null);
+    }
+  };
+
+  const handleImportModpack = async (name: string, parsed: ParsedModpack, ram: number) => {
+    if (localServers.some(s => s.name.toLowerCase() === name.toLowerCase())) {
+      pushDiagnostic({ level: "warning", source: "Instalação", title: "Nome já em uso", message: `Já existe um servidor com o nome "${name}". Escolha outro nome.` });
+      return;
+    }
+    try {
+      onSetServerInstallProgress({ status: "Iniciando import do modpack...", percent: 2 });
+      await installModpack(name, parsed, ram, (p) => onSetServerInstallProgress(p));
+      const servers = await listLocalServers();
+      onSetLocalServers(servers);
+      setSelectedServer(name);
+      setShowImportModpack(false);
+      onSetServerInstallProgress(null);
+    } catch (err) {
+      console.error(err);
+      pushDiagnostic({ level: "error", source: "Instalação", title: "Erro ao importar modpack", message: String(err) });
       onSetServerInstallProgress(null);
     }
   };
@@ -453,7 +506,7 @@ export function HostView({
   const handleDeleteServer = async (serverName: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (serverStatus !== "offline" && serverStatus !== "crashed" && selectedServer === serverName) {
-      alert("Não é possível deletar o servidor enquanto ele está em execução.");
+      pushDiagnostic({ level: "warning", source: "Servidor", title: "Servidor em execução", message: "Não é possível deletar o servidor enquanto ele está em execução." });
       return;
     }
     onSetDeleteConfirmServer(serverName);
@@ -481,12 +534,24 @@ export function HostView({
         onSetLogs(prev => [...prev, `[INFO] Servidor "${deleteConfirmServer}" deletado permanentemente.`]);
       }
 
+      // Remover também da API Central: sem isso o servidor deletado localmente
+      // continuava aparecendo como existente (e potencialmente "online") para os convidados.
+      if (serverInfo.shortCode) {
+        try {
+          await invoke("sync_delete_server", { shortCode: serverInfo.shortCode });
+          onSetLogs(prev => [...prev, `[INFO] Servidor removido da API Central.`]);
+        } catch (err) {
+          console.warn("Falha ao remover servidor da API Central:", err);
+          onSetLogs(prev => [...prev, `[WARN] Não foi possível remover o servidor da API Central agora (ficará na fila de sincronização).`]);
+        }
+      }
+
       if (selectedServer === deleteConfirmServer) setSelectedServer(null);
       const servers = await listLocalServers();
       onSetLocalServers(servers);
     } catch (err) {
       console.error(err);
-      alert("Erro ao deletar servidor: " + err);
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao deletar servidor", message: String(err) });
     } finally {
       onSetIsDeletingServer(null);
       onSetDeleteConfirmServer(null);
@@ -508,7 +573,7 @@ export function HostView({
       // Verificar se já não está na lista (pela path)
       const alreadyExists = localServers.some(s => s.path.toLowerCase() === folderPath.toLowerCase());
       if (alreadyExists) {
-        alert("Este servidor já está na sua lista.");
+        pushDiagnostic({ level: "warning", source: "Instalação", title: "Servidor já importado", message: "Este servidor já está na sua lista." });
         setIsImporting(false);
         return;
       }
@@ -524,7 +589,7 @@ export function HostView({
       onSetLogs(prev => [...prev, `[INFO] Servidor "${imported.name}" (${imported.version || "versão desconhecida"}) importado com sucesso!`]);
     } catch (err) {
       console.error(err);
-      alert("Erro ao importar servidor: " + err);
+      pushDiagnostic({ level: "error", source: "Instalação", title: "Erro ao importar servidor", message: String(err) });
     } finally {
       setIsImporting(false);
     }
@@ -540,6 +605,15 @@ export function HostView({
   const serverInfo = selectedServer ? localServers.find(s => s.name === selectedServer) : null;
   const displayShortCode = serverInfo?.shortCode || serverShortCodeRef.current || shortCode;
 
+  const serverTypeLabels: Record<string, string> = {
+    vanilla: "Vanilla",
+    forge: "Forge",
+    neoforge: "NeoForge",
+    fabric: "Fabric",
+    paper: "Paper",
+  };
+  const serverTypeLabel = serverTypeLabels[serverInfo?.serverType ?? "vanilla"] ?? "Vanilla";
+
   return (
     <>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -550,7 +624,7 @@ export function HostView({
             <div className="flex items-center justify-between flex-wrap gap-4">
               <div className="flex-1 min-w-0">
                 <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest bg-indigo-100 dark:bg-indigo-900/30 px-2.5 py-1 rounded-full">
-                  Minecraft Server Vanilla
+                  Minecraft Server {serverTypeLabel}
                 </span>
                 <div className="flex items-center gap-2 mt-2">
                   <h2 className="text-3xl font-bold text-theme-primary truncate">
@@ -572,7 +646,7 @@ export function HostView({
                 </div>
                 <p className="text-theme-secondary mt-1">
                   {selectedServer
-                    ? `Versão: ${serverInfo?.version || "Não encontrada"}`
+                    ? `Versão: ${serverInfo?.version || "Não encontrada"}${serverInfo?.forgeVersion ? ` • ${serverTypeLabel}: ${serverInfo.forgeVersion}` : ""}`
                     : "Selecione ou crie um servidor na barra lateral para começar."}
                 </p>
 
@@ -615,6 +689,24 @@ export function HostView({
                     </span>
                   </div>
 
+                  {/* Indicador leve de saúde: RAM/CPU real da máquina, atualizado a
+                      cada ~15s (ver src-tauri thread de amostragem + mc-resource-sample).
+                      Sem histórico/gráfico — só o valor mais recente, pra dar uma noção
+                      contínua sem virar um dashboard. */}
+                  {serverStatus === "online" && resourceSample?.totalRamMb && resourceSample.availableRamMb !== undefined && (
+                    <div
+                      className="flex items-center gap-2 px-3 py-1.5 bg-theme-muted border border-theme-card rounded-xl text-xs font-bold text-theme-secondary"
+                      title="Uso de RAM/CPU do computador (não só do servidor)"
+                    >
+                      <Activity className="w-3.5 h-3.5" />
+                      <span>
+                        RAM {Math.round(((resourceSample.totalRamMb - resourceSample.availableRamMb) / resourceSample.totalRamMb) * 100)}%
+                        {" · "}
+                        CPU {Math.round(resourceSample.cpuUsagePercent ?? 0)}%
+                      </span>
+                    </div>
+                  )}
+
                   <button
                     type="button"
                     onClick={serverStatus === "online" ? handleStopMCServer : handleStartMCServer}
@@ -641,10 +733,38 @@ export function HostView({
             </div>
 
             {serverStatus === "crashed" && (
-              <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl flex items-center gap-3 text-sm">
-                <AlertTriangle className="w-5 h-5 text-rose-500 flex-shrink-0" />
-                <div>
-                  <span className="font-bold">O servidor fechou de forma inesperada.</span> Verifique os logs do console para identificar erros nos arquivos ou configurações do Minecraft.
+              <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl text-sm">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    {lastCrashInfo ? (
+                      <>
+                        <span className="font-bold">{lastCrashInfo.title}.</span> {lastCrashInfo.message}
+                      </>
+                    ) : (
+                      <>
+                        <span className="font-bold">O servidor fechou de forma inesperada.</span> Verifique os logs do console para identificar erros nos arquivos ou configurações do Minecraft.
+                      </>
+                    )}
+
+                    {lastCrashInfo?.detail && (
+                      <div className="mt-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowCrashDetail((v) => !v)}
+                          className="flex items-center gap-1 text-xs font-bold text-rose-700 dark:text-rose-300 hover:underline cursor-pointer"
+                        >
+                          <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", showCrashDetail && "rotate-180")} />
+                          {showCrashDetail ? "Ocultar detalhes técnicos" : "Ver detalhes técnicos"}
+                        </button>
+                        {showCrashDetail && (
+                          <pre className="mt-2 p-3 bg-black/10 dark:bg-black/30 rounded-xl text-[10px] font-mono whitespace-pre-wrap break-words max-h-64 overflow-y-auto custom-scrollbar">
+                            {lastCrashInfo.detail}
+                          </pre>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
@@ -772,6 +892,17 @@ export function HostView({
             )}
           </div>
 
+          {/* Gerenciamento de Mods e Mundo */}
+          {selectedServer && serverInfo && (
+            <ServerManagePanel
+              key={serverInfo.path}
+              serverDir={serverInfo.path}
+              serverType={serverInfo.serverType}
+              serverStatus={serverStatus}
+              mcVersion={serverInfo.version}
+            />
+          )}
+
           {/* Console */}
           <ConsolePanel
             mcLogs={mcLogs}
@@ -794,6 +925,7 @@ export function HostView({
             onSelect={setSelectedServer}
             onCreate={() => onSetShowCreateServer(true)}
             onImport={handleImportServer}
+            onImportModpack={() => setShowImportModpack(true)}
             onDelete={handleDeleteServer}
             onConfig={(path) => { onSetConfigServerDir(path); onSetShowConfigModal(true); }}
             isDeleting={isDeletingServer}
@@ -858,6 +990,14 @@ export function HostView({
         isOpen={showCreateServer}
         onClose={() => onSetShowCreateServer(false)}
         onCreate={handleCreateServer}
+        installProgress={serverInstallProgress}
+        totalRamGb={totalSystemRamGb}
+      />
+
+      <ImportModpackModal
+        isOpen={showImportModpack}
+        onClose={() => setShowImportModpack(false)}
+        onImport={handleImportModpack}
         installProgress={serverInstallProgress}
         totalRamGb={totalSystemRamGb}
       />
