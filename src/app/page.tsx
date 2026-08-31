@@ -22,6 +22,8 @@ import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/app/components/ThemeToggle";
 import { DiagnosticsToasts, DiagnosticsBell } from "@/app/components/DiagnosticsCenter";
 import { pushDiagnostic } from "@/app/diagnostics";
+import { UpdateBanner } from "@/app/components/UpdateBanner";
+import { useUpdaterStore } from "@/app/updater";
 import { analyzeCrashText } from "@/lib/crashAnalyzer";
 import { createLagMonitor } from "@/lib/lagDetector";
 import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
@@ -46,6 +48,19 @@ export default function Home() {
   // Evitar hydration mismatch: só renderizar o logo após montar no cliente
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // Checagem de atualização: silenciosa, alguns segundos após o boot (não
+  // compete com as outras chamadas de rede do startup) e depois a cada 4h
+  // enquanto o app fica aberto (útil pro host, que roda por horas).
+  useEffect(() => {
+    const checkForUpdates = useUpdaterStore.getState().checkForUpdates;
+    const initial = setTimeout(checkForUpdates, 5000);
+    const interval = setInterval(checkForUpdates, 4 * 60 * 60 * 1000);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
   }, []);
 
   // --- Store ---
@@ -730,6 +745,7 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-theme-bg transition-colors duration-300">
       <DiagnosticsToasts />
+      <UpdateBanner />
       {/* Cabeçalho */}
       <header className="sticky top-0 z-40 bg-theme-card/80 backdrop-blur-xl border-b border-theme-card">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">

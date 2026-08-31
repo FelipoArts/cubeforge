@@ -1,0 +1,43 @@
+name: Release
+
+# Dispara ao empurrar uma tag "vX.Y.Z" (ex: v0.2.0). Antes de criar a tag,
+# lembre de subir a versão em src-tauri/tauri.conf.json e package.json.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Chave privada minisign gerada com `npx tauri signer generate`.
+          # A pública correspondente já está em src-tauri/tauri.conf.json (plugins.updater.pubkey).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Cubicase ${{ github.ref_name }}"
+          releaseBody: "Veja as mudanças desta versão."
+          # Fica como draft de propósito: você revisa e publica manualmente no
+          # GitHub quando quiser liberar o update pros usuários (o updater só
+          # enxerga releases publicadas, não-draft, não-prerelease).
+          releaseDraft: true
+          prerelease: false

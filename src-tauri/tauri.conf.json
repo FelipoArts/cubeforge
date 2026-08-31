@@ -29,11 +29,19 @@
     "fs": {},
     "http": null,
     "dialog": null,
-    "process": {}
+    "process": {},
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/FelipoArts/cubeforge/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVCNTBFNkYyODE3NkU1OTAKUldTUTVYYUI4dVpRVzhZK3NxT1U2T1NoaW5HYlBmTkFhSW5DVWlJRVlURUhya1NOSDVxbkh0OG4K"
+    }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "externalBin": [
       "binaries/tsnet-node"
     ],

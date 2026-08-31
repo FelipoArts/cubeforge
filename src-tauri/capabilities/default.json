@@ -114,6 +114,7 @@
         { "url": "https://api.modrinth.com" }
       ]
     },
-    "dialog:default"
+    "dialog:default",
+    "updater:default"
   ]
 }
