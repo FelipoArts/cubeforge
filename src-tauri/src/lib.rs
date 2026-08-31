@@ -642,6 +642,252 @@ async fn stop_network_node(
     stop_network_node_internal(&app, &state).await
 }
 
+/// Localiza a pasta ".minecraft" (dados do launcher oficial) no sistema do
+/// convidado. Cada SO tem uma convenção diferente de onde essa pasta fica —
+/// não há como perguntar ao usuário sem quebrar o fluxo "um clique".
+fn find_minecraft_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = if cfg!(target_os = "windows") {
+        // %APPDATA%\.minecraft
+        app.path().config_dir().ok().map(|p| p.join(".minecraft"))
+    } else if cfg!(target_os = "macos") {
+        // ~/Library/Application Support/minecraft
+        app.path().config_dir().ok().map(|p| p.join("minecraft"))
+    } else {
+        // ~/.minecraft
+        app.path().home_dir().ok().map(|p| p.join(".minecraft"))
+    }?;
+
+    if dir.is_dir() { Some(dir) } else { None }
+}
+
+/// Adiciona (ou atualiza, se já existir uma entrada com o mesmo endereço) um
+/// servidor na lista "Multiplayer" do launcher oficial do Minecraft do
+/// convidado, editando diretamente o servers.dat (formato NBT). Isso poupa o
+/// jogador de digitar "localhost:<porta>" manualmente toda vez que conecta.
+///
+/// É melhor-esforço: se a pasta .minecraft não existir (launcher não
+/// instalado, ou instalado por outro launcher que não segue a convenção
+/// padrão), retorna "not_found" em vez de erro — o convidado ainda pode
+/// digitar o endereço manualmente.
+#[tauri::command]
+fn add_minecraft_server_entry(app: tauri::AppHandle, name: String, address: String) -> Result<String, String> {
+    let dir = match find_minecraft_dir(&app) {
+        Some(d) => d,
+        None => return Ok("not_found".to_string()),
+    };
+    let path = dir.join("servers.dat");
+
+    let mut blob = if path.exists() {
+        let bytes = std::fs::read(&path).map_err(|e| format!("Falha ao ler servers.dat: {}", e))?;
+        // Um servers.dat corrompido não deve travar a conexão: tratamos como vazio.
+        nbt::Blob::from_reader(&mut &bytes[..]).unwrap_or_else(|_| nbt::Blob::new())
+    } else {
+        nbt::Blob::new()
+    };
+
+    let mut servers: Vec<nbt::Value> = match blob.get("servers") {
+        Some(nbt::Value::List(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+
+    // Remove qualquer entrada existente com o mesmo endereço para não duplicar
+    // a cada reconexão (o nome do servidor pode ter mudado nesse meio tempo).
+    servers.retain(|v| {
+        if let nbt::Value::Compound(map) = v {
+            !matches!(map.get("ip"), Some(nbt::Value::String(existing_ip)) if existing_ip == &address)
+        } else {
+            true
+        }
+    });
+
+    let mut entry: nbt::Map<String, nbt::Value> = nbt::Map::new();
+    entry.insert("name".to_string(), nbt::Value::String(name));
+    entry.insert("ip".to_string(), nbt::Value::String(address));
+    servers.insert(0, nbt::Value::Compound(entry));
+
+    blob.insert("servers", nbt::Value::List(servers))
+        .map_err(|e| format!("Falha ao montar servers.dat: {}", e))?;
+
+    let mut out: Vec<u8> = Vec::new();
+    blob.to_writer(&mut out).map_err(|e| format!("Falha ao serializar servers.dat: {}", e))?;
+    std::fs::write(&path, out).map_err(|e| format!("Falha ao gravar servers.dat: {}", e))?;
+
+    Ok("added".to_string())
+}
+
+/// Lista os IDs de versão (nomes de pasta) já instalados em
+/// "<.minecraft>/versions/" no cliente do convidado. Usado para decidir a
+/// mensagem exibida ao jogador (versão já instalada vs. o launcher vai
+/// baixá-la sozinho ao clicar Play).
+#[tauri::command]
+fn find_installed_minecraft_versions(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dir = match find_minecraft_dir(&app) {
+        Some(d) => d,
+        None => return Ok(Vec::new()),
+    };
+    let versions_dir = dir.join("versions");
+    if !versions_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let entries = std::fs::read_dir(&versions_dir)
+        .map_err(|e| format!("Falha ao listar versions/: {}", e))?;
+    let mut versions = Vec::new();
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                versions.push(name.to_string());
+            }
+        }
+    }
+    Ok(versions)
+}
+
+/// Nomes de arquivo em que o launcher oficial pode guardar seus perfis,
+/// dependendo de como foi instalado (distribuição clássica vs. Microsoft
+/// Store). Como não há como saber com certeza qual o launcher instalado vai
+/// ler, tocamos nos dois que existirem.
+const LAUNCHER_PROFILE_FILENAMES: [&str; 2] =
+    ["launcher_profiles.json", "launcher_profiles_microsoft_store.json"];
+
+/// Garante que exista, no arquivo de perfis do launcher oficial, um perfil
+/// apontando para `version_id`, e o marca como selecionado — assim quando o
+/// convidado abre o launcher, o perfil certo já está escolhido no dropdown,
+/// faltando só clicar em Play (o próprio launcher baixa a versão sozinha se
+/// ainda não estiver instalada).
+///
+/// `game_dir`, quando informado, isola mods/config/saves desse perfil numa
+/// pasta própria (fora do `.minecraft/mods` compartilhado) — mesmo modelo do
+/// CurseForge: `versions/`/`libraries/` continuam compartilhados dentro do
+/// `.minecraft` real (baixados uma vez, reaproveitados por qualquer servidor
+/// que use a mesma versão/loader), só o conteúdo específico de cada
+/// modpack/servidor fica isolado. Sem isso, dois servidores Forge/Fabric
+/// diferentes acabariam misturando mods na mesma pasta compartilhada.
+///
+/// Edição deliberadamente mínima: parseamos como JSON genérico e só tocamos
+/// nos campos que precisamos, preservando todo o resto do arquivo intacto
+/// (o schema atual do launcher não é totalmente documentado). Backup em
+/// ".bak" antes da primeira escrita.
+#[tauri::command]
+fn prepare_launcher_profile(
+    app: tauri::AppHandle,
+    version_id: String,
+    profile_name: String,
+    game_dir: Option<String>,
+) -> Result<String, String> {
+    let dir = match find_minecraft_dir(&app) {
+        Some(d) => d,
+        None => return Ok("not_found".to_string()),
+    };
+
+    if let Some(ref gd) = game_dir {
+        std::fs::create_dir_all(std::path::Path::new(gd).join("mods"))
+            .map_err(|e| format!("Falha ao criar a pasta da instância: {}", e))?;
+    }
+
+    let mut touched_any = false;
+
+    for filename in LAUNCHER_PROFILE_FILENAMES {
+        let path = dir.join(filename);
+        if !path.is_file() {
+            continue;
+        }
+        touched_any = true;
+
+        let bytes = std::fs::read(&path).map_err(|e| format!("Falha ao ler {}: {}", filename, e))?;
+        let mut root: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Falha ao interpretar {}: {}", filename, e))?;
+
+        let backup_path = dir.join(format!("{}.bak", filename));
+        if !backup_path.exists() {
+            std::fs::write(&backup_path, &bytes)
+                .map_err(|e| format!("Falha ao criar backup de {}: {}", filename, e))?;
+        }
+
+        let profiles = root
+            .get_mut("profiles")
+            .and_then(|p| p.as_object_mut())
+            .ok_or_else(|| format!("{} não tem um campo \"profiles\" válido", filename))?;
+
+        let existing_key = profiles.iter().find_map(|(key, value)| {
+            if value.get("lastVersionId").and_then(|v| v.as_str()) == Some(version_id.as_str()) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        });
+
+        let profile_key = match existing_key {
+            Some(key) => key,
+            None => {
+                let key = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                profiles.insert(key.clone(), serde_json::json!({
+                    "name": profile_name,
+                    "type": "custom",
+                    "created": now,
+                    "lastUsed": now,
+                    "lastVersionId": version_id,
+                    "icon": serde_json::Value::Null,
+                }));
+                key
+            }
+        };
+
+        // Preenche/atualiza name+gameDir mesmo num perfil que já existia (ex: criado
+        // pelo próprio instalador do Forge, que não seta gameDir sozinho) — é assim
+        // que a isolação por servidor se aplica também a perfis que não criamos do zero.
+        if let Some(profile) = profiles.get_mut(&profile_key) {
+            profile["name"] = serde_json::Value::String(profile_name.clone());
+            if let Some(ref gd) = game_dir {
+                profile["gameDir"] = serde_json::Value::String(gd.clone());
+            }
+        }
+
+        // Só ajusta o campo de perfil selecionado se ele já existir no
+        // arquivo original — não inventamos estrutura de schema desconhecida.
+        if root.get("selectedProfile").is_some() {
+            root["selectedProfile"] = serde_json::Value::String(profile_key);
+        }
+
+        let out = serde_json::to_vec_pretty(&root)
+            .map_err(|e| format!("Falha ao serializar {}: {}", filename, e))?;
+        std::fs::write(&path, out).map_err(|e| format!("Falha ao gravar {}: {}", filename, e))?;
+    }
+
+    if !touched_any {
+        return Ok("not_found".to_string());
+    }
+    Ok("ok".to_string())
+}
+
+/// Abre o Minecraft Launcher oficial instalado no sistema do convidado.
+/// Melhor-esforço: se não conseguir, o jogador ainda pode abrir manualmente
+/// (o servidor já está na lista de Multiplayer graças a add_minecraft_server_entry).
+#[tauri::command]
+fn open_minecraft_launcher() -> Result<(), String> {
+    if cfg!(target_os = "windows") {
+        // Ativa o app via seu Package Family Name (mecanismo padrão do Windows
+        // para abrir apps MSIX/Microsoft Store por linha de comando) — mais
+        // robusto do que um caminho de .exe, que muda a cada atualização do launcher.
+        std::process::Command::new("explorer.exe")
+            .arg("shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!App")
+            .spawn()
+            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .args(["-a", "Minecraft"])
+            .spawn()
+            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+    } else {
+        std::process::Command::new("flatpak")
+            .args(["run", "com.mojang.Minecraft"])
+            .spawn()
+            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+    }
+    Ok(())
+}
+
 // ============================================================
 // Comandos de Gerenciamento do Servidor Minecraft
 // ============================================================
@@ -1372,6 +1618,297 @@ async fn run_forge_installer(
     Ok(())
 }
 
+/// Executa o instalador do Fabric em modo cliente (java -jar installer.jar
+/// client -dir <.minecraft real> -mcversion X -noprofile), instalando o mod
+/// loader no cliente do CONVIDADO (não o servidor — esse é `installFabricServer`
+/// no TS, que não usa instalador nenhum). `-noprofile` evita que o instalador
+/// mexa em launcher_profiles.json sozinho (ele teria que adivinhar qual
+/// variante do arquivo usar, e pode travar pedindo input se detectar mais de
+/// uma instalação de launcher) — quem cria/seleciona o perfil é sempre o
+/// `prepare_launcher_profile`, de forma consistente com Vanilla/Paper.
+///
+/// A versão do loader não é escolhida explicitamente (fica a cargo do
+/// instalador pegar a mais recente estável): diferente do Forge, o Fabric
+/// Loader é desenhado pra ser compatível entre builds, então não precisamos
+/// saber a versão exata que o host está usando.
+///
+/// Retorna o ID da versão instalada (ex: "fabric-loader-0.16.9-1.20.1"),
+/// detectado comparando o conteúdo de "<.minecraft>/versions/" antes e
+/// depois de rodar o instalador.
+#[tauri::command]
+async fn run_fabric_client_installer(
+    app: tauri::AppHandle,
+    java_path: String,
+    installer_path: String,
+    mc_version: String,
+) -> Result<String, String> {
+    log_to_file(&app, &format!("=== INSTALANDO FABRIC CLIENT (java={}, installer={}, mc={}) ===", java_path, installer_path, mc_version));
+
+    let minecraft_dir = find_minecraft_dir(&app)
+        .ok_or_else(|| "Não encontramos sua instalação do Minecraft.".to_string())?;
+
+    let list_versions = |dir: &std::path::Path| -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir.join("versions"))
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+            .unwrap_or_default()
+    };
+    let versions_before = list_versions(&minecraft_dir);
+
+    let args = vec![
+        "-jar".to_string(),
+        installer_path.clone(),
+        "client".to_string(),
+        "-dir".to_string(),
+        minecraft_dir.to_string_lossy().to_string(),
+        "-mcversion".to_string(),
+        mc_version.clone(),
+        "-noprofile".to_string(),
+    ];
+
+    log_to_file(&app, &format!("Executando: {} {:?}", java_path, args));
+
+    let mut child = std::process::Command::new(&java_path)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("Falha ao iniciar instalador do Fabric: {}", e);
+            log_to_file(&app, &msg);
+            msg
+        })?;
+
+    job_object::track_process(child.id());
+
+    let app_stdout = app.clone();
+    if let Some(stdout_pipe) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => log_to_file(&app_stdout, &format!("[Fabric-Installer] {}", l)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    let app_stderr = app.clone();
+    if let Some(stderr_pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => log_to_file(&app_stderr, &format!("[Fabric-Installer-ERR] {}", l)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // O instalador do Fabric é leve (não baixa o client inteiro, só o loader) —
+    // 5 minutos é folga de sobra, mas mantém o mesmo teto do Forge por segurança.
+    let start = Instant::now();
+    let timeout = Duration::from_secs(300);
+    let app_wait = app.clone();
+
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    log_to_file(&app_wait, "[Fabric-Installer] Timeout de 5 minutos excedido. Matando processo...");
+                    let _ = child.kill();
+                    return Err("Instalador do Fabric excedeu o tempo limite de 5 minutos.".to_string());
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(e) => {
+                log_to_file(&app_wait, &format!("[Fabric-Installer] Erro ao aguardar: {}", e));
+                return Err(format!("Erro ao aguardar instalador do Fabric: {}", e));
+            }
+        }
+    };
+
+    if !exit_status.success() {
+        let msg = format!("Instalador do Fabric falhou com código: {:?}", exit_status.code());
+        log_to_file(&app, &msg);
+        return Err(msg);
+    }
+
+    let versions_after = list_versions(&minecraft_dir);
+    let suffix = format!("-{}", mc_version);
+    let new_version = versions_after
+        .difference(&versions_before)
+        .find(|v| v.starts_with("fabric-loader-") && v.ends_with(&suffix))
+        .cloned()
+        .or_else(|| {
+            // Fallback: se o instalador já tinha rodado antes (ex: tentativa anterior
+            // que falhou na etapa de perfil), a versão pode já existir e não aparecer
+            // como "nova" — procura em todo o conjunto, não só na diferença.
+            versions_after
+                .iter()
+                .find(|v| v.starts_with("fabric-loader-") && v.ends_with(&suffix))
+                .cloned()
+        });
+
+    match new_version {
+        Some(v) => {
+            log_to_file(&app, &format!("[Fabric-Installer] Instalação concluída: {}", v));
+            Ok(v)
+        }
+        None => {
+            let msg = "O instalador do Fabric rodou, mas não encontramos a versão instalada em versions/.".to_string();
+            log_to_file(&app, &msg);
+            Err(msg)
+        }
+    }
+}
+
+/// Executa o instalador oficial do Forge/NeoForge em modo cliente
+/// (java -jar installer.jar --installClient <.minecraft real>), instalando o
+/// mod loader no cliente do CONVIDADO — mesmo jar universal (client+server)
+/// já usado por `run_forge_installer` para o lado do servidor, só muda a flag.
+///
+/// Diferente do Fabric, o instalador do Forge SEMPRE grava um perfil mínimo em
+/// launcher_profiles.json (nome/tipo/lastVersionId/icon; sem gameDir nem
+/// selectedProfile) — não há flag pra suprimir isso, então deixamos acontecer
+/// e complementamos depois com `prepare_launcher_profile` (isolação de
+/// instância + seleção), do mesmo jeito que fazemos pro perfil que o Fabric
+/// cria via `-noprofile` + nosso próprio código. Se nenhum dos dois arquivos
+/// de perfil existir no `.minecraft` do convidado, o instalador falha sozinho
+/// com uma mensagem clara pedindo pra rodar o launcher pelo menos uma vez.
+///
+/// Diferente do Fabric Loader (compatível entre builds), o Forge quebra
+/// compatibilidade com frequência entre versões — por isso `forge_version`
+/// aqui é sempre a build EXATA que o host está rodando (vem da API Central),
+/// não "a mais recente".
+#[tauri::command]
+async fn run_forge_client_installer(
+    app: tauri::AppHandle,
+    java_path: String,
+    installer_path: String,
+    mc_version: String,
+    forge_version: String,
+) -> Result<String, String> {
+    log_to_file(&app, &format!("=== INSTALANDO FORGE CLIENT (java={}, installer={}, mc={}, forge={}) ===", java_path, installer_path, mc_version, forge_version));
+
+    let minecraft_dir = find_minecraft_dir(&app)
+        .ok_or_else(|| "Não encontramos sua instalação do Minecraft.".to_string())?;
+
+    let list_versions = |dir: &std::path::Path| -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir.join("versions"))
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+            .unwrap_or_default()
+    };
+    let versions_before = list_versions(&minecraft_dir);
+
+    let args = vec![
+        "-jar".to_string(),
+        installer_path.clone(),
+        "--installClient".to_string(),
+        minecraft_dir.to_string_lossy().to_string(),
+    ];
+
+    log_to_file(&app, &format!("Executando: {} {:?}", java_path, args));
+
+    let mut child = std::process::Command::new(&java_path)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            let msg = format!("Falha ao iniciar instalador do Forge: {}", e);
+            log_to_file(&app, &msg);
+            msg
+        })?;
+
+    job_object::track_process(child.id());
+
+    let app_stdout = app.clone();
+    if let Some(stdout_pipe) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => log_to_file(&app_stdout, &format!("[Forge-Client-Installer] {}", l)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    let app_stderr = app.clone();
+    if let Some(stderr_pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr_pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => log_to_file(&app_stderr, &format!("[Forge-Client-Installer-ERR] {}", l)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(600);
+    let app_wait = app.clone();
+
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    log_to_file(&app_wait, "[Forge-Client-Installer] Timeout de 10 minutos excedido. Matando processo...");
+                    let _ = child.kill();
+                    return Err("Instalador do Forge excedeu o tempo limite de 10 minutos.".to_string());
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(e) => {
+                log_to_file(&app_wait, &format!("[Forge-Client-Installer] Erro ao aguardar: {}", e));
+                return Err(format!("Erro ao aguardar instalador do Forge: {}", e));
+            }
+        }
+    };
+
+    if !exit_status.success() {
+        let msg = format!(
+            "Instalador do Forge falhou com código: {:?}. Se você nunca abriu o Minecraft Launcher neste computador, abra-o pelo menos uma vez e tente de novo.",
+            exit_status.code()
+        );
+        log_to_file(&app, &msg);
+        return Err(msg);
+    }
+
+    let versions_after = list_versions(&minecraft_dir);
+    let new_version = versions_after
+        .difference(&versions_before)
+        .find(|v| v.contains(&forge_version))
+        .cloned()
+        .or_else(|| {
+            versions_after
+                .iter()
+                .find(|v| v.contains(&forge_version))
+                .cloned()
+        });
+
+    match new_version {
+        Some(v) => {
+            log_to_file(&app, &format!("[Forge-Client-Installer] Instalação concluída: {}", v));
+            Ok(v)
+        }
+        None => {
+            let msg = "O instalador do Forge rodou, mas não encontramos a versão instalada em versions/.".to_string();
+            log_to_file(&app, &msg);
+            Err(msg)
+        }
+    }
+}
+
 /// Para o servidor de Minecraft enviando o comando `stop` via stdin.
 /// Força a finalização se demorar mais de 15 segundos.
 #[tauri::command]
@@ -1696,6 +2233,31 @@ fn world_folder_paths(server_dir: &str, level_name: &str) -> Vec<PathBuf> {
     .collect()
 }
 
+/// Retorna o timestamp (RFC3339) do arquivo mais recente entre as pastas do
+/// mundo, ou `None` se não houver mundo ainda. Usado pelo backup automático
+/// (autoBackup.ts) para pular o backup quando nada mudou desde o último.
+#[tauri::command]
+fn world_last_modified(server_dir: String) -> Result<Option<String>, String> {
+    let level_name = read_level_name(&server_dir);
+    let folders = world_folder_paths(&server_dir, &level_name);
+    let mut latest: Option<std::time::SystemTime> = None;
+    for folder in &folders {
+        for entry in walkdir::WalkDir::new(folder).into_iter().filter_map(|e| e.ok()) {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if latest.map(|l| modified > l).unwrap_or(true) {
+                        latest = Some(modified);
+                    }
+                }
+            }
+        }
+    }
+    Ok(latest
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
+        .map(|dt| dt.to_rfc3339()))
+}
+
 #[tauri::command]
 async fn list_mods(server_dir: String, folder_name: Option<String>) -> Result<Vec<ModInfo>, String> {
     let mods_dir = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods"));
@@ -1964,6 +2526,283 @@ async fn reset_world(server_dir: String) -> Result<(), String> {
         std::fs::remove_dir_all(&folder).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ============================================================
+// Gerenciamento de Jogadores (whitelist / operadores / banidos)
+// ============================================================
+//
+// Editam diretamente os arquivos JSON que o próprio servidor Minecraft usa
+// (whitelist.json, ops.json, banned-players.json, banned-ips.json), na
+// mesma pasta do server.properties — igual à ideia de read/write_server_properties,
+// mas para essas listas. Enquanto o servidor está rodando, ele mantém essas
+// listas em memória e as sobrescreve de volta no arquivo periodicamente; por
+// isso o lado TS usa `send_minecraft_command` (whitelist/op/ban/pardon) para
+// alterações com o servidor online, e só chama estes comandos com o servidor
+// parado (mesmo padrão de bloqueio já usado em ServerConfigModal/server.properties).
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WhitelistEntry {
+    uuid: String,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OpEntry {
+    uuid: String,
+    name: String,
+    level: u8,
+    #[serde(rename = "bypassesPlayerLimit")]
+    bypasses_player_limit: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BannedPlayerEntry {
+    uuid: String,
+    name: String,
+    created: String,
+    source: String,
+    expires: String,
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BannedIpEntry {
+    ip: String,
+    created: String,
+    source: String,
+    expires: String,
+    reason: String,
+}
+
+fn read_json_list<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<Vec<T>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&contents).map_err(|e| e.to_string())
+}
+
+fn write_json_list<T: Serialize>(path: &PathBuf, items: &[T]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(items).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// Lê a flag `online-mode` do server.properties; usa `true` (padrão do Minecraft) se ausente.
+fn read_online_mode(server_dir: &str) -> bool {
+    let path = format!("{}/server.properties", server_dir);
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                if k.trim() == "online-mode" {
+                    return v.trim() != "false";
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Calcula o UUID "offline" (baseado no nome) que servidores com `online-mode=false`
+/// usam para jogadores sem conta premium — mesmo algoritmo do
+/// `UUID.nameUUIDFromBytes(("OfflinePlayer:" + nome).getBytes(UTF_8))` do Java/Minecraft:
+/// MD5 do nome prefixado, com os bits de versão/variante ajustados para UUID v3.
+fn offline_player_uuid(name: &str) -> uuid::Uuid {
+    let digest = md5::compute(format!("OfflinePlayer:{}", name).as_bytes());
+    let mut bytes: [u8; 16] = *digest;
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn format_uuid_with_dashes(raw: &str) -> String {
+    if raw.len() != 32 {
+        return raw.to_string();
+    }
+    format!("{}-{}-{}-{}-{}", &raw[0..8], &raw[8..12], &raw[12..16], &raw[16..20], &raw[20..32])
+}
+
+/// Resolve o UUID de um jogador pelo nome de usuário. Em servidores `online-mode=true`
+/// (padrão), consulta a API da Mojang — é o UUID que o Minecraft realmente vai usar
+/// para autenticar essa conta, então uma falha aqui é reportada como erro em vez de
+/// cair para um UUID offline que nunca daria match. Em servidores `online-mode=false`
+/// (cracked), calcula o UUID offline localmente, sem depender de rede.
+async fn resolve_player_uuid(server_dir: &str, name: &str) -> Result<String, String> {
+    if !read_online_mode(server_dir) {
+        return Ok(offline_player_uuid(name).to_string());
+    }
+
+    #[derive(Deserialize)]
+    struct MojangProfile {
+        id: String,
+    }
+
+    let url = format!("https://api.mojang.com/users/profiles/minecraft/{}", name);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    if status == 204 || status == 404 {
+        return Err(format!(
+            "Jogador \"{}\" não encontrado (verifique o nome da conta Minecraft/Microsoft).",
+            name
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(format!("Falha ao consultar a API da Mojang: HTTP {}", status));
+    }
+    let profile: MojangProfile = response.json().await.map_err(|e| e.to_string())?;
+    Ok(format_uuid_with_dashes(&profile.id))
+}
+
+fn current_ban_timestamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S %z").to_string()
+}
+
+#[tauri::command]
+async fn list_whitelist(server_dir: String) -> Result<Vec<WhitelistEntry>, String> {
+    read_json_list(&PathBuf::from(&server_dir).join("whitelist.json"))
+}
+
+#[tauri::command]
+async fn add_whitelist_player(server_dir: String, name: String) -> Result<WhitelistEntry, String> {
+    let path = PathBuf::from(&server_dir).join("whitelist.json");
+    let mut entries: Vec<WhitelistEntry> = read_json_list(&path)?;
+    if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
+        return Err(format!("\"{}\" já está na whitelist.", name));
+    }
+    let uuid = resolve_player_uuid(&server_dir, &name).await?;
+    let entry = WhitelistEntry { uuid, name };
+    entries.push(entry.clone());
+    write_json_list(&path, &entries)?;
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn remove_whitelist_player(server_dir: String, uuid: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("whitelist.json");
+    let mut entries: Vec<WhitelistEntry> = read_json_list(&path)?;
+    let before = entries.len();
+    entries.retain(|e| e.uuid != uuid);
+    if entries.len() == before {
+        return Err("Jogador não encontrado na whitelist.".to_string());
+    }
+    write_json_list(&path, &entries)
+}
+
+#[tauri::command]
+async fn list_ops(server_dir: String) -> Result<Vec<OpEntry>, String> {
+    read_json_list(&PathBuf::from(&server_dir).join("ops.json"))
+}
+
+#[tauri::command]
+async fn add_op(server_dir: String, name: String) -> Result<OpEntry, String> {
+    let path = PathBuf::from(&server_dir).join("ops.json");
+    let mut entries: Vec<OpEntry> = read_json_list(&path)?;
+    if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
+        return Err(format!("\"{}\" já é operador.", name));
+    }
+    let uuid = resolve_player_uuid(&server_dir, &name).await?;
+    let entry = OpEntry { uuid, name, level: 4, bypasses_player_limit: false };
+    entries.push(entry.clone());
+    write_json_list(&path, &entries)?;
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn remove_op(server_dir: String, uuid: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("ops.json");
+    let mut entries: Vec<OpEntry> = read_json_list(&path)?;
+    let before = entries.len();
+    entries.retain(|e| e.uuid != uuid);
+    if entries.len() == before {
+        return Err("Operador não encontrado.".to_string());
+    }
+    write_json_list(&path, &entries)
+}
+
+#[tauri::command]
+async fn list_banned_players(server_dir: String) -> Result<Vec<BannedPlayerEntry>, String> {
+    read_json_list(&PathBuf::from(&server_dir).join("banned-players.json"))
+}
+
+#[tauri::command]
+async fn ban_player(server_dir: String, name: String, reason: Option<String>) -> Result<BannedPlayerEntry, String> {
+    let path = PathBuf::from(&server_dir).join("banned-players.json");
+    let mut entries: Vec<BannedPlayerEntry> = read_json_list(&path)?;
+    if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
+        return Err(format!("\"{}\" já está banido.", name));
+    }
+    let uuid = resolve_player_uuid(&server_dir, &name).await?;
+    let entry = BannedPlayerEntry {
+        uuid,
+        name,
+        created: current_ban_timestamp(),
+        source: "CubeForge Dash".to_string(),
+        expires: "forever".to_string(),
+        reason: reason
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "Banido por um operador.".to_string()),
+    };
+    entries.push(entry.clone());
+    write_json_list(&path, &entries)?;
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn pardon_player(server_dir: String, uuid: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("banned-players.json");
+    let mut entries: Vec<BannedPlayerEntry> = read_json_list(&path)?;
+    let before = entries.len();
+    entries.retain(|e| e.uuid != uuid);
+    if entries.len() == before {
+        return Err("Banimento não encontrado.".to_string());
+    }
+    write_json_list(&path, &entries)
+}
+
+#[tauri::command]
+async fn list_banned_ips(server_dir: String) -> Result<Vec<BannedIpEntry>, String> {
+    read_json_list(&PathBuf::from(&server_dir).join("banned-ips.json"))
+}
+
+#[tauri::command]
+async fn ban_ip(server_dir: String, ip: String, reason: Option<String>) -> Result<BannedIpEntry, String> {
+    let path = PathBuf::from(&server_dir).join("banned-ips.json");
+    let mut entries: Vec<BannedIpEntry> = read_json_list(&path)?;
+    if entries.iter().any(|e| e.ip == ip) {
+        return Err(format!("O IP \"{}\" já está banido.", ip));
+    }
+    let entry = BannedIpEntry {
+        ip,
+        created: current_ban_timestamp(),
+        source: "CubeForge Dash".to_string(),
+        expires: "forever".to_string(),
+        reason: reason
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "Banido por um operador.".to_string()),
+    };
+    entries.push(entry.clone());
+    write_json_list(&path, &entries)?;
+    Ok(entry)
+}
+
+#[tauri::command]
+async fn pardon_ip(server_dir: String, ip: String) -> Result<(), String> {
+    let path = PathBuf::from(&server_dir).join("banned-ips.json");
+    let mut entries: Vec<BannedIpEntry> = read_json_list(&path)?;
+    let before = entries.len();
+    entries.retain(|e| e.ip != ip);
+    if entries.len() == before {
+        return Err("Banimento de IP não encontrado.".to_string());
+    }
+    write_json_list(&path, &entries)
 }
 
 // ============================================================
@@ -2258,14 +3097,27 @@ async fn extract_modpack_overrides(zip_path: String, dest_dir: String, overrides
 // Server Registry — Servidor HTTP local para descoberta de servidores
 // ============================================================
 //
-// O Rust mantém um registro em memória dos servidores Minecraft disponíveis.
-// Um servidor HTTP local (127.0.0.1:25567) expõe endpoints para:
+// O Rust mantém um registro em memória dos servidores Minecraft disponíveis
+// e expõe só leitura via HTTP em 127.0.0.1:25567 (loopback — só processos
+// nesta mesma máquina alcançam):
 //
 // - GET /registry/resolve?code={shortCode} → retorna metadados do servidor
-// - POST /registry/update                → atualiza o registro
+// - GET /status                            → health check
 //
-// O sidecar Go consulta este servidor HTTP local para responder requisições
-// que chegam via Tailscale (na porta 25566).
+// O sidecar Go é o único consumidor: ele escuta em :25566 na interface
+// virtual do Tailscale (tsnet, sem stack de rede real — só outros peers da
+// mesh chegam ali) e faz proxy só desses dois GETs para cá. Deliberadamente
+// NÃO existe:
+//
+// - Um listener em 0.0.0.0: escutar em todas as interfaces expunha isso pra
+//   qualquer um na mesma rede local/Wi-Fi, não só pra quem está na mesh
+//   privada — o Tailscale já roteia peers autorizados até o listener do Go,
+//   não precisa (e não deve) haver um caminho de rede alternativo direto.
+// - Rotas de escrita (update/remove) ou listagem completa (/list) por HTTP:
+//   quem precisa mutar o registro é sempre o próprio host, em processo, via
+//   os comandos Tauri `update_server_registry`/`remove_server_registry` —
+//   não há necessidade de aceitar isso pela rede, então essa capacidade nem
+//   existe aqui (não dá pra explorar uma rota que não existe).
 
 use std::collections::BTreeMap;
 
@@ -2286,69 +3138,35 @@ struct ServerRegistry {
     entries: Mutex<BTreeMap<String, ServerRegistryEntry>>, // key = shortCode
 }
 
-/// Inicia o servidor HTTP de registro em uma thread separada.
-/// Escuta em 127.0.0.1:25567 (para o sidecar Go) e em 0.0.0.0:25566 (para o guest via Tailscale).
+/// Inicia o servidor HTTP de registro (só leitura) numa thread separada,
+/// escutando em 127.0.0.1:25567 — ver o comentário do módulo acima para por
+/// que não existe (e não deve existir) um listener em 0.0.0.0.
 fn start_registry_http_server(registry: Arc<ServerRegistry>) {
-    // Servidor interno (127.0.0.1:25567) — usado pelo sidecar Go como proxy
-    let registry_internal = registry.clone();
     thread::spawn(move || {
         let addr = "127.0.0.1:25567";
         let server = match tiny_http::Server::http(addr) {
             Ok(s) => {
-                eprintln!("[Registry] Servidor HTTP interno iniciado em {}", addr);
+                eprintln!("[Registry] Servidor HTTP local iniciado em {}", addr);
                 s
             }
             Err(e) => {
-                eprintln!("[Registry] Falha ao iniciar servidor HTTP interno em {}: {}", addr, e);
+                eprintln!("[Registry] Falha ao iniciar servidor HTTP local em {}: {}", addr, e);
                 return;
             }
         };
-        
+
         loop {
             match server.recv() {
-                Ok(mut request) => {
+                Ok(request) => {
                     let url = request.url().to_string();
                     let method = request.method().as_str().to_string();
-                    eprintln!("[Registry] Requisição recebida (interno): {} {}", method, url);
-                    
-                    let response = handle_registry_request(&registry_internal, &method, &url, &mut request);
+                    eprintln!("[Registry] Requisição recebida: {} {}", method, url);
+
+                    let response = handle_registry_request(&registry, &method, &url);
                     let _ = request.respond(tiny_http::Response::from_string(response));
                 }
                 Err(e) => {
-                    eprintln!("[Registry] Erro no servidor HTTP interno: {}", e);
-                }
-            }
-        }
-    });
-    
-    // Servidor externo (0.0.0.0:25566) — acessível via Tailscale pelo guest
-    // O Tailscale roteia conexões para o IP virtual do host, e qualquer processo
-    // escutando em 0.0.0.0:PORT receberá essas conexões.
-    thread::spawn(move || {
-        let addr = "0.0.0.0:25566";
-        let server = match tiny_http::Server::http(addr) {
-            Ok(s) => {
-                eprintln!("[Registry] Servidor HTTP externo iniciado em {}", addr);
-                s
-            }
-            Err(e) => {
-                eprintln!("[Registry] Falha ao iniciar servidor HTTP externo em {}: {}", addr, e);
-                return;
-            }
-        };
-        
-        loop {
-            match server.recv() {
-                Ok(mut request) => {
-                    let url = request.url().to_string();
-                    let method = request.method().as_str().to_string();
-                    eprintln!("[Registry] Requisição recebida (externo): {} {} de {:?}", method, url, request.remote_addr());
-                    
-                    let response = handle_registry_request(&registry, &method, &url, &mut request);
-                    let _ = request.respond(tiny_http::Response::from_string(response));
-                }
-                Err(e) => {
-                    eprintln!("[Registry] Erro no servidor HTTP externo: {}", e);
+                    eprintln!("[Registry] Erro no servidor HTTP local: {}", e);
                 }
             }
         }
@@ -2356,7 +3174,8 @@ fn start_registry_http_server(registry: Arc<ServerRegistry>) {
 }
 
 /// Processa uma requisição HTTP do registro e retorna a resposta como string.
-fn handle_registry_request(registry: &ServerRegistry, method: &str, url: &str, request: &mut tiny_http::Request) -> String {
+/// Só leitura, deliberadamente — ver o comentário do módulo acima.
+fn handle_registry_request(registry: &ServerRegistry, method: &str, url: &str) -> String {
     match (method, url) {
         // GET /registry/resolve?code={shortCode}
         ("GET", url_str) if url_str.starts_with("/registry/resolve") || url_str.starts_with("/resolve") => {
@@ -2376,38 +3195,12 @@ fn handle_registry_request(registry: &ServerRegistry, method: &str, url: &str, r
                 }
             }
         }
-        // GET /registry/list — lista todos os servidores
-        ("GET", "/registry/list") | ("GET", "/list") => {
-            let entries = registry.entries.lock().unwrap();
-            let list: Vec<&ServerRegistryEntry> = entries.values().collect();
-            let json = serde_json::to_string(&list).unwrap_or_default();
-            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", json)
-        }
         // GET /status — health check
         ("GET", "/status") => {
             format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"ok\"}}")
         }
-        // POST /registry/update — atualiza ou adiciona um servidor
-        ("POST", "/registry/update") | ("POST", "/update") => {
-            let mut body = String::new();
-            let _ = request.as_reader().read_to_string(&mut body);
-            if let Ok(entry) = serde_json::from_str::<ServerRegistryEntry>(&body) {
-                let code = entry.short_code.clone();
-                let mut entries = registry.entries.lock().unwrap();
-                entries.insert(code, entry);
-                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"updated\"}}")
-            } else {
-                format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"JSON inválido\"}}")
-            }
-        }
-        // POST /registry/remove — remove um servidor pelo shortCode
-        ("POST", url_str) if url_str.starts_with("/registry/remove") || url_str.starts_with("/remove") => {
-            let code = url_str.split("?code=").nth(1).unwrap_or("").to_string();
-            let mut entries = registry.entries.lock().unwrap();
-            entries.remove(&code);
-            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"removed\"}}")
-        }
-        // Qualquer outro endpoint
+        // Qualquer outro endpoint (inclui os antigos /list, /update, /remove —
+        // removidos de propósito, não é falta de rota)
         _ => {
             format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"Endpoint não encontrado\"}}")
         }
@@ -3045,6 +3838,8 @@ async fn sync_register_server(
     description: String,
     short_code: Option<String>,
     owner: Option<String>,
+    forge_version: Option<String>,
+    mod_loader_version: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_to_file(&app, &format!("[SYNC] sync_register_server: name={}, version={}", name, version));
 
@@ -3061,6 +3856,8 @@ async fn sync_register_server(
         "description": description,
         "shortCode": short_code,
         "owner": owner,
+        "forgeVersion": forge_version,
+        "modLoaderVersion": mod_loader_version,
     });
     
     let op_id = enqueue_operation(&app, SyncOperationType::RegisterServer, payload.clone());
@@ -3633,9 +4430,15 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
        start_network_node,
        stop_network_node,
+       add_minecraft_server_entry,
+       find_installed_minecraft_versions,
+       prepare_launcher_profile,
+       open_minecraft_launcher,
        download_server_jar,
        start_minecraft_server,
        run_forge_installer,
+       run_fabric_client_installer,
+       run_forge_client_installer,
        stop_minecraft_server,
        send_minecraft_command,
        get_system_status,
@@ -3657,7 +4460,21 @@ pub fn run() {
        backup_world,
        restore_world_backup,
        delete_world_backup,
+       world_last_modified,
        reset_world,
+       // Comandos de gerenciamento de jogadores (whitelist/ops/banidos)
+       list_whitelist,
+       add_whitelist_player,
+       remove_whitelist_player,
+       list_ops,
+       add_op,
+       remove_op,
+       list_banned_players,
+       ban_player,
+       pardon_player,
+       list_banned_ips,
+       ban_ip,
+       pardon_ip,
        // Comandos de import de modpacks (CurseForge/Modrinth)
        read_modpack_manifest,
        extract_modpack_overrides,

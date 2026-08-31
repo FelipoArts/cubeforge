@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Plus,
@@ -17,12 +17,20 @@ import {
   Copy,
   Check,
   RefreshCw,
+  Play,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
 import { useAppStore, type KnownServer, type ServerStatus } from "@/app/store";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { installFabricClient, installForgeClient, getInstanceDir } from "@/lib/clientSetup";
+
+/** Tipos de servidor cobertos pelo fluxo "Jogar" (abrir o launcher já pronto). */
+const PLAYABLE_SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
+
+/** Loaders que precisam de instância isolada (mods/config/saves fora do .minecraft/mods compartilhado). */
+const ISOLATED_SERVER_TYPES = new Set(["fabric", "forge", "neoforge"]);
 
 // ============================================================
 // GuestView
@@ -84,6 +92,88 @@ export function GuestView({
     }
   }, [netStatus, connectedShortCode]);
 
+  // Status do fluxo "Jogar" (Vanilla/Paper/Fabric/Forge/NeoForge) por servidor
+  // — instala o mod loader se precisar e abre o Minecraft Launcher já com o
+  // perfil certo selecionado, assim que o túnel sobe. `launcherTriggeredFor`
+  // evita disparar de novo a cada re-render enquanto a mesma conexão segue online.
+  const [launcherMessage, setLauncherMessage] = useState<Record<string, string>>({});
+  const [launcherProgress, setLauncherProgress] = useState<Record<string, number>>({});
+  const launcherTriggeredFor = useRef<string | null>(null);
+
+  const loaderLabel = (serverType: string): string =>
+    serverType === "neoforge" ? "NeoForge" : serverType === "forge" ? "Forge" : "Fabric";
+
+  const handleOpenLauncher = async (server: KnownServer) => {
+    const setStatus = (status: string, percent?: number) => {
+      setLauncherMessage(prev => ({ ...prev, [server.shortCode]: status }));
+      if (percent !== undefined) setLauncherProgress(prev => ({ ...prev, [server.shortCode]: percent }));
+    };
+
+    setStatus("Preparando o Minecraft...", 0);
+    try {
+      let versionId = server.version ?? "";
+      let alreadyInstalled = false;
+      let gameDir: string | null = null;
+
+      if (server.serverType === "fabric") {
+        gameDir = await getInstanceDir(server.shortCode);
+        versionId = await installFabricClient(server.version, (p) => setStatus(p.status, p.percent));
+      } else if (server.serverType === "forge" || server.serverType === "neoforge") {
+        if (!server.forgeVersion) {
+          setStatus(`Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em localhost:${minecraftPort}.`);
+          return;
+        }
+        gameDir = await getInstanceDir(server.shortCode);
+        versionId = await installForgeClient(server.serverType, server.version, server.forgeVersion, (p) => setStatus(p.status, p.percent));
+      } else {
+        const installed = await invoke<string[]>("find_installed_minecraft_versions").catch(() => [] as string[]);
+        alreadyInstalled = !!server.version && installed.includes(server.version);
+      }
+
+      setStatus("Selecionando o perfil no launcher...", 92);
+      const prepResult = await invoke<string>("prepare_launcher_profile", {
+        versionId,
+        profileName: `Cubicase — ${server.name}`,
+        gameDir,
+      });
+
+      if (prepResult === "not_found") {
+        setStatus(`Não encontramos sua instalação do Minecraft — abra o jogo e conecte em localhost:${minecraftPort} manualmente.`);
+        return;
+      }
+
+      await invoke("open_minecraft_launcher");
+      setStatus(
+        ISOLATED_SERVER_TYPES.has(server.serverType)
+          ? `${loaderLabel(server.serverType)} instalado e perfil selecionado — é só clicar em Play!`
+          : alreadyInstalled
+            ? "Minecraft aberto com o perfil certo selecionado — é só clicar em Play!"
+            : "Minecraft aberto! O launcher vai baixar essa versão automaticamente ao clicar em Play.",
+        100
+      );
+    } catch (err) {
+      console.warn("[GuestView] Falha ao preparar o Minecraft automaticamente:", err);
+      setStatus(`Não conseguimos preparar o Minecraft automaticamente — abra manualmente e conecte em localhost:${minecraftPort}.`);
+    }
+  };
+
+  // Assim que o túnel de um servidor Vanilla/Paper/Fabric sobe, prepara e abre
+  // o launcher sozinho — para os demais tipos (Forge/NeoForge) ainda não
+  // instalamos o mod loader certo automaticamente, então não prometemos nada.
+  useEffect(() => {
+    if (netStatus !== "online" || !connectedShortCode) {
+      launcherTriggeredFor.current = null;
+      return;
+    }
+    if (launcherTriggeredFor.current === connectedShortCode) return;
+
+    const server = knownServers.find(s => s.shortCode === connectedShortCode);
+    if (!server || !PLAYABLE_SERVER_TYPES.has(server.serverType)) return;
+
+    launcherTriggeredFor.current = connectedShortCode;
+    void handleOpenLauncher(server);
+  }, [netStatus, connectedShortCode, knownServers]);
+
   // Sincronizar servidores locais do host na biblioteca do guest
   // Adiciona servidores locais novos e remove os que foram deletados
   useEffect(() => {
@@ -112,6 +202,8 @@ export function GuestView({
           addedAt: new Date().toISOString(),
           isOwnServer: true,
           networkProvider: "tailscale",
+          forgeVersion: server.forgeVersion ?? null,
+          modLoaderVersion: server.modLoaderVersion ?? null,
         });
       }
     }
@@ -229,6 +321,8 @@ export function GuestView({
         addedAt: new Date().toISOString(),
         isOwnServer: false,
         networkProvider: session.provider || "tailscale",
+        forgeVersion: server.forgeVersion ?? null,
+        modLoaderVersion: server.modLoaderVersion ?? null,
       });
 
       setShowAddModal(false);
@@ -525,6 +619,24 @@ export function GuestView({
                     {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                   </button>
                 </div>
+
+                {/* Status do fluxo "Jogar" (instalar loader se preciso + abrir o launcher) */}
+                {connectedShortCode === server.shortCode && launcherMessage[server.shortCode] && (
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-theme-secondary leading-relaxed">
+                      {launcherMessage[server.shortCode]}
+                    </p>
+                    {(launcherProgress[server.shortCode] ?? 100) < 100 && (
+                      <div className="h-1 bg-theme-muted rounded-full overflow-hidden">
+                        <motion.div
+                          className="h-full bg-indigo-500"
+                          animate={{ width: `${launcherProgress[server.shortCode] ?? 0}%` }}
+                          transition={{ duration: 0.3 }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Ações do card */}
@@ -551,6 +663,19 @@ export function GuestView({
                       className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
                     >
                       <X className="w-3.5 h-3.5" /> Desconectar
+                    </button>
+                  ) : PLAYABLE_SERVER_TYPES.has(server.serverType) ? (
+                    // Um clique conecta e já prepara + abre o Minecraft com o perfil certo
+                    // selecionado (ver useEffect que dispara handleOpenLauncher assim que o
+                    // túnel sobe). Para Fabric/Forge/NeoForge isso inclui instalar o mod
+                    // loader certo, numa instância isolada, se ainda não estiver instalado.
+                    <button
+                      type="button"
+                      onClick={() => handleConnect(server)}
+                      disabled={isConnecting}
+                      className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
+                    >
+                      <Play className="w-3.5 h-3.5 fill-current" /> Jogar
                     </button>
                   ) : (
                     <button

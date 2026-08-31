@@ -112,7 +112,11 @@ $tests = @(
     @{ Name = "GET /status"; Url = "http://127.0.0.1:$registryPort/status"; ExpectedStatus = 200; ExpectedField = "status"; ExpectedValue = "ok" },
     @{ Name = "GET /registry/resolve?code=$ShortCode"; Url = "http://127.0.0.1:$registryPort/registry/resolve?code=$ShortCode"; ExpectedStatus = 200; ExpectedField = "short_code"; ExpectedValue = $ShortCode },
     @{ Name = "GET /registry/resolve?code=INVALIDO"; Url = "http://127.0.0.1:$registryPort/registry/resolve?code=INVALIDO"; ExpectedStatus = 404 },
-    @{ Name = "GET /registry/list"; Url = "http://127.0.0.1:$registryPort/registry/list"; ExpectedStatus = 200 }
+    # /registry/list, /registry/update e /registry/remove foram removidos de propósito (hardening):
+    # o registro só é lido por HTTP (guest via sidecar Go); escrita/listagem completa só acontecem
+    # em processo, pelos comandos Tauri update_server_registry/remove_server_registry. Por isso
+    # esperamos 404 aqui, não sucesso.
+    @{ Name = "GET /registry/list (removido de propósito)"; Url = "http://127.0.0.1:$registryPort/registry/list"; ExpectedStatus = 404 }
 )
 
 $allPassed = $true

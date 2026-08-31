@@ -21,7 +21,7 @@ type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
 type SessionStatus = 'creating' | 'starting_provider' | 'waiting_provider' | 'online' | 'degraded' | 'stopping' | 'stopped' | 'failed' | 'cancelled';
 type TerminationReason = 'user_stopped' | 'application_closed' | 'provider_error' | 'api_error' | 'crash' | 'timeout' | 'lease_expired';
 
-interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; }
+interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; forgeVersion?: string | null; modLoaderVersion?: string | null; }
 
 interface SessionEntity { shortCode: string; provider: string; hostIp: string; port: number; status: ServerStatus; currentPlayers: number; maxPlayers: number; lastHeartbeat: string; createdAt: string; expiresAt: string; }
 
@@ -106,7 +106,7 @@ async function handleCreateServer(req: Request, env: Env, cors: Record<string, s
   if (!body.name || !body.version || !body.serverType) return json(fail(ResponseCodes.VALIDATION_ERROR, 'name, version, serverType obrigatórios.'), 400, cors);
   const sc = body.shortCode || await genCode(env, parseInt(env.SHORT_CODE_LENGTH || '6'));
   const id = uuid();
-  const sv: ServerEntity = { shortCode: sc, uuid: id, name: body.name, version: body.version, serverType: body.serverType, description: body.description || '', owner: body.owner || id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const sv: ServerEntity = { shortCode: sc, uuid: id, name: body.name, version: body.version, serverType: body.serverType, description: body.description || '', owner: body.owner || id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), forgeVersion: body.forgeVersion ?? null, modLoaderVersion: body.modLoaderVersion ?? null };
   await env.CUBEFORGE_REGISTRY.put(`server:${sc}`, JSON.stringify(sv));
   await env.CUBEFORGE_REGISTRY.put(`shortCode:${id}`, sc);
   return json(ok(ResponseCodes.SERVER_CREATED, 'Servidor criado.', sv), 201, cors);

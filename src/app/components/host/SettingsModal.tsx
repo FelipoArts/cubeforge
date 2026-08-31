@@ -17,25 +17,35 @@ interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentPort: number;
-  onSave: (port: number) => void;
+  currentAutoBackupEnabled: boolean;
+  currentBackupRetentionCount: number;
+  onSave: (port: number, autoBackupEnabled: boolean, backupRetentionCount: number) => void;
 }
 
 export function SettingsModal({
   isOpen,
   onClose,
   currentPort,
+  currentAutoBackupEnabled,
+  currentBackupRetentionCount,
   onSave,
 }: SettingsModalProps) {
   const [port, setPort] = useState(currentPort);
+  const [autoBackupEnabled, setAutoBackupEnabled] = useState(currentAutoBackupEnabled);
+  const [retentionCount, setRetentionCount] = useState(currentBackupRetentionCount);
 
   useLockBodyScroll(isOpen);
 
   useEffect(() => {
-    if (isOpen) setPort(currentPort);
-  }, [isOpen, currentPort]);
+    if (isOpen) {
+      setPort(currentPort);
+      setAutoBackupEnabled(currentAutoBackupEnabled);
+      setRetentionCount(currentBackupRetentionCount);
+    }
+  }, [isOpen, currentPort, currentAutoBackupEnabled, currentBackupRetentionCount]);
 
   const handleSave = () => {
-    onSave(port);
+    onSave(port, autoBackupEnabled, retentionCount);
     onClose();
   };
 
@@ -90,6 +100,38 @@ export function SettingsModal({
                   />
                   <p className="text-[10px] text-theme-secondary">
                     Porta local na qual o seu Minecraft se conectará (padrão 25565).
+                  </p>
+                </div>
+
+                <div className="space-y-1.5 pt-2 border-t border-theme-card">
+                  <label className="flex items-center gap-2.5 cursor-pointer pt-2">
+                    <input
+                      type="checkbox"
+                      checked={autoBackupEnabled}
+                      onChange={(e) => setAutoBackupEnabled(e.target.checked)}
+                      className="w-4.5 h-4.5 rounded-lg text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Backup automático do mundo</span>
+                  </label>
+                  <p className="text-[10px] text-theme-secondary">
+                    Gera backup sozinho quando o servidor é parado ou crasha, e periodicamente
+                    em sessões longas. Pula sozinho se o mundo não mudou desde o último.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Manter últimos N backups</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={retentionCount}
+                    disabled={!autoBackupEnabled}
+                    onChange={(e) => setRetentionCount(parseInt(e.target.value) || 1)}
+                    className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent disabled:opacity-50"
+                  />
+                  <p className="text-[10px] text-theme-secondary">
+                    Backups mais antigos que isso (automáticos ou manuais) são apagados sozinhos.
                   </p>
                 </div>
               </div>

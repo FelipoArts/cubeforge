@@ -27,6 +27,7 @@ import { useUpdaterStore } from "@/app/updater";
 import { analyzeCrashText } from "@/lib/crashAnalyzer";
 import { createLagMonitor } from "@/lib/lagDetector";
 import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
+import { maybeBackupWorld, SAFETY_NET_INTERVAL_MS } from "@/lib/autoBackup";
 
 // Componentes extraídos
 import { HostView } from "@/app/components/host/HostView";
@@ -162,7 +163,6 @@ export default function Home() {
   const [deleteConfirmServer, setDeleteConfirmServer] = useState<string | null>(null);
   const [totalSystemRamGb, setTotalSystemRamGb] = useState(8);
   const [serverConfigPort, setServerConfigPort] = useState(25565);
-  const [settingsPort, setSettingsPort] = useState(25565);
   const [discoveredServer, setDiscoveredServer] = useState<{
     name: string;
     version: string;
@@ -236,6 +236,10 @@ export default function Home() {
   // Amostra mais recente exposta pra UI (indicador de saúde na HostView) —
   // não precisa de histórico, só o valor mais atual.
   const [resourceSample, setResourceSample] = useState<ResourceSnapshot | null>(null);
+  // Timestamp do último backup automático (qualquer motivo) do servidor
+  // atual — usado pelo "backup de segurança" pra saber quando já se passou
+  // tempo suficiente numa sessão longa. Resetado a cada novo start.
+  const lastAutoBackupAtRef = useRef<number>(Date.now());
 
   // Sincronizar refs
   useEffect(() => { selectedServerRef.current = selectedServer; }, [selectedServer]);
@@ -282,6 +286,8 @@ export default function Home() {
       description: serverInfo.description || `Servidor Minecraft ${typeLabel} ${serverInfo.version || "1.20.1"}`,
       shortCode: metaShortCode,
       owner: null,
+      forgeVersion: serverInfo.forgeVersion ?? null,
+      modLoaderVersion: serverInfo.modLoaderVersion ?? null,
     }).then((responseJson: any) => {
       try {
         const response = typeof responseJson === "string" ? JSON.parse(responseJson) : responseJson;
@@ -591,6 +597,7 @@ export default function Home() {
           resourceMonitorRef.current.reset();
           latestResourceSampleRef.current = null;
           setResourceSample(null);
+          lastAutoBackupAtRef.current = Date.now();
         }
 
         let statusMsg = "";
@@ -602,6 +609,19 @@ export default function Home() {
           case "crashed": statusMsg = "[Cubicase ERR] O servidor de Minecraft fechou de forma inesperada (CRASHED)!"; break;
         }
         if (statusMsg) appendMcLogToRunningServer(statusMsg);
+
+        // Backup automático na parada normal e no crash (ver src/lib/autoBackup.ts) —
+        // pula sozinho se o mundo não mudou desde o último backup (exceto em crash).
+        if (status === "offline" || status === "crashed") {
+          const runningServerName = useAppStore.getState().runningServer;
+          const serverInfo = runningServerName
+            ? localServersRef.current.find(s => s.name === runningServerName)
+            : null;
+          if (serverInfo) {
+            const { autoBackupEnabled: enabled, backupRetentionCount: retentionCount } = useAppStore.getState();
+            maybeBackupWorld(serverInfo.path, status === "crashed" ? "crash" : "stop", { enabled, retentionCount });
+          }
+        }
       });
 
       unlistenMcLogs = await listen<string>("minecraft-log", (event) => {
@@ -643,6 +663,21 @@ export default function Home() {
         const resourceDiagnostic = resourceMonitorRef.current.ingestSample(event.payload);
         if (resourceDiagnostic) {
           pushDiagnostic({ ...resourceDiagnostic, source: "Servidor" });
+        }
+
+        // "Backup de segurança": reaproveita este tick de ~15s como relógio
+        // pra sessões longas que nunca são paradas manualmente (ver
+        // src/lib/autoBackup.ts) — sem precisar de um novo timer.
+        if (Date.now() - lastAutoBackupAtRef.current >= SAFETY_NET_INTERVAL_MS) {
+          lastAutoBackupAtRef.current = Date.now();
+          const runningServerName = useAppStore.getState().runningServer;
+          const serverInfo = runningServerName
+            ? localServersRef.current.find(s => s.name === runningServerName)
+            : null;
+          if (serverInfo) {
+            const { autoBackupEnabled: enabled, backupRetentionCount: retentionCount } = useAppStore.getState();
+            maybeBackupWorld(serverInfo.path, "safety-net", { enabled, retentionCount });
+          }
         }
       });
 
@@ -687,6 +722,8 @@ export default function Home() {
     setNetStatus("connecting");
     setLogs(prev => [...prev, `[INFO] Conectando ao código ${inviteCode}...`]);
 
+    let discoveredName: string | null = null;
+
     try {
       const shortCodeClean = inviteCode.replace("CF-", "");
       const response = await fetch(`https://cubeforge-api.cubeforge.workers.dev/api/v1/servers/${shortCodeClean}`);
@@ -702,6 +739,7 @@ export default function Home() {
           status: session.status,
           description: server.description,
         });
+        discoveredName = server.name ?? null;
       } else {
         setLogs(prev => [...prev, `[INFO] API Central indisponível. Conectando diretamente...`]);
       }
@@ -717,6 +755,26 @@ export default function Home() {
       });
       setNetStatus("online");
       setLogs(prev => [...prev, `[INFO] ✅ Túnel estabelecido! Conecte-se em localhost:${minecraftPort}`]);
+
+      // Adiciona (ou atualiza) automaticamente o servidor na lista "Multiplayer"
+      // do cliente Minecraft do convidado, editando o servers.dat diretamente —
+      // evita que o jogador precise digitar "localhost:<porta>" na mão. Melhor
+      // esforço: se não achar a instalação do launcher, o app continua
+      // funcionando normalmente (o convidado só digita o endereço manualmente).
+      try {
+        const result = await invoke<string>("add_minecraft_server_entry", {
+          name: discoveredName ?? "Servidor CubeForge",
+          address: `localhost:${minecraftPort}`,
+        });
+        if (result === "added") {
+          setLogs(prev => [...prev, `[INFO] ✅ Servidor adicionado automaticamente à sua lista de Multiplayer do Minecraft.`]);
+        } else {
+          setLogs(prev => [...prev, `[INFO] Não encontramos sua instalação do Minecraft — adicione "localhost:${minecraftPort}" manualmente na lista de Multiplayer.`]);
+        }
+      } catch (err) {
+        console.warn("[Guest] Falha ao adicionar servidor ao cliente Minecraft:", err);
+        setLogs(prev => [...prev, `[INFO] Não foi possível adicionar o servidor automaticamente — adicione "localhost:${minecraftPort}" manualmente na lista de Multiplayer.`]);
+      }
     } catch (err) {
       console.error(err);
       setNetStatus("offline");
@@ -814,7 +872,6 @@ export default function Home() {
             deleteConfirmServer={deleteConfirmServer}
             totalSystemRamGb={totalSystemRamGb}
             serverConfigPort={serverConfigPort}
-            settingsPort={settingsPort}
             copied={copied}
             shortCode={shortCode}
             resourceSample={resourceSample}
@@ -834,7 +891,6 @@ export default function Home() {
             onSetDeleteConfirmServer={setDeleteConfirmServer}
             onSetTotalSystemRamGb={setTotalSystemRamGb}
             onSetServerConfigPort={setServerConfigPort}
-            onSetSettingsPort={setSettingsPort}
             onSetCopied={setCopied}
             onSetShortCode={setShortCode}
           />

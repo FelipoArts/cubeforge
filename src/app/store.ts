@@ -31,6 +31,12 @@ export interface KnownServer {
   addedAt: string; // ISO timestamp
   isOwnServer: boolean; // true se for um servidor criado pelo próprio usuário
   networkProvider: string;
+  // Versão exata do Forge/NeoForge (ex: "47.2.0") ou do loader Fabric/build do
+  // Paper, espelhando ServerInfo.forgeVersion/modLoaderVersion em server.ts —
+  // usado pelo fluxo "Jogar" pra instalar o client com a MESMA build do host
+  // (Forge quebra compatibilidade entre builds, então "a mais recente" não serve).
+  forgeVersion: string | null;
+  modLoaderVersion: string | null;
 }
 
 interface AppSettings {
@@ -39,6 +45,11 @@ interface AppSettings {
   hasInitialized: boolean;
   minecraftPort: number;
   selectedServer: string | null;
+
+  // Backup automático do mundo (parada/crash/sessão longa — ver
+  // src/lib/autoBackup.ts). Preferência do usuário, então persistida.
+  autoBackupEnabled: boolean;
+  backupRetentionCount: number;
 
   // Nome do servidor cujo processo Minecraft está atualmente rodando/iniciando
   // (pode divergir de selectedServer quando o usuário navega para outro servidor
@@ -73,6 +84,8 @@ interface AppSettings {
   setServerDir: (dir: string) => void;
   setInitialized: (val: boolean) => void;
   setMinecraftPort: (port: number) => void;
+  setAutoBackupEnabled: (enabled: boolean) => void;
+  setBackupRetentionCount: (count: number) => void;
   setSelectedServer: (name: string | null) => void;
   setRunningServer: (name: string | null) => void;
   setServerStatus: (status: ServerStatus) => void;
@@ -95,6 +108,8 @@ export const useAppStore = create<AppSettings>()(
       serverDir: null,
       hasInitialized: false,
       minecraftPort: 25565,
+      autoBackupEnabled: true,
+      backupRetentionCount: 10,
       selectedServer: null,
       runningServer: null,
       serverStatus: 'offline',
@@ -108,6 +123,8 @@ export const useAppStore = create<AppSettings>()(
       setServerDir: (dir) => set({ serverDir: dir }),
       setInitialized: (val) => set({ hasInitialized: val }),
       setMinecraftPort: (port) => set({ minecraftPort: port }),
+      setAutoBackupEnabled: (enabled) => set({ autoBackupEnabled: enabled }),
+      setBackupRetentionCount: (count) => set({ backupRetentionCount: count }),
       setSelectedServer: (name) => set({ selectedServer: name }),
       setRunningServer: (name) => set({ runningServer: name }),
       setServerStatus: (status) => set((state) => ({
@@ -175,6 +192,8 @@ export const useAppStore = create<AppSettings>()(
         serverDir: state.serverDir,
         hasInitialized: state.hasInitialized,
         minecraftPort: state.minecraftPort,
+        autoBackupEnabled: state.autoBackupEnabled,
+        backupRetentionCount: state.backupRetentionCount,
         selectedServer: state.selectedServer,
         runningServer: state.runningServer,
         knownServers: state.knownServers,

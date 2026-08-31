@@ -41,6 +41,7 @@ import { installModpack, type ParsedModpack } from "@/lib/modpackImport";
 import { ServerConfigModal } from "@/app/ServerConfigModal";
 import { ConsolePanel } from "./ConsolePanel";
 import { ServerManagePanel } from "./ServerManagePanel";
+import { PlayersPanel } from "./PlayersPanel";
 import { ServerList } from "./ServerList";
 import { CreateServerModal } from "./CreateServerModal";
 import { ImportModpackModal } from "./ImportModpackModal";
@@ -72,7 +73,6 @@ interface HostViewProps {
   deleteConfirmServer: string | null;
   totalSystemRamGb: number;
   serverConfigPort: number;
-  settingsPort: number;
   copied: boolean;
   shortCode: string;
   resourceSample: ResourceSnapshot | null;
@@ -94,7 +94,6 @@ interface HostViewProps {
   onSetDeleteConfirmServer: (v: string | null) => void;
   onSetTotalSystemRamGb: (v: number) => void;
   onSetServerConfigPort: (v: number) => void;
-  onSetSettingsPort: (v: number) => void;
   onSetCopied: (v: boolean) => void;
   onSetShortCode: (v: string) => void;
 }
@@ -116,7 +115,6 @@ export function HostView({
   deleteConfirmServer,
   totalSystemRamGb,
   serverConfigPort,
-  settingsPort,
   copied,
   shortCode,
   resourceSample,
@@ -137,7 +135,6 @@ export function HostView({
   onSetDeleteConfirmServer,
   onSetTotalSystemRamGb,
   onSetServerConfigPort,
-  onSetSettingsPort,
   onSetCopied,
   onSetShortCode,
 }: HostViewProps) {
@@ -147,6 +144,10 @@ export function HostView({
     setServerDir,
     minecraftPort,
     setMinecraftPort,
+    autoBackupEnabled,
+    setAutoBackupEnabled,
+    backupRetentionCount,
+    setBackupRetentionCount,
     selectedServer,
     setSelectedServer,
     setRunningServer,
@@ -272,11 +273,6 @@ export function HostView({
       }
     })();
   }, [selectedServer, localServers]);
-
-  // Sincronizar settingsPort ao abrir modal
-  useEffect(() => {
-    if (showSettings) onSetSettingsPort(minecraftPort || 25565);
-  }, [showSettings, minecraftPort]);
 
   // --- Handlers ---
 
@@ -595,8 +591,10 @@ export function HostView({
     }
   };
 
-  const handleSaveSettings = () => {
-    setMinecraftPort(settingsPort);
+  const handleSaveSettings = (port: number, newAutoBackupEnabled: boolean, newBackupRetentionCount: number) => {
+    setMinecraftPort(port);
+    setAutoBackupEnabled(newAutoBackupEnabled);
+    setBackupRetentionCount(newBackupRetentionCount);
     onSetShowSettings(false);
   };
 
@@ -903,6 +901,16 @@ export function HostView({
             />
           )}
 
+          {/* Whitelist, operadores e banimentos */}
+          {selectedServer && serverInfo && (
+            <PlayersPanel
+              key={serverInfo.path}
+              serverDir={serverInfo.path}
+              serverStatus={serverStatus}
+              onSendCommand={handleSendMCCommand}
+            />
+          )}
+
           {/* Console */}
           <ConsolePanel
             mcLogs={mcLogs}
@@ -1018,6 +1026,8 @@ export function HostView({
         isOpen={showSettings}
         onClose={() => onSetShowSettings(false)}
         currentPort={minecraftPort || 25565}
+        currentAutoBackupEnabled={autoBackupEnabled}
+        currentBackupRetentionCount={backupRetentionCount}
         onSave={handleSaveSettings}
       />
 

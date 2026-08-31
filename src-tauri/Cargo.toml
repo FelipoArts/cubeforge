@@ -44,6 +44,8 @@ sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 base64 = "0.22"
 sysinfo = "0.32"
+md5 = "0.7"
+hematite-nbt = "0.5"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }

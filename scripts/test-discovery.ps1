@@ -37,27 +37,35 @@ class RegistryServer {
         listener.Prefixes.Add("http://127.0.0.1:$registryPort/");
         listener.Start();
         Console.WriteLine("[Registry] Servidor HTTP iniciado em 127.0.0.1:$registryPort");
-        
+
         // Registrar servidor de teste
         string testEntry = '{"short_code":"$shortCode","name":"$serverName","version":"$serverVersion","server_type":"vanilla","description":"Servidor de teste local","status":"online","port":25565}';
-        
-        while (true) {
+
+        // Espelha exatamente as rotas do servidor real (handle_registry_request em
+        // lib.rs): só leitura (/registry/resolve, /status). Não existe /registry/list,
+        // /registry/update nem /registry/remove por HTTP — hardening deliberado, quem
+        // muta o registro faz isso em processo, via comando Tauri, nunca pela rede.
+        // Encerra após um número fixo de requisições (em vez de depender de qual rota
+        // foi chamada por último) pra não travar esperando uma requisição a mais.
+        int requestCount = 0;
+        int maxRequests = 4;
+        while (requestCount < maxRequests) {
             HttpListenerContext ctx = listener.GetContext();
             HttpListenerRequest req = ctx.Request;
             HttpListenerResponse resp = ctx.Response;
-            
+
             string url = req.Url.AbsolutePath + req.Url.Query;
             Console.WriteLine("[Registry] Requisição: " + req.HttpMethod + " " + url);
-            
+
             string responseString = "";
             int statusCode = 200;
-            
+
             if (url.StartsWith("/registry/resolve")) {
                 // Extrair code da query string
                 var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
                 string code = query["code"] ?? "";
                 Console.WriteLine("[Registry] Resolvendo código: " + code);
-                
+
                 if (code == "$shortCode") {
                     responseString = testEntry;
                     Console.WriteLine("[Registry] Servidor encontrado!");
@@ -66,15 +74,13 @@ class RegistryServer {
                     responseString = '{"error":"Servidor não encontrado para o código: ' + code + '"}';
                     Console.WriteLine("[Registry] Código não encontrado: " + code);
                 }
-            } else if (url == "/registry/list") {
-                responseString = '[' + testEntry + ']';
             } else if (url == "/status") {
                 responseString = '{"status":"ok"}';
             } else {
                 statusCode = 404;
                 responseString = '{"error":"Endpoint não encontrado"}';
             }
-            
+
             byte[] buffer = Encoding.UTF8.GetBytes(responseString);
             resp.StatusCode = statusCode;
             resp.ContentType = "application/json";
@@ -82,14 +88,10 @@ class RegistryServer {
             resp.ContentLength64 = buffer.Length;
             resp.OutputStream.Write(buffer, 0, buffer.Length);
             resp.OutputStream.Close();
-            
-            if (url == "/registry/list") {
-                // Após listar, esperar um pouco e sair
-                Thread.Sleep(500);
-                break;
-            }
+
+            requestCount++;
         }
-        
+
         listener.Stop();
     }
 }
@@ -150,14 +152,18 @@ try {
         }
     }
 
-    # Teste 4: Listar todos os servidores
-    Write-Host "  Teste 4: GET /registry/list" -NoNewline
-    $list = Invoke-RestMethod -Uri "http://127.0.0.1:$registryPort/registry/list" -TimeoutSec 5
-    if ($list.Count -ge 1 -and $list[0].short_code -eq $shortCode) {
-        Write-Host " ✅ OK" -ForegroundColor Green
-        Write-Host "    Servidores registrados: $($list.Count)"
-    } else {
-        Write-Host " ❌ FALHOU" -ForegroundColor Red
+    # Teste 4: /registry/list foi removido de propósito (hardening) — o registro só é
+    # lido por HTTP, nunca listado por inteiro nem mutado pela rede. Confirma 404.
+    Write-Host "  Teste 4: GET /registry/list (removido de propósito)" -NoNewline
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:$registryPort/registry/list" -TimeoutSec 5 | Out-Null
+        Write-Host " ❌ FALHOU (deveria retornar 404)" -ForegroundColor Red
+    } catch {
+        if ($_.Exception.Response.StatusCode -eq 404) {
+            Write-Host " ✅ OK (404 esperado)" -ForegroundColor Green
+        } else {
+            Write-Host " ❌ FALHOU (status inesperado: $($_.Exception.Response.StatusCode))" -ForegroundColor Red
+        }
     }
 
 } catch {
