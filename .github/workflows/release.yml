@@ -22,6 +22,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # O sidecar tsnet-node (Go) fica fora do git (ver .gitignore) — cada
+      # dev compila localmente antes de rodar/buildar o app. Aqui replicamos
+      # esse passo pro CI, gerando o binário com o nome de target-triple que
+      # o Tauri espera em src-tauri/binaries/.
+      - name: Build tsnet-node sidecar
+        working-directory: src-tauri/sidecars/tsnet-node
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../../binaries | Out-Null
+          go build -o ../../binaries/tsnet-node-x86_64-pc-windows-msvc.exe .
+
       - name: Install frontend dependencies
         run: npm ci
 
