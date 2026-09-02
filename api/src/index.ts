@@ -15,6 +15,14 @@ interface Env {
   TAILSCALE_API_KEY: string;
   // Secret — nunca em wrangler.toml. Configurar com: wrangler secret put CURSEFORGE_API_KEY
   CURSEFORGE_API_KEY?: string;
+  // Secrets do Stripe — nunca em wrangler.toml. Configurar com:
+  //   wrangler secret put STRIPE_RESTRICTED_KEY   (rk_..., NUNCA a secret key sk_...)
+  //   wrangler secret put STRIPE_WEBHOOK_SECRET   (whsec_..., gerado ao criar o
+  //     endpoint de webhook em Developers > Webhooks, apontando pra
+  //     .../api/v1/donations/webhook, eventos checkout.session.completed e
+  //     checkout.session.async_payment_succeeded)
+  STRIPE_RESTRICTED_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
@@ -241,6 +249,150 @@ async function handleCurseForgeProxy(req: Request, env: Env, subpath: string, co
 }
 
 // ============================================================
+// Doações (Stripe Checkout) — botão "Pagar uma Coquinha"
+// ============================================================
+// Cria uma Stripe Checkout Session com valor livre (custom_unit_amount —
+// o doador escolhe quanto pagar direto na página hospedada do Stripe, sem
+// nenhuma UI de pagamento no Cubicase). O app desktop só chama este
+// endpoint e abre a `url` retornada no navegador do sistema.
+//
+// Chamado direto via fetch (sem o SDK oficial do Stripe): o Workers
+// runtime não tem os módulos Node que o SDK espera, e a API REST do
+// Stripe é simples o bastante pra não precisar disso.
+//
+// O pagamento em si nunca deve ser confiado a partir do redirect de
+// sucesso (o usuário pode fechar a aba antes de voltar) — por isso existe
+// o webhook abaixo, que é quem realmente confirma que o pagamento
+// aconteceu (ver stripe-best-practices/references/payments.md).
+
+const STRIPE_API_BASE = 'https://api.stripe.com/v1';
+const STRIPE_API_VERSION = '2026-08-26.dahlia';
+
+function randomLowercaseLetters(n: number): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz';
+  let out = '';
+  for (let i = 0; i < n; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+async function handleCreateDonationCheckout(env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.STRIPE_RESTRICTED_KEY) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Doações não estão configuradas neste servidor.'), 503, cors);
+  }
+
+  const body = new URLSearchParams();
+  body.set('mode', 'payment');
+  body.set('submit_type', 'donate');
+  body.set('success_url', 'https://cubicase.net/obrigado/?session_id={CHECKOUT_SESSION_ID}');
+  body.set('cancel_url', 'https://cubicase.net/download/');
+  body.set('line_items[0][quantity]', '1');
+  body.set('line_items[0][price_data][currency]', 'brl');
+  body.set('line_items[0][price_data][product_data][name]', 'Doação para o Cubicase');
+  // Sem payment_method_types de propósito: deixa o Stripe decidir dinamicamente
+  // quais métodos mostrar (cartão, Pix, carteiras digitais, etc conforme o
+  // país/moeda do doador) — ver "Dynamic payment methods" no guia oficial.
+  body.set('line_items[0][price_data][custom_unit_amount][enabled]', 'true');
+  body.set('line_items[0][price_data][custom_unit_amount][minimum]', '500'); // R$5,00
+  body.set('line_items[0][price_data][custom_unit_amount][preset]', '1000'); // R$10,00
+  body.set('line_items[0][price_data][custom_unit_amount][maximum]', '100000'); // R$1.000,00
+  body.set('integration_identifier', `cubicase_${randomLowercaseLetters(8)}`);
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${STRIPE_API_BASE}/checkout/sessions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.STRIPE_RESTRICTED_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Stripe-Version': STRIPE_API_VERSION,
+      },
+      body: body.toString(),
+    });
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar o Stripe.', { error: String(e) }), 502, cors);
+  }
+
+  const data: any = await upstream.json().catch(() => null);
+  if (!upstream.ok || !data?.url) {
+    return json(
+      fail(ResponseCodes.INTERNAL_ERROR, 'Não foi possível criar a sessão de pagamento.', { stripeError: data?.error?.message }),
+      502,
+      cors
+    );
+  }
+
+  return json(ok(ResponseCodes.SUCCESS, 'Sessão de checkout criada.', { url: data.url }), 200, cors);
+}
+
+/** Verifica a assinatura `Stripe-Signature` de um webhook (HMAC-SHA256, via Web Crypto — sem depender do SDK do Stripe). */
+async function verifyStripeSignature(payload: string, header: string | null, secret: string): Promise<boolean> {
+  if (!header) return false;
+  const parts = Object.fromEntries(
+    header.split(',').map((kv) => {
+      const [k, v] = kv.split('=');
+      return [k, v];
+    })
+  );
+  const timestamp = parts['t'];
+  const signature = parts['v1'];
+  if (!timestamp || !signature) return false;
+
+  // Proteção contra replay: rejeita eventos com mais de 5 minutos.
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signed = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${timestamp}.${payload}`));
+  const expected = Array.from(new Uint8Array(signed))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  // Comparação em tempo constante (evita timing attack).
+  if (expected.length !== signature.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleStripeWebhook(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.STRIPE_WEBHOOK_SECRET) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Webhook do Stripe não está configurado.'), 503, cors);
+  }
+
+  const payload = await req.text();
+  const validSig = await verifyStripeSignature(payload, req.headers.get('Stripe-Signature'), env.STRIPE_WEBHOOK_SECRET);
+  if (!validSig) {
+    return json(fail(ResponseCodes.BAD_REQUEST, 'Assinatura do webhook inválida.'), 400, cors);
+  }
+
+  let event: any;
+  try {
+    event = JSON.parse(payload);
+  } catch {
+    return json(fail(ResponseCodes.BAD_REQUEST, 'Payload inválido.'), 400, cors);
+  }
+
+  // Só os dois eventos que realmente confirmam pagamento — nunca fulfillment
+  // baseado na página de sucesso (ver comentário no topo desta seção).
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    const session = event.data?.object;
+    if (session && session.payment_status !== 'unpaid') {
+      await env.CUBEFORGE_REGISTRY.put(
+        `donation:${session.id}`,
+        JSON.stringify({
+          amountTotal: session.amount_total,
+          currency: session.currency,
+          createdAt: new Date().toISOString(),
+        })
+      );
+    }
+  }
+
+  // Sempre 200 pro Stripe não ficar reenviando eventos que já processamos
+  // (ou que não nos interessam) indefinidamente.
+  return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
+}
+
+// ============================================================
 // MAIN ROUTER
 // ============================================================
 
@@ -292,6 +444,12 @@ export default {
       // Proxy CurseForge: /api/v1/curseforge/{subpath}
       const mcf = p.match(/^\/api\/v1\/curseforge(\/.*)$/);
       if (mcf) return await handleCurseForgeProxy(req, env, mcf[1], cors);
+
+      // POST /api/v1/donations/checkout-session — botão "Pagar uma Coquinha"
+      if (m === 'POST' && p === '/api/v1/donations/checkout-session') return await handleCreateDonationCheckout(env, cors);
+
+      // POST /api/v1/donations/webhook — confirmação de pagamento do Stripe
+      if (m === 'POST' && p === '/api/v1/donations/webhook') return await handleStripeWebhook(req, env, cors);
 
       if (m === 'GET' && p === '/health') return new Response(JSON.stringify(ok(ResponseCodes.SUCCESS, 'OK', { status: 'ok', version: 'v1' })), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });
 

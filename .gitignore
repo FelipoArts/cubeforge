@@ -32,6 +32,9 @@ src-tauri/user_jvm_args.txt
 
 # Config local do Claude Code (específica da máquina, não do projeto)
 .claude/settings.local.json
+.claude/skills/
+.agents/
+skills-lock.json
 
 # Logs
 *.log

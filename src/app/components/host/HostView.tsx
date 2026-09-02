@@ -38,6 +38,7 @@ import {
 } from "@/lib/server";
 import type { ResourceSnapshot } from "@/lib/resourceDiagnostics";
 import { installModpack, type ParsedModpack } from "@/lib/modpackImport";
+import { openDonationCheckout } from "@/lib/donations";
 import { ServerConfigModal } from "@/app/ServerConfigModal";
 import { ConsolePanel } from "./ConsolePanel";
 import { ServerManagePanel } from "./ServerManagePanel";
@@ -163,6 +164,7 @@ export function HostView({
   const [isImporting, setIsImporting] = useState(false);
   const [showCrashDetail, setShowCrashDetail] = useState(false);
   const [showImportModpack, setShowImportModpack] = useState(false);
+  const [isOpeningDonation, setIsOpeningDonation] = useState(false);
 
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
@@ -985,8 +987,20 @@ export function HostView({
             </p>
             <button
               type="button"
-              className="w-full py-3 bg-white text-indigo-600 rounded-2xl font-bold text-sm hover:bg-indigo-50 transition-colors cursor-pointer"
+              disabled={isOpeningDonation}
+              onClick={async () => {
+                setIsOpeningDonation(true);
+                try {
+                  await openDonationCheckout();
+                } catch (err) {
+                  pushDiagnostic({ level: "error", source: "Doação", title: "Não foi possível abrir a página de doação", message: String(err) });
+                } finally {
+                  setIsOpeningDonation(false);
+                }
+              }}
+              className="w-full py-3 bg-white text-indigo-600 rounded-2xl font-bold text-sm hover:bg-indigo-50 transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
+              {isOpeningDonation ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
               Pagar uma Coquinha 🥤
             </button>
           </div>
