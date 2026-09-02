@@ -25,6 +25,8 @@ mod session_manager;
 #[allow(dead_code)]
 mod provider_manager;
 mod job_object;
+#[cfg(test)]
+mod tests;
 
 fn log_to_file(app: &tauri::AppHandle, message: &str) {
     let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
