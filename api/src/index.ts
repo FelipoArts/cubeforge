@@ -268,6 +268,12 @@ async function handleCurseForgeProxy(req: Request, env: Env, subpath: string, co
 const STRIPE_API_BASE = 'https://api.stripe.com/v1';
 const STRIPE_API_VERSION = '2026-08-26.dahlia';
 
+// Preço "avulso, cliente escolhe o valor" (mín. R$0,50), criado uma vez no
+// Dashboard do Stripe (Products) — "valor livre" (custom_unit_amount) só
+// existe em um Price salvo, não dá pra criar isso na hora dentro da sessão
+// de checkout. IDs de preço não são segredo (só a chave de API é).
+const DONATION_PRICE_ID = 'price_1UBi0CR2N4VtEZCjsvAwjT9M';
+
 function randomLowercaseLetters(n: number): string {
   const chars = 'abcdefghijklmnopqrstuvwxyz';
   let out = '';
@@ -286,15 +292,10 @@ async function handleCreateDonationCheckout(env: Env, cors: Record<string, strin
   body.set('success_url', 'https://cubicase.net/obrigado/?session_id={CHECKOUT_SESSION_ID}');
   body.set('cancel_url', 'https://cubicase.net/download/');
   body.set('line_items[0][quantity]', '1');
-  body.set('line_items[0][price_data][currency]', 'brl');
-  body.set('line_items[0][price_data][product_data][name]', 'Doação para o Cubicase');
+  body.set('line_items[0][price]', DONATION_PRICE_ID);
   // Sem payment_method_types de propósito: deixa o Stripe decidir dinamicamente
   // quais métodos mostrar (cartão, Pix, carteiras digitais, etc conforme o
   // país/moeda do doador) — ver "Dynamic payment methods" no guia oficial.
-  body.set('line_items[0][price_data][custom_unit_amount][enabled]', 'true');
-  body.set('line_items[0][price_data][custom_unit_amount][minimum]', '500'); // R$5,00
-  body.set('line_items[0][price_data][custom_unit_amount][preset]', '1000'); // R$10,00
-  body.set('line_items[0][price_data][custom_unit_amount][maximum]', '100000'); // R$1.000,00
   body.set('integration_identifier', `cubicase_${randomLowercaseLetters(8)}`);
 
   let upstream: Response;
