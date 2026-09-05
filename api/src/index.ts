@@ -272,7 +272,7 @@ const STRIPE_API_VERSION = '2026-08-26.dahlia';
 // Dashboard do Stripe (Products) — "valor livre" (custom_unit_amount) só
 // existe em um Price salvo, não dá pra criar isso na hora dentro da sessão
 // de checkout. IDs de preço não são segredo (só a chave de API é).
-const DONATION_PRICE_ID = 'price_1UBi0CR2N4VtEZCjsvAwjT9M';
+const DONATION_PRICE_ID = 'price_1UBjJpJrnDGUaagENUlVHka3';
 
 function randomLowercaseLetters(n: number): string {
   const chars = 'abcdefghijklmnopqrstuvwxyz';
