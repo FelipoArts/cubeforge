@@ -23,6 +23,14 @@ interface Env {
   //     checkout.session.async_payment_succeeded)
   STRIPE_RESTRICTED_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
+  // Secrets do Mercado Pago — nunca em wrangler.toml. Configurar com:
+  //   wrangler secret put MERCADOPAGO_ACCESS_TOKEN   (Access Token de produção,
+  //     em Suas integrações > [app] > Credenciais de produção)
+  //   wrangler secret put MERCADOPAGO_WEBHOOK_SECRET  (chave secreta gerada ao
+  //     configurar o webhook em Suas integrações > [app] > Webhooks, apontando
+  //     pra .../api/v1/donations/mercadopago/webhook, evento "Pagamentos")
+  MERCADOPAGO_ACCESS_TOKEN?: string;
+  MERCADOPAGO_WEBHOOK_SECRET?: string;
 }
 
 type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
@@ -394,6 +402,173 @@ async function handleStripeWebhook(req: Request, env: Env, cors: Record<string, 
 }
 
 // ============================================================
+// Doações via Pix (Mercado Pago) — complemento ao Stripe
+// ============================================================
+// O Stripe (acima) não libera Pix pra contas pessoa física novas — pra não
+// perder quem prefere Pix a preencher cartão, esse segundo caminho usa o
+// Checkout Pro do Mercado Pago, que aceita conta de pessoa física sem
+// carência. O app mostra as duas opções (Cartão → Stripe, Pix → Mercado
+// Pago) e cada uma abre sua própria página hospedada no navegador.
+//
+// Diferença importante em relação ao Stripe: o Checkout Pro do Mercado
+// Pago não tem "o cliente escolhe o valor" — o valor precisa vir fixo na
+// criação da preferência. Por isso este endpoint recebe o valor (em
+// centavos, mesma unidade que o resto do app usa) no corpo da requisição;
+// a escolha do valor acontece numa etapa curta dentro do próprio Cubicase
+// (não é dado de pagamento, só um número).
+
+const MERCADOPAGO_API_BASE = 'https://api.mercadopago.com';
+const DONATION_MIN_CENTS = 50; // R$0,50 — mesmo mínimo do Price do Stripe
+const DONATION_MAX_CENTS = 100_000; // R$1.000,00 — mesmo teto do Stripe
+
+async function handleCreateMercadoPagoCheckout(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.MERCADOPAGO_ACCESS_TOKEN) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Doações via Pix não estão configuradas neste servidor.'), 503, cors);
+  }
+
+  let body: any;
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+  const amountCents = Math.round(Number(body?.amountCents));
+  if (!Number.isFinite(amountCents) || amountCents < DONATION_MIN_CENTS || amountCents > DONATION_MAX_CENTS) {
+    return json(fail(ResponseCodes.VALIDATION_ERROR, `O valor precisa estar entre R$${(DONATION_MIN_CENTS / 100).toFixed(2)} e R$${(DONATION_MAX_CENTS / 100).toFixed(2)}.`), 400, cors);
+  }
+
+  const preference = {
+    items: [
+      {
+        title: 'Doação para o Cubicase',
+        quantity: 1,
+        unit_price: amountCents / 100,
+        currency_id: 'BRL',
+      },
+    ],
+    back_urls: {
+      success: 'https://cubicase.net/obrigado/',
+      failure: 'https://cubicase.net/download/',
+      pending: 'https://cubicase.net/obrigado/',
+    },
+    auto_return: 'approved',
+    notification_url: 'https://cubeforge-api.cubeforge.workers.dev/api/v1/donations/mercadopago/webhook',
+    // Restringe ao Pix — cartão já é coberto pelo Stripe, não faz sentido
+    // duplicar aqui (e evita confundir o doador com métodos redundantes).
+    payment_methods: {
+      excluded_payment_types: [{ id: 'credit_card' }, { id: 'debit_card' }, { id: 'ticket' }, { id: 'atm' }],
+    },
+  };
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${MERCADOPAGO_API_BASE}/checkout/preferences`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.MERCADOPAGO_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(preference),
+    });
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar o Mercado Pago.', { error: String(e) }), 502, cors);
+  }
+
+  const data: any = await upstream.json().catch(() => null);
+  if (!upstream.ok || !data?.init_point) {
+    return json(
+      fail(ResponseCodes.INTERNAL_ERROR, 'Não foi possível criar a cobrança Pix.', { mercadoPagoError: data?.message || data }),
+      502,
+      cors
+    );
+  }
+
+  return json(ok(ResponseCodes.SUCCESS, 'Cobrança Pix criada.', { url: data.init_point }), 200, cors);
+}
+
+/** Verifica a assinatura `x-signature` de um webhook do Mercado Pago (HMAC-SHA256 sobre um manifest fixo — ver docs.mercadopago.com/webhooks). */
+async function verifyMercadoPagoSignature(dataId: string, requestId: string | null, signatureHeader: string | null, secret: string): Promise<boolean> {
+  if (!signatureHeader || !requestId) return false;
+  const parts = Object.fromEntries(
+    signatureHeader.split(',').map((kv) => {
+      const [k, v] = kv.split('=');
+      return [k?.trim(), v?.trim()];
+    })
+  );
+  const ts = parts['ts'];
+  const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+
+  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signed = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(manifest));
+  const expected = Array.from(new Uint8Array(signed))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  if (expected.length !== v1.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleMercadoPagoWebhook(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.MERCADOPAGO_ACCESS_TOKEN || !env.MERCADOPAGO_WEBHOOK_SECRET) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Webhook do Mercado Pago não está configurado.'), 503, cors);
+  }
+
+  const url = new URL(req.url);
+  let payload: any = {};
+  try {
+    payload = await req.json();
+  } catch {
+    payload = {};
+  }
+
+  // O Mercado Pago manda o id do pagamento tanto na query string (formato
+  // IPN legado) quanto no corpo (formato webhook novo) — aceita os dois.
+  const dataId = payload?.data?.id || url.searchParams.get('data.id') || url.searchParams.get('id');
+  const topic = payload?.type || url.searchParams.get('type') || url.searchParams.get('topic');
+
+  if (!dataId || topic !== 'payment') {
+    // Outros tópicos (merchant_order, etc) não interessam aqui — sempre 200
+    // pro Mercado Pago não ficar reentregando.
+    return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
+  }
+
+  const validSig = await verifyMercadoPagoSignature(String(dataId), req.headers.get('x-request-id'), req.headers.get('x-signature'), env.MERCADOPAGO_WEBHOOK_SECRET);
+  if (!validSig) {
+    return json(fail(ResponseCodes.BAD_REQUEST, 'Assinatura do webhook inválida.'), 400, cors);
+  }
+
+  // O payload do webhook não traz o status do pagamento — precisa buscar
+  // direto na API pra confirmar de verdade (nunca confiar só na notificação).
+  let payment: any;
+  try {
+    const resp = await fetch(`${MERCADOPAGO_API_BASE}/v1/payments/${dataId}`, {
+      headers: { Authorization: `Bearer ${env.MERCADOPAGO_ACCESS_TOKEN}` },
+    });
+    payment = await resp.json().catch(() => null);
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao confirmar o pagamento no Mercado Pago.', { error: String(e) }), 502, cors);
+  }
+
+  if (payment && payment.status === 'approved') {
+    await env.CUBEFORGE_REGISTRY.put(
+      `donation:mp_${dataId}`,
+      JSON.stringify({
+        provider: 'mercadopago',
+        amountTotal: Math.round((payment.transaction_amount || 0) * 100),
+        currency: payment.currency_id,
+        createdAt: new Date().toISOString(),
+      })
+    );
+  }
+
+  return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
+}
+
+// ============================================================
 // MAIN ROUTER
 // ============================================================
 
@@ -451,6 +626,12 @@ export default {
 
       // POST /api/v1/donations/webhook — confirmação de pagamento do Stripe
       if (m === 'POST' && p === '/api/v1/donations/webhook') return await handleStripeWebhook(req, env, cors);
+
+      // POST /api/v1/donations/mercadopago/checkout-session — doação via Pix
+      if (m === 'POST' && p === '/api/v1/donations/mercadopago/checkout-session') return await handleCreateMercadoPagoCheckout(req, env, cors);
+
+      // POST /api/v1/donations/mercadopago/webhook — confirmação de pagamento do Mercado Pago
+      if (m === 'POST' && p === '/api/v1/donations/mercadopago/webhook') return await handleMercadoPagoWebhook(req, env, cors);
 
       if (m === 'GET' && p === '/health') return new Response(JSON.stringify(ok(ResponseCodes.SUCCESS, 'OK', { status: 'ok', version: 'v1' })), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });
 
