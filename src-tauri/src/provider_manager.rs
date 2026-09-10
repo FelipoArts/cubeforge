@@ -21,10 +21,11 @@ impl ProviderManager {
         session: &ConnectionSessionResponse,
         mode: &str,
         local_port: u16,
+        target_ip: Option<&str>,
     ) -> Result<(CommandChild, mpsc::Receiver<CommandEvent>), String> {
         match session.launcher.as_str() {
             "tsnet-v1" => {
-                self.start_tsnet(app, &session.credentials, mode, local_port, &session.session_id).await
+                self.start_tsnet(app, &session.credentials, mode, local_port, &session.session_id, target_ip).await
             }
             "mock-v1" => {
                 self.start_mock(app, &session.credentials, mode, local_port).await
@@ -41,6 +42,7 @@ impl ProviderManager {
         mode: &str,
         local_port: u16,
         session_id: &str,
+        target_ip: Option<&str>,
     ) -> Result<(CommandChild, mpsc::Receiver<CommandEvent>), String> {
         let auth_key = credentials.get("auth_key")
             .or_else(|| credentials.get("authKey"))
@@ -63,7 +65,7 @@ impl ProviderManager {
             "authKey": auth_key,
             "hostname": hostname,
             "mode": mode,
-            "targetIp": serde_json::Value::Null,
+            "targetIp": target_ip,
             "localPort": local_port,
         });
         let config_str = serde_json::to_string(&config)

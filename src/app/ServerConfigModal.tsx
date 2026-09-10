@@ -27,7 +27,10 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
   const [whitelist, setWhitelist] = useState(false);
   const [pvp, setPvp] = useState(true);
   const [allowFlight, setAllowFlight] = useState(false);
-  const [levelSeed, setLevelSeed] = useState('');
+  // Somente leitura: o level-seed só faz efeito na criação do mundo (que já
+  // aconteceu quando este modal é aberto), então não é mais editável aqui —
+  // ver campo de semente no CreateServerModal, usado na criação do servidor.
+  const [currentSeed, setCurrentSeed] = useState('');
   const [allowNether, setAllowNether] = useState(true);
   const [spawnMonsters, setSpawnMonsters] = useState(true);
   const [spawnAnimals, setSpawnAnimals] = useState(true);
@@ -71,7 +74,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
         setWhitelist(props['white-list'] === 'true');
         setPvp(props.pvp !== 'false'); // default true
         setAllowFlight(props['allow-flight'] === 'true');
-        setLevelSeed(props['level-seed'] ?? '');
+        setCurrentSeed(props['level-seed'] ?? '');
         setAllowNether(props['allow-nether'] !== 'false'); // default true
         setSpawnMonsters(props['spawn-monsters'] !== 'false'); // default true
         setSpawnAnimals(props['spawn-animals'] !== 'false'); // default true
@@ -138,7 +141,6 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
       'white-list': String(whitelist),
       pvp: String(pvp),
       'allow-flight': String(allowFlight),
-      'level-seed': levelSeed,
       'allow-nether': String(allowNether),
       'spawn-monsters': String(spawnMonsters),
       'spawn-animals': String(spawnAnimals),
@@ -335,7 +337,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                     <select
                       value={gamemode}
                       onChange={e => setGamemode(e.target.value)}
-                      disabled={formDisabled}
+                      disabled={formDisabled || hardcore}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <option value="survival">Sobrevivência</option>
@@ -349,7 +351,7 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                     <select
                       value={difficulty}
                       onChange={e => setDifficulty(e.target.value)}
-                      disabled={formDisabled}
+                      disabled={formDisabled || hardcore}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <option value="peaceful">Pacífico</option>
@@ -362,7 +364,20 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                 {/* Toggles */}
                 <div className="grid grid-cols-2 gap-4">
                   <label className="inline-flex items-center space-x-2">
-                    <input type="checkbox" checked={hardcore} onChange={e => setHardcore(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
+                    <input
+                      type="checkbox"
+                      checked={hardcore}
+                      onChange={e => {
+                        const checked = e.target.checked;
+                        setHardcore(checked);
+                        if (checked) {
+                          setGamemode('survival');
+                          setDifficulty('hard');
+                        }
+                      }}
+                      disabled={formDisabled}
+                      className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
                     <span className="text-sm text-theme-primary">Hardcore</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
@@ -440,14 +455,13 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Semente (level-seed)</label>
-                    <input
-                      type="text"
-                      value={levelSeed}
-                      onChange={e => setLevelSeed(e.target.value)}
-                      disabled={formDisabled}
-                      className="w-full rounded-2xl border border-theme-card bg-transparent px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                    />
+                    <label className="block text-sm font-medium text-theme-primary mb-1">Semente do Mundo</label>
+                    <div className="w-full rounded-2xl border border-theme-card bg-theme-muted px-3 py-2 text-theme-secondary text-sm font-mono truncate">
+                      {currentSeed || <span className="italic">Aleatória</span>}
+                    </div>
+                    <p className="mt-1 text-[10px] text-theme-secondary">
+                      Só pode ser escolhida na criação do servidor — o mundo já existe, então mudar isso aqui não teria efeito.
+                    </p>
                   </div>
                 </div>
                 {/* View Distance Slider */}

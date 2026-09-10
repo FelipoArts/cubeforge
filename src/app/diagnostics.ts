@@ -26,6 +26,8 @@ export interface DiagnosticEntry {
   source: string;
   timestamp: string; // ISO
   read: boolean;
+  /** Quantas vezes esse mesmo diagnóstico (nível+fonte+título+mensagem) se repetiu enquanto o toast estava ativo. */
+  count: number;
 }
 
 export interface PushDiagnosticInput {
@@ -69,6 +71,32 @@ export const useDiagnosticsStore = create<DiagnosticsState>((set, get) => ({
   unreadCount: 0,
 
   push: (input) => {
+    // Se o mesmo diagnóstico (nível+fonte+título+mensagem) já está ativo como
+    // toast, não empilha um novo popup — só atualiza o existente com um
+    // contador, evitando que o usuário precise fechar vários X repetidos
+    // para o mesmo erro.
+    const state = get();
+    const duplicate = state.entries.find(
+      (e) =>
+        state.toastIds.includes(e.id) &&
+        e.level === input.level &&
+        e.source === input.source &&
+        e.title === input.title &&
+        e.message === input.message
+    );
+
+    if (duplicate) {
+      set((s) => ({
+        entries: s.entries.map((e) =>
+          e.id === duplicate.id
+            ? { ...e, count: e.count + 1, detail: input.detail ?? e.detail, timestamp: new Date().toISOString(), read: false }
+            : e
+        ),
+        unreadCount: s.unreadCount + 1,
+      }));
+      return duplicate.id;
+    }
+
     const id = nextId();
     const entry: DiagnosticEntry = {
       id,
@@ -79,12 +107,13 @@ export const useDiagnosticsStore = create<DiagnosticsState>((set, get) => ({
       source: input.source,
       timestamp: new Date().toISOString(),
       read: false,
+      count: 1,
     };
 
-    set((state) => ({
-      entries: [entry, ...state.entries].slice(0, MAX_HISTORY),
-      toastIds: [...state.toastIds, id],
-      unreadCount: state.unreadCount + 1,
+    set((s) => ({
+      entries: [entry, ...s.entries].slice(0, MAX_HISTORY),
+      toastIds: [...s.toastIds, id],
+      unreadCount: s.unreadCount + 1,
     }));
 
     const dismissAfter = AUTO_DISMISS_MS[input.level];

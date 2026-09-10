@@ -14,6 +14,16 @@ export interface CrashInfo {
   detail?: string;
 }
 
+// Usuário autenticado via Supabase (ver src/lib/auth.ts) — só um espelho
+// reativo para a UI. A sessão de verdade (tokens, refresh) fica no storage
+// interno do supabase-js, que já persiste e renova sozinho; duplicar isso
+// aqui só criaria uma segunda fonte de verdade. Por isso NÃO entra no
+// `partialize` abaixo.
+export interface AuthUser {
+  id: string;
+  email: string;
+}
+
 // Servidor conhecido na biblioteca do guest
 export interface KnownServer {
   shortCode: string;
@@ -46,10 +56,18 @@ interface AppSettings {
   minecraftPort: number;
   selectedServer: string | null;
 
+  // Aba atualmente selecionada (Host/Convidado). Persistida para não voltar
+  // sempre para "host" a cada F5 — sem isso, dar refresh enquanto na aba
+  // Convidado te jogava de volta para a aba Host no meio de um teste.
+  mode: "host" | "guest";
+
   // Backup automático do mundo (parada/crash/sessão longa — ver
   // src/lib/autoBackup.ts). Preferência do usuário, então persistida.
   autoBackupEnabled: boolean;
   backupRetentionCount: number;
+  // Intervalo (em horas) do backup de segurança para sessões longas que
+  // nunca são paradas manualmente — ver uso em page.tsx.
+  backupSafetyNetIntervalHours: number;
 
   // Nome do servidor cujo processo Minecraft está atualmente rodando/iniciando
   // (pode divergir de selectedServer quando o usuário navega para outro servidor
@@ -60,10 +78,21 @@ interface AppSettings {
   // Estado de runtime (não persistido)
   serverStatus: ServerStatus;
 
+  // Jogadores conectados no servidor Minecraft rodando neste momento (runtime,
+  // não persistido). Não há RCON/consulta de estado disponível, então essa
+  // lista é derivada das mensagens padrão do servidor vanilla ("X joined/left
+  // the game") — ver o listener de "minecraft-log" em page.tsx. Zerada sempre
+  // que o servidor sai do estado "online".
+  onlinePlayers: string[];
+
   // Causa do último crash (não persistido — assim como serverStatus, não faz
   // sentido reabrir o app "lembrando" de um crash antigo). Resetado sempre
   // que um novo start é disparado (ver setServerStatus).
   lastCrashInfo: CrashInfo | null;
+
+  // Usuário logado (Supabase), null se estiver usando sem conta — ver
+  // AuthUser acima. Não persistido.
+  user: AuthUser | null;
 
   // Biblioteca de servidores conhecidos (persistida)
   knownServers: KnownServer[];
@@ -86,10 +115,16 @@ interface AppSettings {
   setMinecraftPort: (port: number) => void;
   setAutoBackupEnabled: (enabled: boolean) => void;
   setBackupRetentionCount: (count: number) => void;
+  setBackupSafetyNetIntervalHours: (hours: number) => void;
   setSelectedServer: (name: string | null) => void;
+  setMode: (mode: "host" | "guest") => void;
   setRunningServer: (name: string | null) => void;
   setServerStatus: (status: ServerStatus) => void;
+  setOnlinePlayers: (players: string[]) => void;
+  addOnlinePlayer: (name: string) => void;
+  removeOnlinePlayer: (name: string) => void;
   setLastCrashInfo: (info: CrashInfo | null) => void;
+  setUser: (user: AuthUser | null) => void;
   setLocalServers: (servers: ServerInfo[]) => void;
   setKnownServers: (servers: KnownServer[]) => void;
   addKnownServer: (server: KnownServer) => void;
@@ -110,10 +145,14 @@ export const useAppStore = create<AppSettings>()(
       minecraftPort: 25565,
       autoBackupEnabled: true,
       backupRetentionCount: 10,
+      backupSafetyNetIntervalHours: 6,
       selectedServer: null,
+      mode: "host",
       runningServer: null,
       serverStatus: 'offline',
+      onlinePlayers: [],
       lastCrashInfo: null,
+      user: null,
       knownServers: [],
       localServers: [],
       importedServerPaths: [],
@@ -125,14 +164,24 @@ export const useAppStore = create<AppSettings>()(
       setMinecraftPort: (port) => set({ minecraftPort: port }),
       setAutoBackupEnabled: (enabled) => set({ autoBackupEnabled: enabled }),
       setBackupRetentionCount: (count) => set({ backupRetentionCount: count }),
+      setBackupSafetyNetIntervalHours: (hours) => set({ backupSafetyNetIntervalHours: hours }),
       setSelectedServer: (name) => set({ selectedServer: name }),
+      setMode: (mode) => set({ mode }),
       setRunningServer: (name) => set({ runningServer: name }),
       setServerStatus: (status) => set((state) => ({
         serverStatus: status,
         // Um novo start torna o crash anterior irrelevante para o banner.
         lastCrashInfo: status === 'starting' ? null : state.lastCrashInfo,
       })),
+      setOnlinePlayers: (players) => set({ onlinePlayers: players }),
+      addOnlinePlayer: (name) => set((state) =>
+        state.onlinePlayers.includes(name) ? state : { onlinePlayers: [...state.onlinePlayers, name] }
+      ),
+      removeOnlinePlayer: (name) => set((state) => ({
+        onlinePlayers: state.onlinePlayers.filter((p) => p !== name),
+      })),
       setLastCrashInfo: (info) => set({ lastCrashInfo: info }),
+      setUser: (user) => set({ user }),
       setLocalServers: (servers) => set({ localServers: servers }),
       setKnownServers: (servers) => set({ knownServers: servers }),
       addKnownServer: (server) => set((state) => {
@@ -194,7 +243,9 @@ export const useAppStore = create<AppSettings>()(
         minecraftPort: state.minecraftPort,
         autoBackupEnabled: state.autoBackupEnabled,
         backupRetentionCount: state.backupRetentionCount,
+        backupSafetyNetIntervalHours: state.backupSafetyNetIntervalHours,
         selectedServer: state.selectedServer,
+        mode: state.mode,
         runningServer: state.runningServer,
         knownServers: state.knownServers,
         importedServerPaths: state.importedServerPaths,

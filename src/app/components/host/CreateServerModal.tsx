@@ -42,7 +42,10 @@ interface CreateServerModalProps {
     ram: number,
     serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper",
     // Forge/NeoForge: versão do Forge. Fabric: versão do loader. Paper: número da build (como string).
-    extraVersion?: string
+    extraVersion?: string,
+    // Semente do mundo. Só tem efeito aqui, na criação — depois que o mundo já existe,
+    // mudar o level-seed no server.properties não regenera o terreno.
+    seed?: string
   ) => Promise<void>;
   installProgress: ServerInstallProgress | null;
   totalRamGb: number;
@@ -60,6 +63,7 @@ export function CreateServerModal({
   const [serverName, setServerName] = useState("");
   const [serverVersion, setServerVersion] = useState("1.20.1");
   const [serverRam, setServerRam] = useState(4);
+  const [serverSeed, setServerSeed] = useState("");
   const [serverType, setServerType] = useState<UiServerType>("vanilla");
   const [forgeBuilds, setForgeBuilds] = useState<ForgeBuild[]>([]);
   const [selectedForgeBuild, setSelectedForgeBuild] = useState<string>("");
@@ -187,6 +191,7 @@ export function CreateServerModal({
   useEffect(() => {
     if (!isOpen) {
       setServerName("");
+      setServerSeed("");
       setVersionSearchQuery("");
       setShowAllVersions(false);
       setVersionDropdownOpen(false);
@@ -213,6 +218,7 @@ export function CreateServerModal({
     e.preventDefault();
     if (!serverName.trim()) return;
     const cleanName = serverName.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+    const seed = serverSeed.trim() || undefined;
     if (serverType === "forge") {
       if (!selectedForgeBuild) {
         pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Forge não selecionada", message: "Selecione uma versão do Forge." });
@@ -222,21 +228,21 @@ export function CreateServerModal({
       // da URL de instalação é diferente entre os dois, então é preciso mandar o
       // provider certo, não assumir sempre "forge".
       const build = forgeBuilds.find(b => b.forgeVersion === selectedForgeBuild);
-      await onCreate(cleanName, serverVersion, serverRam, build?.provider ?? "forge", selectedForgeBuild);
+      await onCreate(cleanName, serverVersion, serverRam, build?.provider ?? "forge", selectedForgeBuild, seed);
     } else if (serverType === "fabric") {
       if (!selectedFabricLoader) {
         pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Fabric não selecionada", message: "Selecione uma versão do Fabric Loader." });
         return;
       }
-      await onCreate(cleanName, serverVersion, serverRam, "fabric", selectedFabricLoader);
+      await onCreate(cleanName, serverVersion, serverRam, "fabric", selectedFabricLoader, seed);
     } else if (serverType === "paper") {
       if (selectedPaperBuild === null) {
         pushDiagnostic({ level: "warning", source: "Instalação", title: "Build do Paper não selecionada", message: "Selecione uma build do Paper." });
         return;
       }
-      await onCreate(cleanName, serverVersion, serverRam, "paper", String(selectedPaperBuild));
+      await onCreate(cleanName, serverVersion, serverRam, "paper", String(selectedPaperBuild), seed);
     } else {
-      await onCreate(cleanName, serverVersion, serverRam);
+      await onCreate(cleanName, serverVersion, serverRam, undefined, undefined, seed);
     }
   };
 
@@ -673,6 +679,21 @@ export function CreateServerModal({
                       </span>
                     </div>
                   )}
+                </div>
+
+                {/* Semente do Mundo */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Semente do Mundo (opcional)</label>
+                  <input
+                    type="text"
+                    placeholder="Deixe em branco para uma semente aleatória"
+                    value={serverSeed}
+                    onChange={(e) => setServerSeed(e.target.value)}
+                    className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm font-mono text-theme-primary bg-transparent"
+                  />
+                  <p className="text-[10px] text-theme-secondary">
+                    Só pode ser definida agora — o mundo é gerado no primeiro início do servidor e a semente não pode mais ser trocada depois.
+                  </p>
                 </div>
 
                 {/* Botões */}

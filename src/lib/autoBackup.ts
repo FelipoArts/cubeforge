@@ -28,10 +28,6 @@ export interface AutoBackupOptions {
   retentionCount: number;
 }
 
-// Intervalo do "backup de segurança" para sessões longas que nunca são
-// paradas manualmente — constante fixa por ora, não exposta na UI.
-export const SAFETY_NET_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
-
 const REASON_LABELS: Record<AutoBackupReason, string> = {
   stop: "servidor parado",
   crash: "crash do servidor",

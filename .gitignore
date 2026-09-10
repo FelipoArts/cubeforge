@@ -61,6 +61,8 @@ network_session.json
 
 # Cloudflare (Wrangler)
 .wrangler/
+.dev.vars
+.dev.vars.*
 .vercel
 
 # TypeScript

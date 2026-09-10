@@ -512,6 +512,7 @@ export function GuestView({
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {knownServers.map((server, index) => {
             const stale = isServerStale(server);
+            const isThisConnected = connectedShortCode === server.shortCode;
             return (
             <motion.div
               key={server.shortCode}
@@ -519,10 +520,10 @@ export function GuestView({
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: index * 0.05 }}
               className={cn(
-                "bg-theme-card rounded-[2rem] border shadow-theme-card overflow-hidden transition-all duration-300 hover:shadow-lg",
-                connectedShortCode === server.shortCode
-                  ? "border-emerald-400 dark:border-emerald-600 ring-2 ring-emerald-400/30"
-                  : "border-theme-card hover:border-indigo-200 dark:hover:border-indigo-800"
+                "rounded-[2rem] border shadow-theme-card overflow-hidden transition-all duration-300 hover:shadow-lg",
+                isThisConnected
+                  ? "bg-emerald-50/70 dark:bg-emerald-950/20 border-emerald-400 dark:border-emerald-600 ring-2 ring-emerald-400/30"
+                  : "bg-theme-card border-theme-card hover:border-indigo-200 dark:hover:border-indigo-800"
               )}
             >
               {/* Topo do card */}
@@ -602,46 +603,82 @@ export function GuestView({
                   </span>
                 </div>
 
-                {/* Endereço de conexão: o app tuneliza a porta local para o servidor via
-                    mesh, então o endereço que o convidado usa no Minecraft é sempre este
-                    localhost — só passa a rotear de fato depois de clicar em "Conectar". */}
-                <div className="flex items-center gap-2 bg-theme-muted rounded-xl px-3 py-2 border border-theme-card">
-                  <Globe className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
-                  <span className="font-mono font-bold text-theme-primary text-xs flex-1 truncate">
-                    localhost:{minecraftPort}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
-                    className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
-                    title="Copiar endereço de conexão"
-                  >
-                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
+                {isThisConnected ? (
+                  // Conectado: em vez de uma div separada abaixo da lista, as informações
+                  // de conexão ficam centralizadas dentro do próprio card (que já mudou
+                  // de cor para indicar o estado), junto do progresso de preparo do launcher.
+                  <div className="flex flex-col items-center text-center gap-2.5 py-1">
+                    <div className="w-11 h-11 bg-emerald-100 dark:bg-emerald-900/40 rounded-2xl flex items-center justify-center">
+                      <Zap className="w-5 h-5 text-emerald-600 fill-current" />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold text-emerald-700 dark:text-emerald-300">
+                        {isOnline ? "Conectado" : "Conectando..."}
+                      </h4>
+                      <p className="text-[11px] text-theme-secondary mt-0.5 leading-relaxed">
+                        Conecte-se em{" "}
+                        <strong className="text-theme-primary font-mono">localhost:{minecraftPort}</strong>{" "}
+                        no seu Minecraft
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
+                      className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer"
+                    >
+                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied ? "Copiado!" : "Copiar endereço"}
+                    </button>
 
-                {/* Status do fluxo "Jogar" (instalar loader se preciso + abrir o launcher) */}
-                {connectedShortCode === server.shortCode && launcherMessage[server.shortCode] && (
-                  <div className="space-y-1">
-                    <p className="text-[10px] text-theme-secondary leading-relaxed">
-                      {launcherMessage[server.shortCode]}
-                    </p>
-                    {(launcherProgress[server.shortCode] ?? 100) < 100 && (
-                      <div className="h-1 bg-theme-muted rounded-full overflow-hidden">
-                        <motion.div
-                          className="h-full bg-indigo-500"
-                          animate={{ width: `${launcherProgress[server.shortCode] ?? 0}%` }}
-                          transition={{ duration: 0.3 }}
-                        />
+                    {launcherMessage[server.shortCode] && (
+                      <div className="w-full space-y-1">
+                        <p className="text-[10px] text-theme-secondary leading-relaxed">
+                          {launcherMessage[server.shortCode]}
+                        </p>
+                        {(launcherProgress[server.shortCode] ?? 100) < 100 && (
+                          <div className="h-1 bg-theme-muted rounded-full overflow-hidden">
+                            <motion.div
+                              className="h-full bg-indigo-500"
+                              animate={{ width: `${launcherProgress[server.shortCode] ?? 0}%` }}
+                              transition={{ duration: 0.3 }}
+                            />
+                          </div>
+                        )}
                       </div>
                     )}
+                  </div>
+                ) : (
+                  // Endereço de conexão: o app tuneliza a porta local para o servidor via
+                  // mesh, então o endereço que o convidado usa no Minecraft é sempre este
+                  // localhost — só passa a rotear de fato depois de clicar em "Conectar".
+                  <div className="flex items-center gap-2 bg-theme-muted rounded-xl px-3 py-2 border border-theme-card">
+                    <Globe className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                    <span className="font-mono font-bold text-theme-primary text-xs flex-1 truncate">
+                      localhost:{minecraftPort}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
+                      className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
+                      title="Copiar endereço de conexão"
+                    >
+                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
                   </div>
                 )}
               </div>
 
               {/* Ações do card */}
               <div className="px-5 pb-5 pt-0 flex items-center gap-2">
-                {stale && connectedShortCode !== server.shortCode ? (
+                {isThisConnected ? (
+                  <button
+                    type="button"
+                    onClick={() => handleDisconnect()}
+                    className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
+                  >
+                    <X className="w-3.5 h-3.5" /> Desconectar
+                  </button>
+                ) : stale ? (
                   // Não conseguimos confirmar o status recentemente com a API Central —
                   // melhor não afirmar "Online" nem "Offline" (nenhuma das duas seria confiável)
                   // e impedir uma tentativa de conexão baseada em dado potencialmente obsoleto.
@@ -656,14 +693,6 @@ export function GuestView({
                       <Zap className="w-3 h-3 text-indigo-400" />
                       Online
                     </div>
-                  ) : connectedShortCode === server.shortCode ? (
-                    <button
-                      type="button"
-                      onClick={() => handleDisconnect()}
-                      className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
-                    >
-                      <X className="w-3.5 h-3.5" /> Desconectar
-                    </button>
                   ) : PLAYABLE_SERVER_TYPES.has(server.serverType) ? (
                     // Um clique conecta e já prepara + abre o Minecraft com o perfil certo
                     // selecionado (ver useEffect que dispara handleOpenLauncher assim que o
@@ -675,7 +704,7 @@ export function GuestView({
                       disabled={isConnecting}
                       className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
                     >
-                      <Play className="w-3.5 h-3.5 fill-current" /> Jogar
+                      <Play className="w-3.5 h-3.5 fill-current" /> Conectar
                     </button>
                   ) : (
                     <button
@@ -724,66 +753,6 @@ export function GuestView({
           })}
         </div>
       )}
-
-      {/* Modal de conexão ativa */}
-      <AnimatePresence>
-        {isOnline && connectedShortCode && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            className="p-6 bg-theme-success border border-emerald-200 dark:border-emerald-800/30 rounded-[2rem] space-y-4"
-          >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-emerald-100 dark:bg-emerald-900/30 rounded-xl flex items-center justify-center">
-                  <Zap className="w-5 h-5 text-emerald-600 fill-current" />
-                </div>
-                <div>
-                  <h4 className="font-bold text-theme-primary">Conectado</h4>
-                  <p className="text-xs text-theme-secondary">
-                    {knownServers.find(s => s.shortCode === connectedShortCode)?.name || "Servidor"}
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={handleDisconnect}
-                className="h-10 px-5 bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 rounded-xl hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-all text-xs font-bold flex items-center gap-2 cursor-pointer"
-              >
-                <X className="w-3.5 h-3.5" /> Desconectar
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="bg-theme-muted p-3 rounded-xl border border-theme-card">
-                <p className="text-[10px] font-bold text-theme-secondary uppercase tracking-wider">Endereço Local</p>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="font-mono font-bold text-theme-primary text-sm">localhost:{minecraftPort}</span>
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
-                    className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 transition-colors cursor-pointer"
-                  >
-                    {copied ? "Copiado!" : "Copiar"}
-                  </button>
-                </div>
-              </div>
-              <div className="bg-theme-muted p-3 rounded-xl border border-theme-card">
-                <p className="text-[10px] font-bold text-theme-secondary uppercase tracking-wider">Status da Rede</p>
-                <div className="flex items-center gap-1.5 mt-1">
-                  <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-                  <span className="text-sm font-bold text-emerald-600">Online</span>
-                </div>
-              </div>
-            </div>
-
-            <p className="text-xs text-theme-secondary leading-relaxed bg-theme-muted p-3 rounded-xl">
-              Conecte-se em <strong className="text-theme-primary">localhost:{minecraftPort}</strong> no seu Minecraft para jogar.
-            </p>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Modal de Adicionar Servidor */}
       <AnimatePresence>

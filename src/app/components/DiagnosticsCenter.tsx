@@ -75,7 +75,14 @@ export function DiagnosticsToasts() {
             >
               <Icon className={cn("w-5 h-5 flex-shrink-0 mt-0.5", style.text)} />
               <div className="flex-1 min-w-0">
-                <p className={cn("text-sm font-bold", style.text)}>{entry.title}</p>
+                <p className={cn("text-sm font-bold flex items-center gap-1.5", style.text)}>
+                  {entry.title}
+                  {entry.count > 1 && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-theme-muted text-theme-secondary">
+                      ×{entry.count}
+                    </span>
+                  )}
+                </p>
                 <p className="text-xs text-theme-secondary mt-0.5 break-words">{entry.message}</p>
               </div>
               <button
@@ -178,6 +185,9 @@ export function DiagnosticsBell() {
                         <div className="flex items-center gap-2">
                           <span className={cn("text-xs font-bold", style.text)}>{entry.title}</span>
                           <span className="text-[10px] text-theme-muted">{LEVEL_LABELS[entry.level]}</span>
+                          {entry.count > 1 && (
+                            <span className="text-[10px] text-theme-muted">×{entry.count}</span>
+                          )}
                         </div>
                         <p className="text-xs text-theme-secondary mt-0.5 break-words">{entry.message}</p>
                         {entry.detail && (

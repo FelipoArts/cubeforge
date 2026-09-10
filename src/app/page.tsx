@@ -5,6 +5,7 @@ import { AnimatePresence } from "framer-motion";
 import {
   Globe,
   Monitor,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
@@ -19,7 +20,7 @@ import {
   type ServerInstallProgress,
 } from "@/lib/server";
 import { useTheme } from "next-themes";
-import { ThemeToggle } from "@/app/components/ThemeToggle";
+import { AppSettingsPanel } from "@/app/components/AppSettingsPanel";
 import { DiagnosticsToasts, DiagnosticsBell } from "@/app/components/DiagnosticsCenter";
 import { pushDiagnostic } from "@/app/diagnostics";
 import { UpdateBanner } from "@/app/components/UpdateBanner";
@@ -27,7 +28,7 @@ import { useUpdaterStore } from "@/app/updater";
 import { analyzeCrashText } from "@/lib/crashAnalyzer";
 import { createLagMonitor } from "@/lib/lagDetector";
 import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
-import { maybeBackupWorld, SAFETY_NET_INTERVAL_MS } from "@/lib/autoBackup";
+import { maybeBackupWorld } from "@/lib/autoBackup";
 
 // Componentes extraídos
 import { HostView } from "@/app/components/host/HostView";
@@ -72,6 +73,8 @@ export default function Home() {
     setMinecraftPort,
     selectedServer,
     setSelectedServer,
+    mode,
+    setMode,
     serverStatus,
     setServerStatus,
     setLastCrashInfo,
@@ -80,12 +83,12 @@ export default function Home() {
   } = useAppStore();
 
   // --- Estados locais (compartilhados entre Host e Guest) ---
-  const [mode, setMode] = useState<"host" | "guest">("host");
   const [netStatus, setNetStatus] = useState<"offline" | "connecting" | "online">("offline");
+  // De quem é a conexão de rede ativa (só existe uma por instalação — ver
+  // active_network_mode no Rust). Sem isso, a aba Host não tinha como saber
+  // que um netStatus "online" era, na verdade, a conexão do Convidado.
+  const [netMode, setNetMode] = useState<"host" | "guest" | null>(null);
   const [netIp, setNetIp] = useState<string | null>(null);
-  // Status unificado: recalcula sempre que mesh ou MC mudam
-  const [meshStatus, setMeshStatus] = useState<"offline" | "connecting" | "online">("offline");
-  const combinedStatus = (meshStatus === "online" && serverStatus === "online") ? "online" : "offline";
   const [isStarting, setIsStarting] = useState(false);
   const [copied, setCopied] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
@@ -156,6 +159,7 @@ export default function Home() {
   const [localServers, setLocalServers] = useState<ServerInfo[]>([]);
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAppSettings, setShowAppSettings] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [configServerDir, setConfigServerDir] = useState<string | null>(null);
   const [serverInstallProgress, setServerInstallProgress] = useState<ServerInstallProgress | null>(null);
@@ -177,32 +181,6 @@ export default function Home() {
     storeSetLocalServers(localServers);
   }, [localServers, storeSetLocalServers]);
 
-  // Status unificado: sempre que mesh ou MC mudarem, recalcula e envia heartbeat
-  // Isso é o CORAÇÃO da lógica de status combinado.
-  // Garante que NÃO IMPORTA qual listener disparou (mesh ou MC),
-  // o heartbeat sempre reflete o estado real combinado.
-  const prevCombinedRef = useRef<string>("offline");
-  useEffect(() => {
-    const shortCode = serverShortCodeRef.current;
-    if (!shortCode) return;
-
-    // Evitar enviar heartbeat repetido se o status combinado não mudou
-    if (combinedStatus === prevCombinedRef.current) return;
-    prevCombinedRef.current = combinedStatus;
-
-    // Fire-and-forget: heartbeat não usa SyncEngine.
-    // Se falhar, o próximo virá em 60s ou na próxima mudança de estado.
-    invoke("sync_send_heartbeat", {
-      shortCode: shortCode,
-      status: combinedStatus,
-      currentPlayers: combinedStatus === "online" ? currentPlayersRef.current : null,
-    }).then(() => {
-      setLogs(prev => [...prev, `[API] Status combinado atualizado: ${combinedStatus}`]);
-    }).catch(() => {
-      // Fire-and-forget: falha é esperada, próximo heartbeat tentará de novo
-    });
-  }, [combinedStatus]);
-
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
   const localServersRef = useRef<ServerInfo[]>([]);
@@ -215,13 +193,9 @@ export default function Home() {
   // causa real do crash for outra coisa que só parece o mesmo sintoma.
   const jreAutoFixAttemptedRef = useRef<Set<string>>(new Set());
   const serverShortCodeRef = useRef<string>("");
-  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // shortCode do último servidor efetivamente registrado na API Central nesta sessão.
   // Evita re-registrar (e re-logar) o mesmo servidor repetidamente.
   const registeredShortCodeRef = useRef<string | null>(null);
-  // Contagem de jogadores online, derivada das linhas de log do Minecraft
-  // ("X joined/left the game"). Zerada sempre que o servidor sai do estado "online".
-  const currentPlayersRef = useRef(0);
   // Detector de lag baseado em regras (ver src/lib/lagDetector.ts) — mantém uma
   // janela deslizante de ocorrências de "Can't keep up!"/Watchdog no stream de
   // log. Resetado a cada novo start para não arrastar contagem de uma sessão anterior.
@@ -260,13 +234,18 @@ export default function Home() {
   // via 404 mesmo com o host e a mesh online. Por isso agora essa função também é
   // chamada por um efeito reativo (abaixo) sempre que o servidor selecionado muda
   // com a mesh já online.
-  const registerServerWithCentral = (serverInfo: ServerInfo) => {
-    if (!serverInfo.shortCode) return;
+  // Retorna a Promise do invoke pra quem precisa ESPERAR o registro terminar
+  // antes de seguir (ex: HostView precisa que o ServerEntity já exista na API
+  // Central antes de pedir uma ConnectionSession pra esse shortCode — senão
+  // toma SERVER_NOT_FOUND). Quando já registrado nesta sessão (guard abaixo),
+  // resolve imediatamente (await em non-Promise é um no-op).
+  const registerServerWithCentral = (serverInfo: ServerInfo): Promise<void> => {
+    if (!serverInfo.shortCode) return Promise.resolve();
     const metaShortCode = serverInfo.shortCode;
     serverShortCodeRef.current = metaShortCode;
     setShortCode(metaShortCode);
 
-    if (registeredShortCodeRef.current === metaShortCode) return;
+    if (registeredShortCodeRef.current === metaShortCode) return Promise.resolve();
     registeredShortCodeRef.current = metaShortCode;
 
     setLogs(prev => [...prev, `[INFO] Código do servidor: CF-${metaShortCode}`]);
@@ -279,7 +258,7 @@ export default function Home() {
       type === "fabric" ? "Fabric" :
       type === "paper" ? "Paper" :
       type;
-    invoke("sync_register_server", {
+    return invoke("sync_register_server", {
       name: serverInfo.name,
       version: serverInfo.version || "1.20.1",
       serverType: type,
@@ -313,52 +292,11 @@ export default function Home() {
     if (serverInfo) registerServerWithCentral(serverInfo);
   }, [selectedServer, netStatus]);
 
-  // --- Heartbeat periódico para manter servidor "vivo" na API Central ---
-  // A API Central tem um heartbeat timeout de 300s (5 min).
-  // Enviamos heartbeats a cada 60s para garantir que o servidor não seja
-  // marcado como offline por inatividade.
-  //
-  // Este useEffect monitora TANTO serverStatus quanto shortCode.
-  // Se o shortCode for definido DEPOIS que o servidor já está online
-  // (ex: rede mesh demorou para conectar), o heartbeat ainda assim inicia.
-  useEffect(() => {
-    // Limpar intervalo anterior se existir
-    if (heartbeatIntervalRef.current) {
-      clearInterval(heartbeatIntervalRef.current);
-      heartbeatIntervalRef.current = null;
-    }
-
-    // Só iniciar heartbeat se o status COMBINADO (mesh + MC) estiver online e tiver shortCode.
-    // Antes este efeito considerava apenas serverStatus (MC), ignorando o mesh: se o mesh
-    // caísse com o MC ainda rodando, este intervalo continuava reenviando "online" a cada
-    // 60s e sobrescrevia o "offline" correto enviado pelo efeito do combinedStatus acima.
-    const currentShortCode = serverShortCodeRef.current;
-    if (combinedStatus === "online" && currentShortCode) {
-      setLogs(prev => [...prev, `[INFO] ❤️ Iniciando heartbeat (a cada 60s) para CF-${currentShortCode}...`]);
-
-      heartbeatIntervalRef.current = setInterval(() => {
-        const sc = serverShortCodeRef.current;
-        // Reavalia o status combinado no momento do tick, não apenas o MC.
-        const stillCombinedOnline = netStatusRef.current === "online" && serverStatusRef.current === "online";
-        if (sc && stillCombinedOnline) {
-          invoke("sync_send_heartbeat", {
-            shortCode: sc,
-            status: "online",
-            currentPlayers: currentPlayersRef.current,
-          }).catch((err: any) => {
-            console.warn("[Heartbeat] Falha ao enviar heartbeat:", err);
-          });
-        }
-      }, 60_000); // 60 segundos
-    }
-
-    return () => {
-      if (heartbeatIntervalRef.current) {
-        clearInterval(heartbeatIntervalRef.current);
-        heartbeatIntervalRef.current = null;
-      }
-    };
-  }, [combinedStatus, shortCode, setLogs]);
+  // O heartbeat periódico que existia aqui foi removido: mantinha uma
+  // SessionEntity legada viva via timer no JS, em paralelo com o ciclo de
+  // vida real da ConnectionSession, que agora é conduzido pelo Rust (heartbeat
+  // automático a cada 60s enquanto a sessão estiver Online/Degraded — ver
+  // start_network_node em lib.rs).
 
   // Inicia o processo Java para um servidor: resolve (e instala se preciso) a JRE
   // correta para a versão do MC, lê a RAM configurada em cubicase-meta.json, e invoca
@@ -398,7 +336,10 @@ export default function Home() {
         serverDir: serverInfo.path,
         javaPath,
         ramGb: ram,
-        localPort: minecraftPort,
+        // A porta do Java precisa ser a real (server-port do server.properties),
+        // não a "Porta Local de Convidado" global (essa é só para quando este
+        // app entra como convidado em outro servidor) — ver mesmo ajuste em HostView.
+        localPort: serverConfigPortRef.current,
         serverJarName: serverInfo.serverJar || null,
         launchArgsDir: serverInfo.launchArgsDir || null,
       });
@@ -423,10 +364,8 @@ export default function Home() {
       const { listen } = await import("@tauri-apps/api/event");
 
       unlistenStatus = await listen<{ status: string; ip: string | null }>("network-status", (event) => {
-        // Sincronizar meshStatus sempre que netStatus mudar
         const newNetStatus = event.payload.status === "online" ? "online" : "offline";
         setNetStatus(newNetStatus);
-        setMeshStatus(newNetStatus);
 
         if (event.payload.status === "online") {
           setNetIp(event.payload.ip);
@@ -434,7 +373,6 @@ export default function Home() {
 
           const currentSelectedServer = selectedServerRef.current;
           const currentLocalServers = localServersRef.current;
-          const currentServerConfigPort = serverConfigPortRef.current;
 
           if (currentSelectedServer) {
             const serverInfo = currentLocalServers.find(s => s.name === currentSelectedServer);
@@ -460,22 +398,10 @@ export default function Home() {
           }
         } else {
           setNetStatus("offline");
-          setMeshStatus("offline");
+          setNetMode(null);
           setNetIp(null);
           setIsStarting(false);
           pendingMcStartRef.current = false;
-
-          // Rede mesh caiu → atualizar status combinado para a API
-          const currentShortCode = serverShortCodeRef.current;
-          const currentMcStatus = serverStatusRef.current;
-          if (currentShortCode) {
-            // Se mesh caiu, status efetivo é "offline" (mesmo se MC estiver rodando)
-            invoke("sync_send_heartbeat", {
-              shortCode: currentShortCode,
-              status: "offline",
-              currentPlayers: null,
-            }).catch(() => {});
-          }
         }
       });
 
@@ -581,13 +507,11 @@ export default function Home() {
       unlistenMcStatus = await listen<string>("minecraft-status-changed", (event) => {
         const status = event.payload as ServerStatus;
         setServerStatus(status);
-        // O heartbeat é enviado automaticamente pelo useEffect do combinedStatus
-        // NÃO precisa enviar manualmente aqui.
 
-        // Fora do estado "online" não há jogadores conectados: zera a contagem
-        // para não reportar um número desatualizado na próxima vez que ficar online.
+        // Fora do estado "online" não há jogadores conectados: zera a lista
+        // para não reportar jogadores desatualizados na próxima vez que ficar online.
         if (status !== "online") {
-          currentPlayersRef.current = 0;
+          useAppStore.getState().setOnlinePlayers([]);
         }
 
         // Novo start: zera a janela do detector de lag e do monitor de
@@ -626,12 +550,17 @@ export default function Home() {
 
       unlistenMcLogs = await listen<string>("minecraft-log", (event) => {
         const line = event.payload.trim();
-        // Não há RCON/consulta de estado disponível — a contagem de jogadores é
-        // derivada das mensagens padrão do servidor vanilla ("X joined/left the game").
-        if (/ joined the game$/.test(line)) {
-          currentPlayersRef.current += 1;
-        } else if (/ left the game$/.test(line)) {
-          currentPlayersRef.current = Math.max(0, currentPlayersRef.current - 1);
+        // Não há RCON/consulta de estado disponível — a lista de jogadores online
+        // (exibida no painel de Jogadores) é derivada das mensagens padrão do
+        // servidor vanilla ("X joined/left the game"). O nome é sempre a última
+        // palavra antes desse sufixo, independente do prefixo de timestamp/thread
+        // (que varia entre vanilla/Forge/Fabric/Paper).
+        const joinedMatch = /(\S+) joined the game$/.exec(line);
+        const leftMatch = /(\S+) left the game$/.exec(line);
+        if (joinedMatch) {
+          useAppStore.getState().addOnlinePlayer(joinedMatch[1]);
+        } else if (leftMatch) {
+          useAppStore.getState().removeOnlinePlayer(leftMatch[1]);
         }
 
         // Detecção de lag/trava baseada em regras sobre o próprio aviso do
@@ -668,7 +597,8 @@ export default function Home() {
         // "Backup de segurança": reaproveita este tick de ~15s como relógio
         // pra sessões longas que nunca são paradas manualmente (ver
         // src/lib/autoBackup.ts) — sem precisar de um novo timer.
-        if (Date.now() - lastAutoBackupAtRef.current >= SAFETY_NET_INTERVAL_MS) {
+        const safetyNetIntervalMs = useAppStore.getState().backupSafetyNetIntervalHours * 60 * 60 * 1000;
+        if (Date.now() - lastAutoBackupAtRef.current >= safetyNetIntervalMs) {
           lastAutoBackupAtRef.current = Date.now();
           const runningServerName = useAppStore.getState().runningServer;
           const serverInfo = runningServerName
@@ -684,12 +614,12 @@ export default function Home() {
       // Restaurar estado real APÓS os listeners estarem registrados.
       // Se chamássemos antes, os listeners sobrescreveriam o estado.
       try {
-        const status = await invoke<{ minecraftStatus: string; netStatus: string; ip: string | null }>("get_system_status");
+        const status = await invoke<{ minecraftStatus: string; netStatus: string; netMode: "host" | "guest" | null; ip: string | null }>("get_system_status");
         console.log("[Restore] Estado do sistema após recarga:", status);
 
         if (status.netStatus === "online") {
           setNetStatus("online");
-          setMeshStatus("online");
+          setNetMode(status.netMode ?? null);
           setNetIp(status.ip || null);
         }
         if (status.minecraftStatus === "online") {
@@ -698,6 +628,9 @@ export default function Home() {
         } else if (status.minecraftStatus === "crashed") {
           setServerStatus("crashed");
           appendMcLogToRunningServer("[Cubicase] ❌ Servidor Minecraft estava CRASHADO (detectado após recarga).");
+        } else if (status.minecraftStatus === "starting") {
+          setServerStatus("starting");
+          appendMcLogToRunningServer("[Cubicase] ⏳ Servidor Minecraft ainda está inicializando (detectado após recarga).");
         }
       } catch (err) {
         console.warn("[Restore] Erro ao verificar estado do sistema:", err);
@@ -715,17 +648,39 @@ export default function Home() {
     };
   }, [setServerStatus, setLastCrashInfo, minecraftPort]);
 
+  // Login opcional (Supabase) — registra o listener do deep link de volta
+  // do fluxo de login uma única vez. Ver src/lib/auth.ts.
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      const { initAuthListener } = await import("@/lib/auth");
+      const unlisten = await initAuthListener();
+      if (cancelled) unlisten();
+      else cleanup = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, []);
+
   // --- Guest Handlers ---
   const handleGuestConnect = async (inviteCode: string) => {
     setLogs([]);
     setDiscoveredServer(null);
     setNetStatus("connecting");
+    setNetMode("guest");
     setLogs(prev => [...prev, `[INFO] Conectando ao código ${inviteCode}...`]);
 
     let discoveredName: string | null = null;
+    const shortCodeClean = inviteCode.replace("CF-", "");
 
+    // A descoberta agora é obrigatória: é dela que vem o IP de malha real do
+    // host (session.hostIp) — sem isso não tem pra onde discar. O código de
+    // convite sozinho (CF-XXXXXX) só carrega o shortCode, nunca um IP.
+    let hostIp: string | null = null;
     try {
-      const shortCodeClean = inviteCode.replace("CF-", "");
       const response = await fetch(`https://cubeforge-api.cubeforge.workers.dev/api/v1/servers/${shortCodeClean}`);
       if (response.ok) {
         // Envelope da API Central: metadados em data.server, status em data.session.
@@ -740,20 +695,34 @@ export default function Home() {
           description: server.description,
         });
         discoveredName = server.name ?? null;
-      } else {
-        setLogs(prev => [...prev, `[INFO] API Central indisponível. Conectando diretamente...`]);
+        hostIp = session.hostIp ?? null;
       }
     } catch {
-      setLogs(prev => [...prev, `[INFO] API Central indisponível. Conectando diretamente...`]);
+      // tratado abaixo pelo `!hostIp`
+    }
+
+    if (!hostIp) {
+      setNetStatus("offline");
+      setNetMode(null);
+      setLogs(prev => [...prev, `[ERR] Não foi possível encontrar esse servidor online. Confira o código ou peça para o host verificar se a rede mesh dele está ativa.`]);
+      pushDiagnostic({
+        level: "error",
+        source: "Rede",
+        title: "Servidor não encontrado",
+        message: "A API Central não retornou um endereço de rede para esse código — o host provavelmente não está com a rede mesh online agora.",
+      });
+      return;
     }
 
     try {
       await invoke("start_network_node", {
         mode: "guest",
-        targetIp: inviteCode,
+        shortCode: shortCodeClean,
+        targetIp: hostIp,
         localPort: minecraftPort,
       });
       setNetStatus("online");
+      setNetMode("guest");
       setLogs(prev => [...prev, `[INFO] ✅ Túnel estabelecido! Conecte-se em localhost:${minecraftPort}`]);
 
       // Adiciona (ou atualiza) automaticamente o servidor na lista "Multiplayer"
@@ -778,6 +747,7 @@ export default function Home() {
     } catch (err) {
       console.error(err);
       setNetStatus("offline");
+      setNetMode(null);
       setLogs(prev => [...prev, `[ERR] Falha ao conectar: ${err}`]);
       pushDiagnostic({
         level: "error",
@@ -792,6 +762,7 @@ export default function Home() {
     try {
       await invoke("stop_network_node");
       setNetStatus("offline");
+      setNetMode(null);
       setNetIp(null);
       setDiscoveredServer(null);
       setLogs(prev => [...prev, `[INFO] Conexão encerrada.`]);
@@ -847,16 +818,26 @@ export default function Home() {
             </div>
 
             <DiagnosticsBell />
-            <ThemeToggle />
+            <button
+              type="button"
+              onClick={() => setShowAppSettings(true)}
+              title="Configurações"
+              className="w-9 h-9 flex items-center justify-center rounded-xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors cursor-pointer"
+            >
+              <SettingsIcon className="w-4.5 h-4.5" />
+            </button>
           </div>
         </div>
       </header>
+
+      <AppSettingsPanel isOpen={showAppSettings} onClose={() => setShowAppSettings(false)} />
 
       {/* Conteúdo Principal */}
       <main className="max-w-7xl mx-auto px-6 py-8">
         {mode === "host" ? (
           <HostView
             netStatus={netStatus}
+            netMode={netMode}
             netIp={netIp}
             isStarting={isStarting}
             downloadProgress={downloadProgress}
@@ -876,6 +857,7 @@ export default function Home() {
             shortCode={shortCode}
             resourceSample={resourceSample}
             onSetNetStatus={setNetStatus}
+            onSetNetMode={setNetMode}
             onSetNetIp={setNetIp}
             onSetIsStarting={setIsStarting}
             onSetDownloadProgress={setDownloadProgress}
@@ -893,6 +875,7 @@ export default function Home() {
             onSetServerConfigPort={setServerConfigPort}
             onSetCopied={setCopied}
             onSetShortCode={setShortCode}
+            onRegisterServer={registerServerWithCentral}
           />
         ) : (
           <GuestView

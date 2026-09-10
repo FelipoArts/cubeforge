@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { join, documentDir } from "@tauri-apps/api/path";
-import { exists, mkdir, writeTextFile, readDir, readTextFile, remove } from "@tauri-apps/plugin-fs";
+import { exists, mkdir, writeTextFile, readDir, readTextFile, remove, size } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 
 // ============================================================
@@ -333,6 +333,7 @@ export async function installMinecraftServer(
   serverName: string,
   version: string,
   ramGb: number,
+  seed: string | undefined,
   onProgress: (p: ServerInstallProgress) => void
 ): Promise<void> {
   // --- Caminhos ---
@@ -370,7 +371,7 @@ export async function installMinecraftServer(
     // --- Gerar server.properties ---
     onProgress({ status: "Gerando configurações...", percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
-    const properties = generateServerProperties(version, ramGb);
+    const properties = generateServerProperties(version, ramGb, seed);
     await writeTextFile(propertiesPath, properties);
 
     // --- Gerar UUID permanente e short code para o servidor ---
@@ -411,9 +412,14 @@ export async function installMinecraftServer(
 /**
  * Gera o conteúdo do server.properties com configurações adequadas para
  * uso com o Cubicase: offline-mode e porta padrão 25565 local.
+ *
+ * `seed`, quando informada, só tem efeito porque o mundo ainda não existe
+ * neste ponto (a instalação não gera o mundo — ver comentário em
+ * installMinecraftServer). Definir o level-seed depois que o mundo já foi
+ * gerado não faz nada, por isso esse parâmetro só existe no fluxo de criação.
  */
-function generateServerProperties(version: string, _ramGb: number): string {
-  return [
+function generateServerProperties(version: string, _ramGb: number, seed?: string): string {
+  const lines = [
     `# Gerado pelo Cubicase - versao ${version}`,
     `# Nao altere server-port manualmente; o Cubicase gerencia as portas.`,
     `online-mode=false`,
@@ -428,7 +434,11 @@ function generateServerProperties(version: string, _ramGb: number): string {
     `spawn-protection=0`,
     `enforce-whitelist=false`,
     `white-list=false`,
-  ].join("\n") + "\n";
+  ];
+  if (seed && seed.trim()) {
+    lines.push(`level-seed=${seed.trim()}`);
+  }
+  return lines.join("\n") + "\n";
 }
 
 // ============================================================
@@ -585,6 +595,80 @@ async function findForgeArgsDir(serverPath: string): Promise<string | null> {
 }
 
 /**
+ * Detecta como iniciar um servidor Minecraft existente sem depender do nome
+ * do arquivo escolhido por quem o criou. Usada para validar e importar uma
+ * pasta externa qualquer — diferente de `detectForgeJar` (que assume um
+ * Forge/NeoForge recém-instalado por este app), aqui a pasta pode ter vindo
+ * de qualquer launcher/host (Paper oficial, um modpack, um servidor Fabric
+ * baixado manualmente etc.), então nada pode ser assumido sobre nomes.
+ *
+ * Estratégias, em ordem:
+ * 1. Layout moderno Forge/NeoForge (1.17+): não há JAR único, roda via
+ *    `@user_jvm_args.txt @libraries/.../win_args.txt` — já é independente de nome.
+ * 2. Nomes de arquivo conhecidos dos principais loaders/distribuições.
+ * 3. Único .jar "não-instalador" na raiz da pasta.
+ * 4. Múltiplos candidatos sem nome reconhecível: usa o maior arquivo (instaladores
+ *    e bootstraps tendem a ser bem menores que o JAR completo do servidor).
+ */
+export async function detectServerLaunchInfo(
+  serverPath: string
+): Promise<{ mode: "jar"; jarName: string } | { mode: "argfile"; argsDir: string } | null> {
+  // 1. Layout moderno Forge/NeoForge
+  if (await exists(await join(serverPath, "user_jvm_args.txt"))) {
+    const argsDir = await findForgeArgsDir(serverPath);
+    if (argsDir) return { mode: "argfile", argsDir };
+  }
+
+  let entries;
+  try {
+    entries = await readDir(serverPath);
+  } catch {
+    return null;
+  }
+  const jars = entries.filter(e => !e.isDirectory && e.name.toLowerCase().endsWith(".jar"));
+  if (jars.length === 0) return null;
+
+  // 2. Padrões de nome conhecidos (do mais específico ao mais genérico)
+  const knownPatterns: RegExp[] = [
+    /^server\.jar$/i,
+    /-shim\.jar$/i,
+    /-universal\.jar$/i,
+    /^purpur-/i,
+    /^paper-/i,
+    /^spigot-/i,
+    /^craftbukkit/i,
+    /^bukkit-/i,
+    /^fabric-server/i,
+    /^quilt-server/i,
+    /^neoforge-/i,
+    /^forge-/i,
+    /^minecraft_server\./i,
+    /^sponge/i,
+  ];
+  for (const pattern of knownPatterns) {
+    const match = jars.find(j => pattern.test(j.name));
+    if (match) return { mode: "jar", jarName: match.name };
+  }
+
+  // 3. Fallback: sobrando um único .jar que não pareça instalador, usa ele
+  const candidates = jars.filter(j => !/install/i.test(j.name));
+  const pool = candidates.length > 0 ? candidates : jars;
+  if (pool.length === 1) return { mode: "jar", jarName: pool[0].name };
+
+  // 4. Vários candidatos ambíguos: usa o maior arquivo
+  let biggest: { name: string; fileSize: number } | null = null;
+  for (const jarEntry of pool) {
+    try {
+      const fileSize = await size(await join(serverPath, jarEntry.name));
+      if (!biggest || fileSize > biggest.fileSize) biggest = { name: jarEntry.name, fileSize };
+    } catch { /* ignora */ }
+  }
+  if (biggest) return { mode: "jar", jarName: biggest.name };
+
+  return null;
+}
+
+/**
  * Detecta como iniciar o servidor Forge/NeoForge recém-instalado.
  * - Versões modernas (1.17+): não há JAR único, apenas `libraries/.../win_args.txt` + `user_jvm_args.txt`
  * - Versões antigas (≤1.16): procura por shim.jar, universal.jar, ou qualquer forge-*.jar
@@ -684,6 +768,7 @@ export async function installForgeServer(
   forgeVersion: string,
   providerName: 'forge' | 'neoforge',
   ramGb: number,
+  seed: string | undefined,
   onProgress: (p: ServerInstallProgress) => void,
   opts?: { strict?: boolean }
 ): Promise<void> {
@@ -767,7 +852,7 @@ export async function installForgeServer(
     // 6. Gerar server.properties
     onProgress({ status: "Gerando configurações...", percent: 90 });
     const propertiesPath = await join(serverPath, "server.properties");
-    const properties = generateServerProperties(mcVersion, ramGb);
+    const properties = generateServerProperties(mcVersion, ramGb, seed);
     await writeTextFile(propertiesPath, properties);
 
     // 7. Limpar installer.jar
@@ -894,6 +979,7 @@ export async function installFabricServer(
   mcVersion: string,
   loaderVersion: string,
   ramGb: number,
+  seed: string | undefined,
   onProgress: (p: ServerInstallProgress) => void
 ): Promise<void> {
   const docsDir = await documentDir();
@@ -926,7 +1012,7 @@ export async function installFabricServer(
 
     onProgress({ status: "Gerando configurações...", percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
-    await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb));
+    await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb, seed));
 
     const uuid = crypto.randomUUID();
     const shortCode = Array.from({ length: 6 }, () =>
@@ -1048,6 +1134,7 @@ export async function installPaperServer(
   mcVersion: string,
   build: number,
   ramGb: number,
+  seed: string | undefined,
   onProgress: (p: ServerInstallProgress) => void
 ): Promise<void> {
   const docsDir = await documentDir();
@@ -1091,7 +1178,7 @@ export async function installPaperServer(
 
     onProgress({ status: "Gerando configurações...", percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
-    await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb));
+    await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb, seed));
 
     const uuid = crypto.randomUUID();
     const shortCode = Array.from({ length: 6 }, () =>
@@ -1128,13 +1215,12 @@ export async function installPaperServer(
 
 /**
  * Valida se uma pasta contém um servidor Minecraft válido.
- * Verifica a presença de server.jar e server.properties.
+ * Não depende do nome do JAR — usa `detectServerLaunchInfo` para reconhecer
+ * qualquer loader (Vanilla, Paper, Fabric, Forge/NeoForge antigo ou moderno etc.).
  */
 export async function isValidServerFolder(path: string): Promise<boolean> {
   if (!(await exists(path))) return false;
-  const jarPath = await join(path, 'server.jar');
-  if (!(await exists(jarPath))) return false;
-  return true;
+  return (await detectServerLaunchInfo(path)) !== null;
 }
 
 // ============================================================
@@ -1217,18 +1303,22 @@ export async function acceptEula(serverPath: string): Promise<void> {
 /**
  * Importa um servidor Minecraft de uma pasta existente.
  *
- * 1. Valida que a pasta tem server.jar
+ * 1. Detecta como o servidor é iniciado (JAR — de qualquer nome — ou layout
+ *    argfile do Forge/NeoForge moderno), sem assumir "server.jar"
  * 2. Detecta a versão automaticamente (várias estratégias)
  * 3. Detecta o tipo (vanilla, forge, fabric, paper, etc.)
  * 4. Verifica/aceita a EULA automaticamente (se ainda não aceita)
- * 5. Cria/atualiza cubicase-meta.json com UUID e shortCode
+ * 5. Cria/atualiza cubicase-meta.json com UUID, shortCode, serverJar/launchArgsDir
  * 6. Retorna o ServerInfo completo
  */
 export async function importExistingServer(path: string): Promise<ServerInfo> {
-  // Validar
-  if (!(await isValidServerFolder(path))) {
-    throw new Error("A pasta selecionada não contém um servidor Minecraft válido (server.jar não encontrado).");
+  // Validar e descobrir como este servidor é iniciado
+  const launchInfo = await detectServerLaunchInfo(path);
+  if (!launchInfo) {
+    throw new Error("A pasta selecionada não contém um servidor Minecraft válido (nenhum JAR executável ou instalação de Forge/NeoForge foi encontrado).");
   }
+  const serverJar = launchInfo.mode === 'jar' ? launchInfo.jarName : null;
+  const launchArgsDir = launchInfo.mode === 'argfile' ? launchInfo.argsDir : null;
 
   // Extrair nome da pasta
   const name = path.split('\\').pop()?.split('/').pop() || 'Servidor Importado';
@@ -1293,6 +1383,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
     version,
     serverType,
     description,
+    serverJar,
+    launchArgsDir,
     forgeVersion,
     modLoaderVersion,
     createdAt: new Date().toISOString(),
@@ -1312,8 +1404,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
     description,
     schemaVersion: 2,
     eulaAccepted: true,
-    serverJar: null,
-    launchArgsDir: null,
+    serverJar,
+    launchArgsDir,
     forgeVersion,
     modLoaderVersion,
   };
@@ -1327,8 +1419,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
 export async function scanExternalServer(serverPath: string): Promise<ServerInfo | null> {
   if (!(await exists(serverPath))) return null;
 
-  const jarPath = await join(serverPath, "server.jar");
-  if (!(await exists(jarPath))) return null;
+  const launchInfo = await detectServerLaunchInfo(serverPath);
+  if (!launchInfo) return null;
 
   const name = serverPath.split('\\').pop()?.split('/').pop() || 'Servidor';
 
@@ -1339,6 +1431,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
   let serverType = "vanilla";
   let description = "";
   let schemaVersion = 1;
+  let serverJar: string | null = null;
+  let launchArgsDir: string | null = null;
   let forgeVersion: string | null = null;
   let modLoaderVersion: string | null = null;
 
@@ -1354,6 +1448,7 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
           description?: string;
           schemaVersion?: number;
           serverJar?: string;
+          launchArgsDir?: string;
           forgeVersion?: string;
           modLoaderVersion?: string;
         };
@@ -1363,6 +1458,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
         serverType = meta.serverType ?? "vanilla";
         description = meta.description ?? "";
         schemaVersion = meta.schemaVersion ?? 1;
+        serverJar = meta.serverJar ?? null;
+        launchArgsDir = meta.launchArgsDir ?? null;
         forgeVersion = meta.forgeVersion ?? null;
         modLoaderVersion = meta.modLoaderVersion ?? null;
     } catch { /* ignora */ }
@@ -1378,6 +1475,14 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
     serverType = await detectServerType(serverPath);
   }
 
+  // Fallback: metadados antigos (ou de uma importação anterior ao suporte a
+  // qualquer nome de JAR) podem não ter serverJar/launchArgsDir gravados —
+  // reusa a mesma detecção do import para não quebrar o início do servidor.
+  if (!serverJar && !launchArgsDir) {
+    if (launchInfo.mode === 'jar') serverJar = launchInfo.jarName;
+    else launchArgsDir = launchInfo.argsDir;
+  }
+
   // Verificar status do EULA
   const eulaAccepted = await checkEulaAccepted(serverPath);
 
@@ -1391,8 +1496,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
     description,
     schemaVersion,
     eulaAccepted,
-    serverJar: null,
-    launchArgsDir: null,
+    serverJar,
+    launchArgsDir,
     forgeVersion,
     modLoaderVersion,
   };

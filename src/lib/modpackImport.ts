@@ -268,11 +268,12 @@ export async function installModpack(
         parsed.loaderVersion,
         parsed.loader,
         ramGb,
+        undefined,
         subProgress(onProgress, 2, 40),
         { strict: true }
       );
     } else {
-      await installFabricServer(serverName, parsed.mcVersion, parsed.loaderVersion, ramGb, subProgress(onProgress, 2, 40));
+      await installFabricServer(serverName, parsed.mcVersion, parsed.loaderVersion, ramGb, undefined, subProgress(onProgress, 2, 40));
     }
 
     const registry = await readModInstallRegistry(serverPath);

@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Database,
   ChevronDown,
+  Globe,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -59,6 +60,11 @@ import { SettingsModal } from "./SettingsModal";
 
 interface HostViewProps {
   netStatus: "offline" | "connecting" | "online";
+  // Papel de quem é dono da conexão de rede ativa nesta instalação (só existe
+  // UMA por vez — ver active_network_mode no Rust). Sem isso, se a conexão
+  // ativa fosse do modo Convidado, este painel mostrava "Parar Rede Mesh"
+  // como se fosse a rede DELE, quando na verdade era a do convidado.
+  netMode: "host" | "guest" | null;
   netIp: string | null;
   isStarting: boolean;
   downloadProgress: DownloadProgress | null;
@@ -80,6 +86,7 @@ interface HostViewProps {
 
   // Callbacks
   onSetNetStatus: (status: "offline" | "connecting" | "online") => void;
+  onSetNetMode: (mode: "host" | "guest" | null) => void;
   onSetNetIp: (ip: string | null) => void;
   onSetIsStarting: (v: boolean) => void;
   onSetDownloadProgress: (p: DownloadProgress | null) => void;
@@ -97,10 +104,12 @@ interface HostViewProps {
   onSetServerConfigPort: (v: number) => void;
   onSetCopied: (v: boolean) => void;
   onSetShortCode: (v: string) => void;
+  onRegisterServer: (serverInfo: ServerInfo) => Promise<void>;
 }
 
 export function HostView({
   netStatus,
+  netMode,
   netIp,
   isStarting,
   downloadProgress,
@@ -121,6 +130,7 @@ export function HostView({
   resourceSample,
 
   onSetNetStatus,
+  onSetNetMode,
   onSetNetIp,
   onSetIsStarting,
   onSetDownloadProgress,
@@ -138,22 +148,25 @@ export function HostView({
   onSetServerConfigPort,
   onSetCopied,
   onSetShortCode,
+  onRegisterServer,
 }: HostViewProps) {
+  // A conexão de rede ativa (se houver) pertence ao modo Convidado, não a este
+  // painel — mostrar "Parar Rede Mesh" aqui seria afirmar que é a rede DESTE
+  // host, quando na verdade é a do convidado que está de pé.
+  const guestOwnsNetwork = netStatus !== "offline" && netMode === "guest";
+
   // --- Store ---
   const {
     serverDir,
     setServerDir,
     minecraftPort,
     setMinecraftPort,
-    autoBackupEnabled,
-    setAutoBackupEnabled,
-    backupRetentionCount,
-    setBackupRetentionCount,
     selectedServer,
     setSelectedServer,
     setRunningServer,
     serverStatus,
     setServerStatus,
+    onlinePlayers,
     lastCrashInfo,
     importedServerPaths,
     addImportedServerPath,
@@ -285,6 +298,7 @@ export function HostView({
         await invoke("stop_network_node");
         onSetIsStarting(false);
         onSetNetStatus("offline");
+        onSetNetMode(null);
         onSetNetIp(null);
         pendingMcStartRef.current = false;
       } catch (err) {
@@ -300,11 +314,23 @@ export function HostView({
         await invoke("stop_network_node");
         onSetIsStarting(false);
         onSetNetStatus("offline");
+        onSetNetMode(null);
         onSetNetIp(null);
         pendingMcStartRef.current = false;
       } catch (err) {
         console.error(err);
       }
+      return;
+    }
+
+    // A rede mesh agora é sempre atrelada a um servidor específico (é o
+    // shortCode dele que a API central usa pra saber a quem pertence a
+    // credencial do Tailscale) — não dá mais pra "ligar a rede" sem escolher
+    // qual servidor ela vai expor.
+    const currentServerInfo = selectedServer ? localServers.find(s => s.name === selectedServer) : null;
+    if (!currentServerInfo?.shortCode) {
+      onSetLogs(prev => [...prev, "[ERR] Selecione um servidor antes de iniciar a rede mesh."]);
+      pushDiagnostic({ level: "error", source: "Rede", title: "Nenhum servidor selecionado", message: "É preciso escolher (ou criar) um servidor antes de iniciar a rede mesh." });
       return;
     }
 
@@ -321,9 +347,26 @@ export function HostView({
       onSetDownloadProgress(null);
       onSetLogs(prev => [...prev, "[INFO] Java 17 está pronto!"]);
 
+      // Garante que o ServerEntity já existe na API Central ANTES de pedir a
+      // ConnectionSession — senão a API responde SERVER_NOT_FOUND (a
+      // ConnectionSession é sempre amarrada a um servidor já registrado).
+      onSetLogs(prev => [...prev, "[INFO] Registrando servidor na API Central..."]);
+      await onRegisterServer(currentServerInfo);
+
       onSetLogs(prev => [...prev, "[INFO] Autenticando sessão de rede no Cubicase..."]);
       onSetNetStatus("connecting");
-      await invoke("start_network_node", { mode: "host", targetIp: null, localPort: minecraftPort });
+      onSetNetMode("host");
+      await invoke("start_network_node", {
+        mode: "host",
+        shortCode: currentServerInfo.shortCode,
+        targetIp: null,
+        // O túnel mesh precisa apontar pra porta REAL do Minecraft (server-port em
+        // server.properties, editável no modal de configuração do servidor) — não
+        // pra "Porta Local de Convidado" dos Ajustes do Sistema, que é só a porta
+        // local usada quando ESTE app entra como convidado em outro servidor.
+        // Divergir aqui deixa o mesh de pé mas incapaz de alcançar o Java real.
+        localPort: serverConfigPortRef.current,
+      });
 
       if (selectedServer && serverStatus !== "online" && serverStatus !== "starting") {
         pendingMcStartRef.current = true;
@@ -337,6 +380,7 @@ export function HostView({
       console.error(error);
       onSetIsStarting(false);
       onSetNetStatus("offline");
+      onSetNetMode(null);
       onSetDownloadProgress(null);
       pendingMcStartRef.current = false;
       onSetLogs(prev => [...prev, `[ERR] Falha ao iniciar host: ${error}`]);
@@ -401,7 +445,9 @@ export function HostView({
         serverDir: serverInfo.path,
         javaPath: javaPath,
         ramGb: ram,
-        localPort: minecraftPort,
+        // Idem: a porta do processo Java é a configurada no server.properties
+        // deste servidor, não a porta local global de convidado.
+        localPort: serverConfigPortRef.current,
         serverJarName: serverJarName,
         launchArgsDir: launchArgsDir,
       });
@@ -450,7 +496,7 @@ export function HostView({
     setTimeout(() => onSetCopied(false), 2000);
   };
 
-  const handleCreateServer = async (name: string, version: string, ram: number, serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper", extraVersion?: string) => {
+  const handleCreateServer = async (name: string, version: string, ram: number, serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper", extraVersion?: string, seed?: string) => {
     if (localServers.some(s => s.name.toLowerCase() === name.toLowerCase())) {
       pushDiagnostic({ level: "warning", source: "Instalação", title: "Nome já em uso", message: `Já existe um servidor com o nome "${name}". Escolha outro nome.` });
       return;
@@ -458,16 +504,16 @@ export function HostView({
     try {
       if ((serverType === "forge" || serverType === "neoforge") && extraVersion) {
         onSetServerInstallProgress({ status: "Iniciando instalação do Forge...", percent: 5 });
-        await installForgeServer(name, version, extraVersion, serverType, ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+        await installForgeServer(name, version, extraVersion, serverType, ram, seed, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
       } else if (serverType === "fabric" && extraVersion) {
         onSetServerInstallProgress({ status: "Iniciando instalação do Fabric...", percent: 5 });
-        await installFabricServer(name, version, extraVersion, ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+        await installFabricServer(name, version, extraVersion, ram, seed, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
       } else if (serverType === "paper" && extraVersion) {
         onSetServerInstallProgress({ status: "Iniciando instalação do Paper...", percent: 5 });
-        await installPaperServer(name, version, Number(extraVersion), ram, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
+        await installPaperServer(name, version, Number(extraVersion), ram, seed, (p: ServerInstallProgress) => onSetServerInstallProgress(p));
       } else {
         onSetServerInstallProgress({ status: "Iniciando download da Mojang...", percent: 5 });
-        await installMinecraftServer(name, version, ram, (p) => onSetServerInstallProgress(p));
+        await installMinecraftServer(name, version, ram, seed, (p) => onSetServerInstallProgress(p));
       }
       const servers = await listLocalServers();
       onSetLocalServers(servers);
@@ -593,10 +639,8 @@ export function HostView({
     }
   };
 
-  const handleSaveSettings = (port: number, newAutoBackupEnabled: boolean, newBackupRetentionCount: number) => {
+  const handleSaveSettings = (port: number) => {
     setMinecraftPort(port);
-    setAutoBackupEnabled(newAutoBackupEnabled);
-    setBackupRetentionCount(newBackupRetentionCount);
     onSetShowSettings(false);
   };
 
@@ -807,15 +851,20 @@ export function HostView({
               <button
                 type="button"
                 onClick={handleStartNetwork}
-                disabled={isStarting && downloadProgress !== null}
+                disabled={(isStarting && downloadProgress !== null) || guestOwnsNetwork}
+                title={guestOwnsNetwork ? "Esta instalação está conectada como Convidado a outro servidor — pare essa conexão antes de hospedar o seu." : undefined}
                 className={cn(
                   "h-14 px-8 rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 shadow-lg disabled:opacity-50 cursor-pointer",
-                  netStatus !== "offline" || isStarting
-                    ? "bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 shadow-theme-shadow hover:bg-rose-100 dark:hover:bg-rose-900/30"
-                    : "bg-indigo-600 text-white shadow-theme-shadow hover:bg-indigo-700"
+                  guestOwnsNetwork
+                    ? "bg-theme-muted text-theme-secondary shadow-none"
+                    : netStatus !== "offline" || isStarting
+                      ? "bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 shadow-theme-shadow hover:bg-rose-100 dark:hover:bg-rose-900/30"
+                      : "bg-indigo-600 text-white shadow-theme-shadow hover:bg-indigo-700"
                 )}
               >
-                {isStarting || netStatus === "connecting" ? (
+                {guestOwnsNetwork ? (
+                  <><Globe className="w-5 h-5" /> Em uso pelo modo Convidado</>
+                ) : isStarting || netStatus === "connecting" ? (
                   downloadProgress ? (
                     <><Activity className="w-5 h-5 animate-spin" /> Instalando JRE {downloadProgress.percent}%</>
                   ) : (
@@ -848,7 +897,7 @@ export function HostView({
             <div className="grid grid-cols-3 gap-4">
               <div className="bg-theme-muted p-4 rounded-2xl border border-theme-card">
                 <p className="text-[10px] font-bold text-theme-secondary uppercase tracking-wider">Redirecionamento</p>
-                <p className="text-sm font-bold text-theme-primary mt-1">127.0.0.1:{minecraftPort}</p>
+                <p className="text-sm font-bold text-theme-primary mt-1">127.0.0.1:{serverConfigPort}</p>
               </div>
               <div className="bg-theme-muted p-4 rounded-2xl border border-theme-card">
                 <p className="text-[10px] font-bold text-theme-secondary uppercase tracking-wider">Endereço Mesh</p>
@@ -895,7 +944,7 @@ export function HostView({
           {/* Gerenciamento de Mods e Mundo */}
           {selectedServer && serverInfo && (
             <ServerManagePanel
-              key={serverInfo.path}
+              key={`manage-${serverInfo.path}`}
               serverDir={serverInfo.path}
               serverType={serverInfo.serverType}
               serverStatus={serverStatus}
@@ -906,9 +955,10 @@ export function HostView({
           {/* Whitelist, operadores e banimentos */}
           {selectedServer && serverInfo && (
             <PlayersPanel
-              key={serverInfo.path}
+              key={`players-${serverInfo.path}`}
               serverDir={serverInfo.path}
               serverStatus={serverStatus}
+              onlinePlayers={onlinePlayers}
               onSendCommand={handleSendMCCommand}
             />
           )}
@@ -1035,8 +1085,6 @@ export function HostView({
         isOpen={showSettings}
         onClose={() => onSetShowSettings(false)}
         currentPort={minecraftPort || 25565}
-        currentAutoBackupEnabled={autoBackupEnabled}
-        currentBackupRetentionCount={backupRetentionCount}
         onSave={handleSaveSettings}
       />
 

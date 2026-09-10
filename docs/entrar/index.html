@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Entrar — Cubicase</title>
+  <meta name="description" content="Entrar na sua conta Cubicase." />
+  <meta name="robots" content="noindex" />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <link rel="apple-touch-icon" href="/assets/icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <div class="ambient-glow"></div>
+
+  <nav class="nav">
+    <div class="container nav-inner">
+      <a href="/" class="nav-brand">
+        <img src="/assets/logo-dark.png" alt="Cubicase" />
+      </a>
+      <div class="nav-links" data-nav-links>
+        <a href="/#recursos">Recursos</a>
+        <a href="/#como-funciona">Como funciona</a>
+        <a href="https://github.com/FelipoArts/cubeforge" target="_blank" rel="noopener">GitHub</a>
+        <div class="nav-cta">
+          <a class="btn btn-primary" href="/download/">Baixar</a>
+        </div>
+      </div>
+      <button class="nav-toggle" data-nav-toggle aria-label="Abrir menu" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+    </div>
+  </nav>
+
+  <header class="download-hero">
+    <div class="container">
+      <div class="eyebrow"><span class="dot"></span>Conta Cubicase</div>
+      <h1>Entrar</h1>
+      <p class="hero-sub" style="margin: 18px auto 0; text-align: center;">
+        Login é opcional no Cubicase — só é pedido quando você quer usar um
+        recurso pago ou vincular seus servidores a um perfil. Essa página é
+        só a ponte: depois de logar aqui, você volta pro app sozinho.
+      </p>
+
+      <div class="download-card" style="margin-top: 34px;">
+        <div id="login-form">
+          <div class="login-providers">
+            <button type="button" class="btn btn-ghost btn-block" id="btn-google">Continuar com Google</button>
+            <button type="button" class="btn btn-ghost btn-block" id="btn-discord">Continuar com Discord</button>
+          </div>
+
+          <div class="login-divider"><span>ou por e-mail</span></div>
+
+          <form id="magic-link-form">
+            <label for="email" class="login-label">E-mail</label>
+            <input type="email" id="email" required autocomplete="email" placeholder="voce@exemplo.com" class="login-input" />
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top: 14px;">Enviar link mágico</button>
+          </form>
+
+          <p id="login-status" class="login-status" hidden></p>
+        </div>
+
+        <div id="login-success" hidden style="text-align: center;">
+          <p>Login confirmado! Abrindo o Cubicase&hellip;</p>
+          <p class="login-status" style="margin-top: 10px;">
+            Se o app não abrir sozinho em alguns segundos,
+            <a id="manual-link" href="#" style="color: var(--accent);">clique aqui</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <script src="/assets/site.js"></script>
+  <script type="module">
+    // ============================================================
+    // Ponte de login: navegador → Cubicase (app desktop)
+    // ============================================================
+    // Página hospedada porque o login por OAuth/magic link do Supabase
+    // exige uma URL https:// de callback — não dá pra fazer isso direto
+    // dentro do app. Depois de confirmar a sessão aqui, ela é repassada
+    // pro app via deep link (cubicase://auth-callback#access_token=...),
+    // que o Cubicase já sabe escutar (ver src/lib/auth.ts no repo).
+    //
+    // Sessão não é persistida aqui (persistSession: false) de propósito:
+    // essa aba só existe pra fazer a ponte e fecha logo em seguida, não
+    // precisa deixar um login guardado no navegador.
+    // ============================================================
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    // Mesmos valores de src/lib/supabaseClient.ts no app — atualizar os
+    // dois juntos se o projeto Supabase mudar. Publishable key (segura pra
+    // expor no client, protegida pelo RLS) — nunca a secret key aqui.
+    const SUPABASE_URL = "https://rtfxcyvymlxebvemgwaj.supabase.co";
+    const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ggAEPrue0lgmIlXGkv4vUg_Hot7Xe0Y";
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: { persistSession: false, detectSessionInUrl: true },
+    });
+
+    const loginForm = document.getElementById("login-form");
+    const successBox = document.getElementById("login-success");
+    const statusEl = document.getElementById("login-status");
+    const manualLink = document.getElementById("manual-link");
+
+    let handled = false;
+
+    function showStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.hidden = false;
+      statusEl.classList.toggle("is-error", isError);
+    }
+
+    function buildDeepLink(session) {
+      const params = new URLSearchParams({
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        token_type: session.token_type || "bearer",
+      });
+      return `cubicase://auth-callback#${params.toString()}`;
+    }
+
+    function completeLogin(session) {
+      if (handled) return;
+      handled = true;
+      const deepLink = buildDeepLink(session);
+      loginForm.hidden = true;
+      successBox.hidden = false;
+      manualLink.href = deepLink;
+      window.location.href = deepLink;
+    }
+
+    document.getElementById("btn-google").addEventListener("click", () => {
+      supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } });
+    });
+
+    document.getElementById("btn-discord").addEventListener("click", () => {
+      supabase.auth.signInWithOAuth({ provider: "discord", options: { redirectTo: window.location.href } });
+    });
+
+    document.getElementById("magic-link-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const email = document.getElementById("email").value.trim();
+      if (!email) return;
+      const submitBtn = e.target.querySelector("button[type=submit]");
+      submitBtn.disabled = true;
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: window.location.href },
+      });
+      submitBtn.disabled = false;
+      if (error) {
+        showStatus(`Não foi possível enviar o link: ${error.message}`, true);
+      } else {
+        showStatus("Link enviado! Confira seu e-mail (pode levar um minuto).");
+      }
+    });
+
+    // Se a página carregou por causa de um redirect de login (OAuth ou
+    // magic link), o supabase-js já extraiu a sessão da URL sozinho
+    // (detectSessionInUrl acima) — checa os dois jeitos de pegar isso,
+    // porque a ordem entre "sessão já pronta" e "evento disparado" varia.
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) completeLogin(data.session);
+    });
+    supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_IN" && session) completeLogin(session);
+    });
+  </script>
+</body>
+</html>

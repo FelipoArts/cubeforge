@@ -194,7 +194,7 @@ impl SessionManager {
     // Iniciar Sessão (ponto de entrada principal)
     // ============================================================
 
-    pub async fn start(&self, short_code: &str, local_port: u16) -> Result<ConnectionSessionResponse, String> {
+    pub async fn start(&self, short_code: &str, mode: &str, local_port: u16) -> Result<ConnectionSessionResponse, String> {
         // Verificar concorrência
         {
             let state = self.state.lock().unwrap();
@@ -221,7 +221,7 @@ impl SessionManager {
         }
 
         // Chamar API para criar sessão
-        let result = self.api.create_connection_session(short_code).await;
+        let result = self.api.create_connection_session(short_code, mode).await;
 
         match result {
             Ok(session) => {
@@ -392,12 +392,11 @@ impl SessionManager {
     // Enviar Heartbeat
     // ============================================================
 
-    pub async fn send_heartbeat(&self) -> Result<(), String> {
-        let state = self.state.lock().unwrap();
-        let session_id = state.session_id.clone();
-        let status = state.status;
-        let players = 0; // TODO: obter do Minecraft
-        drop(state);
+    pub async fn send_heartbeat(&self, players: u32) -> Result<(), String> {
+        let (session_id, status) = {
+            let state = self.state.lock().unwrap();
+            (state.session_id.clone(), state.status)
+        };
 
         if status != SessionStatus::Online && status != SessionStatus::Degraded {
             return Ok(()); // Só manda heartbeat se estiver ativa

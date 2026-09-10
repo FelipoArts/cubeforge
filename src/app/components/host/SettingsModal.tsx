@@ -8,44 +8,37 @@ import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 // ============================================================
 // SettingsModal
 // ============================================================
-// Modal de configurações globais do sistema.
+// Modal de configurações do servidor de convidado.
 // Permite ajustar a porta local do Minecraft.
 // Com altura máxima e scroll vertical para não ultrapassar viewport.
+// (Backup automático e tema ficam no painel geral — ver AppSettingsPanel.)
 // ============================================================
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentPort: number;
-  currentAutoBackupEnabled: boolean;
-  currentBackupRetentionCount: number;
-  onSave: (port: number, autoBackupEnabled: boolean, backupRetentionCount: number) => void;
+  onSave: (port: number) => void;
 }
 
 export function SettingsModal({
   isOpen,
   onClose,
   currentPort,
-  currentAutoBackupEnabled,
-  currentBackupRetentionCount,
   onSave,
 }: SettingsModalProps) {
   const [port, setPort] = useState(currentPort);
-  const [autoBackupEnabled, setAutoBackupEnabled] = useState(currentAutoBackupEnabled);
-  const [retentionCount, setRetentionCount] = useState(currentBackupRetentionCount);
 
   useLockBodyScroll(isOpen);
 
   useEffect(() => {
     if (isOpen) {
       setPort(currentPort);
-      setAutoBackupEnabled(currentAutoBackupEnabled);
-      setRetentionCount(currentBackupRetentionCount);
     }
-  }, [isOpen, currentPort, currentAutoBackupEnabled, currentBackupRetentionCount]);
+  }, [isOpen, currentPort]);
 
   const handleSave = () => {
-    onSave(port, autoBackupEnabled, retentionCount);
+    onSave(port);
     onClose();
   };
 
@@ -89,7 +82,7 @@ export function SettingsModal({
             <div className="px-8 overflow-y-auto flex-1 custom-scrollbar">
               <div className="space-y-4 pb-4">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Porta Local do Minecraft</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Porta Local de Convidado</label>
                   <input
                     type="number"
                     min="1024"
@@ -99,39 +92,7 @@ export function SettingsModal({
                     className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent"
                   />
                   <p className="text-[10px] text-theme-secondary">
-                    Porta local na qual o seu Minecraft se conectará (padrão 25565).
-                  </p>
-                </div>
-
-                <div className="space-y-1.5 pt-2 border-t border-theme-card">
-                  <label className="flex items-center gap-2.5 cursor-pointer pt-2">
-                    <input
-                      type="checkbox"
-                      checked={autoBackupEnabled}
-                      onChange={(e) => setAutoBackupEnabled(e.target.checked)}
-                      className="w-4.5 h-4.5 rounded-lg text-indigo-600 focus:ring-indigo-500"
-                    />
-                    <span className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Backup automático do mundo</span>
-                  </label>
-                  <p className="text-[10px] text-theme-secondary">
-                    Gera backup sozinho quando o servidor é parado ou crasha, e periodicamente
-                    em sessões longas. Pula sozinho se o mundo não mudou desde o último.
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Manter últimos N backups</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="100"
-                    value={retentionCount}
-                    disabled={!autoBackupEnabled}
-                    onChange={(e) => setRetentionCount(parseInt(e.target.value) || 1)}
-                    className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent disabled:opacity-50"
-                  />
-                  <p className="text-[10px] text-theme-secondary">
-                    Backups mais antigos que isso (automáticos ou manuais) são apagados sozinhos.
+                    Porta local usada apenas quando VOCÊ entra como convidado no servidor de outra pessoa (padrão 25565). Não afeta servidores que você hospeda — a porta desses é definida em "Configurações do Servidor", em cada servidor.
                   </p>
                 </div>
               </div>

@@ -30,7 +30,11 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://api.cubeforge.dev".to_string(),
+            // "api.cubeforge.dev" nunca foi configurado como domínio customizado de
+            // verdade no Cloudflare (só existe o SOA da zona, sem rota pro Worker) —
+            // usar a URL padrão do Workers.dev, que é a que de fato está no ar (a
+            // mesma que lib.rs::API_BASE_URL já usa para o resto da API central).
+            base_url: "https://cubeforge-api.cubeforge.workers.dev".to_string(),
             timeout_seconds: 10,
             retry_count: 3,
             client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -79,6 +83,7 @@ impl std::fmt::Display for ApiError {
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionSessionResponse {
     pub session_id: String,
     pub launcher: String,
@@ -117,11 +122,16 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(config: &ApiConfig) -> Self {
+        // Sem `.http2_prior_knowledge()`: essa flag é só para HTTP/2 em texto
+        // puro (sem TLS) — combinada com uma URL https:// ela pula a
+        // negociação normal via ALPN e a conexão nem chega a se completar
+        // (`error sending request`, mascarando o motivo real). Sem a flag, o
+        // reqwest negocia HTTP/2 via ALPN normalmente quando o servidor
+        // suporta (caso do Cloudflare), com HTTP/1.1 como fallback.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(10)
-            .http2_prior_knowledge() // HTTP/2 se disponível
             .build()
             .expect("Failed to build HTTP client");
 
@@ -265,11 +275,13 @@ impl ApiClient {
         (generate_uuid(), generate_uuid())
     }
 
-    /// Cria uma ConnectionSession. O desktop NÃO envia "provider".
-    /// A API decide qual driver usar.
+    /// Cria uma ConnectionSession. O desktop informa apenas o papel (mode:
+    /// host/guest) — a API decide qual driver/tag usar; as credenciais
+    /// retornadas continuam opacas para quem chama.
     pub async fn create_connection_session(
         &self,
         short_code: &str,
+        mode: &str,
     ) -> Result<ConnectionSessionResponse, ApiError> {
         let (request_id, correlation_id) = self.generate_ids();
 
@@ -281,6 +293,7 @@ impl ApiClient {
                 "correlationId": correlation_id,
                 "installationId": self.config.installation_id,
                 "clientVersion": self.config.client_version,
+                "mode": mode,
             })),
             request_id,
             correlation_id,
@@ -315,11 +328,16 @@ impl ApiClient {
                 Err(e) => {
                     last_error = e;
                     if (attempt as u32) < self.config.retry_count - 1 {
-                        // Jitter: ~900ms, ~2100ms, ~4300ms
-                        let mut rng = rand::thread_rng();
-                        let base_ms = 1000u64 * (1u64 << attempt);
-                        let jitter = rng.gen_range(-100..100);
-                        let delay = (base_ms as i64 + jitter).max(100) as u64;
+                        // Jitter: ~900ms, ~2100ms, ~4300ms. `ThreadRng` não é
+                        // `Send` — precisa ficar fora de escopo antes do
+                        // `.await` abaixo, senão a future inteira deixa de
+                        // ser `Send` (exigido pelo tauri::command).
+                        let delay = {
+                            let mut rng = rand::thread_rng();
+                            let base_ms = 1000u64 * (1u64 << attempt);
+                            let jitter = rng.gen_range(-100..100);
+                            (base_ms as i64 + jitter).max(100) as u64
+                        };
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }

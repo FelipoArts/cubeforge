@@ -108,7 +108,23 @@ func main() {
 		fatalWithCode("config_missing", nil)
 	}
 
+	// Cada sessão vem com um AuthKey novo e de uso único (ver ConnectionSession
+	// na API central) — mas por padrão o tsnet persiste o estado (tailscaled.state)
+	// numa pasta fixa por binário, igual em toda execução. Isso faz uma sessão
+	// nova carregar a identidade/estado da sessão anterior e, ao ver que o
+	// backend não está em NeedsLogin, ignorar o AuthKey atual silenciosamente
+	// (loga "Authkey is set; but state is ...; Ignoring authkey.") — o processo
+	// então fica parado esperando um login interativo que nunca chega. Usar um
+	// diretório de estado novo a cada execução garante que o AuthKey da sessão
+	// atual sempre seja o que autentica.
+	stateDir, err := os.MkdirTemp("", "cubeforge-tsnet-*")
+	if err != nil {
+		fatalWithCode("state_dir_failed", err)
+	}
+	defer os.RemoveAll(stateDir)
+
 	s := &tsnet.Server{
+		Dir:      stateDir,
 		Hostname: cfg.Hostname,
 		AuthKey:  cfg.AuthKey,
 		Logf:     func(format string, args ...any) {}, // Silent for now
@@ -181,6 +197,8 @@ func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config, ln net.Lis
 
 	fmt.Printf("{\"info\": \"Guest listening on localhost:%d -> %s:25565\"}\n", cfg.LocalPort, cfg.TargetIP)
 
+	go startGuestHealthCheck(ctx, s, cfg)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -199,6 +217,59 @@ func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config, ln net.Lis
 			continue
 		}
 		go handleProxy(conn, targetConn)
+	}
+}
+
+// startGuestHealthCheck roda em paralelo ao proxy e verifica periodicamente
+// se o host continua alcançável na malha. Sem isso, se o host cair no meio de
+// uma sessão (dormiu, perdeu rede, fechou o app), o guest só percebia isso
+// quando o TCP do próprio jogo travasse/desse timeout — sem nenhum aviso — e o
+// app continuava mostrando a rede como "online" indefinidamente. Usa o
+// endpoint de health-check que o host já expõe em :25566 (ver
+// startHTTPServer) só para testar a alcançabilidade — não interpreta a
+// resposta.
+func startGuestHealthCheck(ctx context.Context, s *tsnet.Server, cfg Config) {
+	const (
+		checkInterval  = 15 * time.Second
+		checkTimeout   = 5 * time.Second
+		failsToWarn    = 2 // ~30s de instabilidade seguida antes de avisar, pra não disparar em um blip único
+	)
+
+	consecutiveFailures := 0
+	warned := false
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dialCtx, cancel := context.WithTimeout(ctx, checkTimeout)
+			conn, err := s.Dial(dialCtx, "tcp", fmt.Sprintf("%s:25566", cfg.TargetIP))
+			cancel()
+
+			if err != nil {
+				consecutiveFailures++
+				if consecutiveFailures >= failsToWarn && !warned {
+					warned = true
+					if b, mErr := json.Marshal(map[string]string{"warning": "host_unreachable", "detail": err.Error()}); mErr == nil {
+						fmt.Println(string(b))
+					}
+				}
+				continue
+			}
+
+			conn.Close()
+			consecutiveFailures = 0
+			if warned {
+				warned = false
+				if b, mErr := json.Marshal(map[string]string{"recovered": "host_unreachable"}); mErr == nil {
+					fmt.Println(string(b))
+				}
+			}
+		}
 	}
 }
 

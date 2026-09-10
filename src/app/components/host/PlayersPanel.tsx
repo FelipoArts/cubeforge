@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Users, ShieldCheck, Ban, Plus, Trash2, RefreshCw, Loader2, AlertTriangle, Undo2 } from "lucide-react";
+import { Users, ShieldCheck, Ban, Plus, Trash2, RefreshCw, Loader2, AlertTriangle, Undo2, Wifi } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import { pushDiagnostic } from "@/app/diagnostics";
@@ -54,10 +54,11 @@ interface BannedIpEntry {
 interface PlayersPanelProps {
   serverDir: string;
   serverStatus: ServerStatus;
+  onlinePlayers: string[];
   onSendCommand: (command: string) => Promise<void>;
 }
 
-type Tab = "whitelist" | "ops" | "banidos";
+type Tab = "online" | "whitelist" | "ops" | "banidos";
 
 type PendingAction =
   | { kind: "remove-whitelist"; entry: WhitelistEntry }
@@ -69,15 +70,19 @@ function shortUuid(uuid: string): string {
   return uuid.length > 8 ? `${uuid.slice(0, 8)}…` : uuid;
 }
 
-export function PlayersPanel({ serverDir, serverStatus, onSendCommand }: PlayersPanelProps) {
+export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCommand }: PlayersPanelProps) {
   const isOnline = serverStatus === "online";
 
-  const [activeTab, setActiveTab] = useState<Tab>("whitelist");
+  const [activeTab, setActiveTab] = useState<Tab>("online");
 
   const [whitelist, setWhitelist] = useState<WhitelistEntry[]>([]);
   const [ops, setOps] = useState<OpEntry[]>([]);
   const [bannedPlayers, setBannedPlayers] = useState<BannedPlayerEntry[]>([]);
   const [bannedIps, setBannedIps] = useState<BannedIpEntry[]>([]);
+  // O recurso de whitelist é opcional (`white-list` em server.properties) — a aba
+  // só faz sentido mostrar quando ele está de fato habilitado no servidor. `null`
+  // enquanto ainda não sabemos (arquivo lendo/inexistente).
+  const [whitelistEnabled, setWhitelistEnabled] = useState<boolean | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,16 +106,18 @@ export function PlayersPanel({ serverDir, serverStatus, onSendCommand }: Players
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [wl, opList, bp, bi] = await Promise.all([
+      const [wl, opList, bp, bi, props] = await Promise.all([
         invoke<WhitelistEntry[]>("list_whitelist", { serverDir }),
         invoke<OpEntry[]>("list_ops", { serverDir }),
         invoke<BannedPlayerEntry[]>("list_banned_players", { serverDir }),
         invoke<BannedIpEntry[]>("list_banned_ips", { serverDir }),
+        invoke<Record<string, string>>("read_server_properties", { serverDir }),
       ]);
       setWhitelist(wl);
       setOps(opList);
       setBannedPlayers(bp);
       setBannedIps(bi);
+      setWhitelistEnabled(props["white-list"] === "true");
     } catch (err) {
       console.error("Erro ao listar jogadores:", err);
       pushDiagnostic({ level: "warning", source: "Servidor", title: "Não foi possível listar whitelist/ops/banidos", message: String(err) });
@@ -261,11 +268,24 @@ export function PlayersPanel({ serverDir, serverStatus, onSendCommand }: Players
     }
   };
 
+  // A whitelist só aparece como aba quando o recurso está de fato ligado no
+  // server.properties (`white-list=true`) — do contrário a lista existe no
+  // arquivo mas não tem efeito nenhum, e mostrá-la só confunde.
   const tabs: { id: Tab; label: string; icon: typeof Users }[] = [
-    { id: "whitelist", label: "Whitelist", icon: Users },
+    { id: "online", label: "Online", icon: Wifi },
+    ...(whitelistEnabled ? [{ id: "whitelist" as const, label: "Whitelist", icon: Users }] : []),
     { id: "ops", label: "Operadores", icon: ShieldCheck },
     { id: "banidos", label: "Banidos", icon: Ban },
   ];
+
+  // Se a whitelist estava selecionada e o recurso foi desativado (ou ainda nem
+  // carregou), volta para uma aba que sempre existe, para não travar numa
+  // aba escondida.
+  useEffect(() => {
+    if (activeTab === "whitelist" && !whitelistEnabled) {
+      setActiveTab("online");
+    }
+  }, [activeTab, whitelistEnabled]);
 
   return (
     <div className="bg-theme-card p-8 rounded-[2rem] border-theme-card shadow-theme-card space-y-6">
@@ -318,6 +338,25 @@ export function PlayersPanel({ serverDir, serverStatus, onSendCommand }: Players
           <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
         </button>
       </div>
+
+      {activeTab === "online" && (
+        <div className="space-y-4">
+          {!isOnline ? (
+            <div className="text-center py-10 text-theme-secondary text-sm">Servidor offline — nenhum jogador conectado.</div>
+          ) : onlinePlayers.length === 0 ? (
+            <div className="text-center py-10 text-theme-secondary text-sm">Nenhum jogador conectado no momento.</div>
+          ) : (
+            <div className="space-y-2 max-h-80 overflow-y-auto pr-1 custom-scrollbar">
+              {onlinePlayers.map((name) => (
+                <div key={name} className="flex items-center gap-3 bg-theme-muted border border-theme-card rounded-2xl px-4 py-3">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0" />
+                  <p className="text-sm font-semibold text-theme-primary truncate">{name}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {activeTab === "whitelist" && (
         <div className="space-y-4">

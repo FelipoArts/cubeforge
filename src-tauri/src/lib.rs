@@ -11,22 +11,60 @@ use std::collections::HashMap;
 use tauri::{Manager, Emitter};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri_plugin_shell::ShellExt;
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use std::thread;
 use std::path::PathBuf;
 use sysinfo::{System, Pid};
 
-// Módulos da nova arquitetura de rede (scaffold — serão integrados futuramente)
-#[allow(dead_code)]
+// Módulos da arquitetura de rede: a API central atua como "controlador" —
+// decide o provedor (Tailscale via tsnet) e minta credenciais de curta duração
+// por sessão; o desktop só executa (ver ProviderManager) e reporta ciclo de
+// vida (SessionManager).
 mod api_client;
-#[allow(dead_code)]
 mod session_manager;
-#[allow(dead_code)]
 mod provider_manager;
 mod job_object;
 #[cfg(test)]
 mod tests;
+
+use api_client::{ApiClient, ApiConfig};
+use session_manager::SessionManager;
+use provider_manager::ProviderManager;
+
+/// Lê (ou cria, na primeira execução) um identificador estável desta instalação,
+/// usado para correlacionar chamadas à API central — não é PII, só um UUID local.
+fn get_or_create_installation_id(app: &tauri::AppHandle) -> String {
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
+        let _ = std::fs::create_dir_all(&data_dir);
+        let path = data_dir.join("installation_id.txt");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let _ = std::fs::write(&path, &new_id);
+        return new_id;
+    }
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Cria um `Command` já configurado para não abrir uma janela de console visível
+/// no Windows. Processos console (como `java.exe`) alocam seu próprio console a
+/// menos que `CREATE_NO_WINDOW` seja passado explicitamente — redirecionar
+/// stdin/stdout/stderr sozinho não evita isso.
+fn silent_command(program: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 fn log_to_file(app: &tauri::AppHandle, message: &str) {
     let timestamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -121,12 +159,36 @@ struct AppState {
     // offline mesmo quando o fechamento acontece antes de qualquer heartbeat do JS.
     active_short_code: Mutex<Option<String>>,
 
+    // ConnectionSession ativa (host ou guest) na rede mesh — dono do session_id
+    // usado para heartbeat e para encerrar/revogar a credencial do Tailscale no
+    // fim (ver stop_network_node_internal e graceful_shutdown_and_exit). None
+    // quando não há nó de rede ativo ou quando o provedor ativo é o Mock local
+    // (que não fala com a API central).
+    active_session_manager: Mutex<Option<Arc<SessionManager>>>,
+
+    // Papel ("host"/"guest") do nó de rede atualmente ativo nesta instalação
+    // (None se nenhum). Esta instância só suporta UM nó de rede por vez —
+    // start_network_node sempre encerra o anterior antes de abrir um novo (ver
+    // stop_network_node_internal). Sem este guard, iniciar como convidado
+    // enquanto a rede mesh do host estivesse de pé derrubava o host em
+    // silêncio (a UI da aba Host nem ficava sabendo, porque ela lê o mesmo
+    // netStatus/isStarting compartilhado no frontend).
+    active_network_mode: Mutex<Option<String>>,
+
     // Última amostra de RAM/CPU do sistema (e do processo java.exe), atualizada
     // pela thread de amostragem periódica enquanto o servidor está rodando.
     // Usada tanto para o evento "mc-resource-sample" (indicador de saúde na UI)
     // quanto para enriquecer o diagnóstico de crash com o retrato de hardware
     // pouco antes do problema (ver ResourceSample).
     minecraft_last_resource_sample: Mutex<Option<ResourceSample>>,
+
+    // Nomes dos jogadores atualmente conectados ao servidor Minecraft, mantidos
+    // a partir das mesmas mensagens padrão do servidor ("X joined/left the game")
+    // que o frontend já usa para o painel de Jogadores (ver listener de
+    // "minecraft-log" em page.tsx) — não há RCON/consulta de estado disponível.
+    // Serve de fonte para o heartbeat da ConnectionSession reportar currentPlayers
+    // de verdade à API Central em vez do valor fixo que existia antes.
+    minecraft_online_players: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Retrato de RAM/CPU do sistema (e do processo do servidor) em um instante,
@@ -144,29 +206,10 @@ struct ResourceSample {
     process_cpu_percent: Option<f32>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SidecarConfig {
-    #[serde(rename = "authKey")]
-    auth_key: String,
-    hostname: String,
-    mode: String,
-    #[serde(rename = "targetIp", skip_serializing_if = "Option::is_none")]
-    target_ip: Option<String>,
-    #[serde(rename = "localPort")]
-    local_port: u16,
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 struct NetworkSession {
     provider: String,
     credentials: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize)]
-struct TailscaleCredentials {
-    #[serde(rename = "authKey")]
-    auth_key: String,
-    hostname: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -216,197 +259,148 @@ fn map_sidecar_error_code(code: &str, detail: &str) -> (String, String) {
     }
 }
 
+/// Traduz um código de AVISO (não-fatal) emitido pelo sidecar Go — diferente de
+/// `map_sidecar_error_code`, não significa que o processo vai sair, só que algo
+/// está degradado e o usuário deveria saber (ver startGuestHealthCheck em main.go).
+fn map_sidecar_warning_code(code: &str, detail: &str) -> (String, String) {
+    match code {
+        "host_unreachable" => (
+            "Conexão com o host instável".to_string(),
+            "Não estamos conseguindo alcançar o host na rede mesh há um tempo — a conexão pode ter caído ou o host pode ter ficado offline. O túnel continua tentando se recuperar sozinho; se persistir, peça para o host verificar a rede mesh dele.".to_string(),
+        ),
+        other => (
+            "Aviso na rede mesh".to_string(),
+            if detail.is_empty() {
+                format!("Código: {}", other)
+            } else {
+                detail.to_string()
+            },
+        ),
+    }
+}
+
 #[tauri::command]
 async fn start_network_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     mode: String,
+    short_code: String,
     target_ip: Option<String>,
     local_port: u16,
 ) -> Result<(), String> {
-    log_to_file(&app, &format!("=== INÍCIO DE CONEXÃO (Modo: {}, Porta Local: {}, IP Alvo: {:?}) ===", mode, local_port, target_ip));
-    // 1. Parar qualquer nó que já esteja rodando
-    stop_network_node_internal(&app, &state).await?;
+    log_to_file(&app, &format!("=== INÍCIO DE CONEXÃO (Modo: {}, shortCode: {}, Porta Local: {}, IP Alvo: {:?}) ===", mode, short_code, local_port, target_ip));
 
-    // 2. Tentar obter a sessão de rede (NetworkSession)
-    let api_url = "https://api.cubeforge.dev/network/session";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let mut session: Option<NetworkSession> = None;
-
-    // Tenta obter via chamada HTTP para a API Central
-    if let Ok(res) = client.get(api_url).send().await {
-        if res.status().is_success() {
-            if let Ok(json_session) = res.json::<NetworkSession>().await {
-                session = Some(json_session);
-            }
-        }
-    }
-
-    // Fallback: Procura o arquivo local `network_session.json` se a API falhar.
-    // Durante `tauri dev`, o binário roda de src-tauri/, então também buscamos
-    // no diretório pai (raiz do projeto) e no diretório do executável.
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if session.is_none() {
-        let file_name = "network_session.json";
-
-        // 1. Diretório de trabalho atual (raiz em produção, src-tauri/ em dev)
-        if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join(file_name));
-            // 2. Diretório pai do cwd (raiz do projeto em dev)
-            if let Some(parent) = cwd.parent() {
-                candidates.push(parent.join(file_name));
-            }
-        }
-
-        // 3. Diretório do executável (útil em produção)
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                candidates.push(exe_dir.join(file_name));
-            }
-        }
-
-        // 4. AppData local (configuração persistente do usuário)
-        if let Ok(data_dir) = app.path().app_local_data_dir() {
-            candidates.push(data_dir.join(file_name));
-        }
-
-        // Tenta cada candidato em ordem
-        for path in &candidates {
-            if path.exists() {
-                if let Ok(file_content) = std::fs::read_to_string(path) {
-                    match serde_json::from_str::<NetworkSession>(&file_content) {
-                        Ok(json_session) => {
-                            log_to_file(&app, &format!("network_session.json carregado com sucesso de: {:?}", path));
-                            session = Some(json_session);
-                            break;
-                        }
-                        Err(e) => {
-                            log_to_file(&app, &format!("Falha ao parsear JSON em {:?}: {}", path, e));
-                        }
-                    }
-                } else {
-                    log_to_file(&app, &format!("Falha ao ler o arquivo em {:?}", path));
-                }
-            } else {
-                log_to_file(&app, &format!("Candidato inexistente: {:?}", path));
-            }
-        }
-    }
-
-    // Se falhar a API e o fallback, retorna a mensagem de erro amigável com diagnóstico
-    let session = match session {
-        Some(s) => s,
-        None => {
-            let mut tried_info = Vec::new();
-            if let Ok(cwd) = std::env::current_dir() {
-                tried_info.push(format!("cwd: {:?}", cwd));
-            } else {
-                tried_info.push("cwd: failed".to_string());
-            }
-            for (i, path) in candidates.iter().enumerate() {
-                let exists = path.exists();
-                let mut read_ok = false;
-                let mut parse_ok = false;
-                if exists {
-                    if let Ok(file_content) = std::fs::read_to_string(path) {
-                        read_ok = true;
-                        if serde_json::from_str::<NetworkSession>(&file_content).is_ok() {
-                            parse_ok = true;
-                        }
-                    }
-                }
-                tried_info.push(format!("cand{}: {:?} (exists={}, read={}, parse={})", i, path, exists, read_ok, parse_ok));
-            }
-            let err_msg = format!(
-                "Não foi possível conectar ao servidor de autenticação do CubeForge. Verifique sua conexão. [DIAGNOSTICO: {}]",
-                tried_info.join(" | ")
+    // 0. Recusar troca de papel com um nó de outro modo ainda ativo. Hospedar
+    // e entrar como convidado ao mesmo tempo NÃO é suportado nesta mesma
+    // instalação (é uma única identidade de rede mesh por processo) — sem
+    // este guard, start_network_node simplesmente encerrava o nó anterior
+    // (linha abaixo) sem avisar, e a aba Host continuava mostrando "Parar
+    // Rede Mesh" como se sua própria rede ainda estivesse de pé.
+    if let Some(active_mode) = state.active_network_mode.lock().unwrap().clone() {
+        if active_mode != mode {
+            let msg = format!(
+                "Esta instalação já está com a rede mesh ativa como \"{}\". Pare-a antes de conectar como \"{}\". Se quiser jogar no seu próprio servidor a partir deste mesmo computador, conecte direto em localhost:{} — não precisa (e não é suportado) usar o modo Convidado para isso.",
+                if active_mode == "host" { "Host" } else { "Convidado" },
+                if mode == "host" { "Host" } else { "Convidado" },
+                local_port,
             );
-            log_to_file(&app, &format!("Erro de inicialização: {}", err_msg));
-            return Err(err_msg);
+            log_to_file(&app, &msg);
+            return Err(msg);
         }
-    };
+    }
 
-    // 3. Execução baseada no Provedor de Rede (Network Provider)
-    if session.provider == "tailscale" {
-        log_to_file(&app, "Iniciando provedor Tailscale...");
-        // Parsear as credenciais do Tailscale
-        let creds: TailscaleCredentials = serde_json::from_value(session.credentials)
-            .map_err(|e| {
-                let err_msg = format!("Credenciais do provedor Tailscale inválidas: {}", e);
-                log_to_file(&app, &err_msg);
-                err_msg
-            })?;
+    // 1. Parar qualquer nó que já esteja rodando (e encerrar/revogar a
+    // ConnectionSession anterior, se houver)
+    stop_network_node_internal(&app, &state).await?;
+    *state.active_network_mode.lock().unwrap() = Some(mode.clone());
 
-        // Criar pasta local de dados se não existir
-        let data_dir = app.path().app_local_data_dir().map_err(|e| {
-            let err_msg = e.to_string();
-            log_to_file(&app, &format!("Erro criando data_dir: {}", err_msg));
-            err_msg
-        })?;
-        std::fs::create_dir_all(&data_dir).map_err(|e| {
-            let err_msg = e.to_string();
-            log_to_file(&app, &format!("Erro criando pastas em data_dir: {}", err_msg));
-            err_msg
-        })?;
+    // 2. Opt-in de desenvolvimento: se existir um `network_session.json` local
+    // com "provider":"mock", usa o provedor simulado direto, sem tocar na API
+    // central nem no Tailscale (ver CLAUDE.md — Mock provider). É a ÚNICA
+    // função desse arquivo agora; ele nunca mais serve de fallback silencioso
+    // para credenciais reais (isso causava falhas incompreensíveis fora da
+    // máquina de dev, já que o arquivo nunca vai para o instalador).
+    let mock_override = load_local_mock_session(&app);
 
-        // Gravar arquivo de configuração temporário
-        let config_path = data_dir.join("tsnet_config.json");
-        let config = SidecarConfig {
-            auth_key: creds.auth_key,
-            hostname: creds.hostname,
-            mode,
-            target_ip: target_ip.clone(),
-            local_port,
-        };
-        
-        let config_json = serde_json::to_string(&config).map_err(|e| {
-            let err_msg = e.to_string();
-            log_to_file(&app, &format!("Erro serializando config: {}", err_msg));
-            err_msg
-        })?;
-        let mut file = File::create(&config_path).map_err(|e| {
-            let err_msg = e.to_string();
-            log_to_file(&app, &format!("Erro criando tsnet_config: {}", err_msg));
-            err_msg
-        })?;
-        file.write_all(config_json.as_bytes()).map_err(|e| {
-            let err_msg = e.to_string();
-            log_to_file(&app, &format!("Erro escrevendo tsnet_config: {}", err_msg));
-            err_msg
-        })?;
+    if let Some(session) = mock_override {
+        log_to_file(&app, "[MOCK] network_session.json local com provider=mock encontrado — usando provedor simulado.");
+        *state.is_mock_active.lock().unwrap() = true;
 
-        // Iniciar o sidecar Go tsnet-node
-        log_to_file(&app, "Iniciando sidecar tsnet-node...");
-        let shell = app.shell();
-        let config_path_str = config_path.to_string_lossy().to_string();
-        let (mut rx, child) = shell
-            .sidecar("tsnet-node")
-            .map_err(|e| {
-                let err_msg = e.to_string();
-                log_to_file(&app, &format!("Erro ao criar sidecar: {}", err_msg));
-                err_msg
-            })?
-            .args(["--config", &config_path_str])
-            .spawn()
-            .map_err(|e| {
-                let err_msg = e.to_string();
-                log_to_file(&app, &format!("Erro ao spawnar sidecar: {}", err_msg));
-                err_msg
-            })?;
+        let app_clone = app.clone();
+        let fake_ip = session.credentials.get("fakeIp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("100.99.99.99")
+            .to_string();
 
-        // Amarrar ao job object: se o app morrer (fechado ou finalizado à força),
-        // o Windows mata este sidecar junto em vez de deixá-lo órfão.
-        job_object::track_process(child.pid());
+        tauri::async_runtime::spawn(async move {
+            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                message: "[mock-provider] Inicializando provedor de testes (Mock)...".to_string(),
+                is_error: false,
+            });
+            tokio::time::sleep(Duration::from_millis(600)).await;
 
-        // Guardar o processo filho no estado global
-        *state.sidecar_process.lock().unwrap() = Some(child);
+            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                message: "[mock-provider] Autenticando nó virtual de rede mesh simulado...".to_string(),
+                is_error: false,
+            });
+            tokio::time::sleep(Duration::from_millis(800)).await;
 
+            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                message: format!("[mock-provider] Nó registrado com IP virtual simulado: {}", fake_ip),
+                is_error: false,
+            });
+            let _ = app_clone.emit("network-log", NetworkLogPayload {
+                message: format!("[mock-provider] Proxy reverso simulado escutando em localhost:{}", local_port),
+                is_error: false,
+            });
+
+            let _ = app_clone.emit("network-status", NetworkStatusPayload {
+                status: "online".to_string(),
+                ip: Some(fake_ip),
+            });
+        });
+
+        return Ok(());
+    }
+
+    // 3. Caminho real: a API central decide o provedor e minta uma credencial
+    // de curta duração específica desta sessão (ver session_manager.rs).
+    let installation_id = get_or_create_installation_id(&app);
+    let api = Arc::new(ApiClient::new(ApiConfig { installation_id, ..Default::default() }));
+    let session_manager = Arc::new(SessionManager::new(api));
+    *state.active_session_manager.lock().unwrap() = Some(session_manager.clone());
+
+    let session_resp = session_manager.start(&short_code, &mode, local_port).await.map_err(|e| {
+        let err_msg = format!("Não foi possível obter credenciais de rede: {}", e);
+        log_to_file(&app, &err_msg);
+        err_msg
+    })?;
+    session_manager.set_waiting_provider().map_err(|e| {
+        log_to_file(&app, &format!("Erro interno de estado da sessão: {}", e));
+        e
+    })?;
+
+    // 4. Executar via ProviderManager (sabe qual sidecar iniciar a partir de
+    // `session.launcher` — hoje só "tsnet-v1" — sem o desktop precisar saber o
+    // formato das credenciais, que continuam opacas aqui).
+    log_to_file(&app, &format!("Iniciando provedor (launcher: {})...", session_resp.launcher));
+    let provider_manager = ProviderManager::new();
+    let (child, mut rx) = provider_manager.start_provider(&app, &session_resp, &mode, local_port, target_ip.as_deref()).await.map_err(|e| {
+        log_to_file(&app, &format!("Erro ao iniciar provedor: {}", e));
+        e
+    })?;
+
+    // Amarrar ao job object: se o app morrer (fechado ou finalizado à força),
+    // o Windows mata este sidecar junto em vez de deixá-lo órfão.
+    job_object::track_process(child.pid());
+
+    // Guardar o processo filho no estado global
+    *state.sidecar_process.lock().unwrap() = Some(child);
+
+    {
         // Escutar eventos do sidecar
         let app_clone = app.clone();
+        let session_manager_events = session_manager.clone();
         tauri::async_runtime::spawn(async move {
             log_to_file(&app_clone, "Iniciando escuta de eventos do sidecar.");
             while let Some(event) = rx.recv().await {
@@ -429,8 +423,34 @@ async fn start_network_node(
                                         log_to_file(&app_clone, &format!("Rede mesh online! IP virtual: {:?}", ip_str));
                                         let _ = app_clone.emit("network-status", NetworkStatusPayload {
                                             status: "online".to_string(),
-                                            ip: ip_str,
+                                            ip: ip_str.clone(),
                                         });
+
+                                        // Reportar "online" à API central (popula hostIp real —
+                                        // é o que permite um convidado descobrir este host depois)
+                                        // e manter a ConnectionSession viva com heartbeats
+                                        // periódicos até a sessão sair de Online/Degraded.
+                                        if let Some(ip) = ip_str {
+                                            let sm = session_manager_events.clone();
+                                            let app_for_hb = app_clone.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                if let Err(e) = sm.set_online(&ip).await {
+                                                    log_to_file(&app_for_hb, &format!("[SessionManager] Falha ao reportar online: {}", e));
+                                                }
+                                                loop {
+                                                    tokio::time::sleep(Duration::from_secs(60)).await;
+                                                    let status = sm.get_status();
+                                                    if status != session_manager::SessionStatus::Online
+                                                        && status != session_manager::SessionStatus::Degraded
+                                                    {
+                                                        break;
+                                                    }
+                                                    let player_count = app_for_hb.state::<AppState>()
+                                                        .minecraft_online_players.lock().unwrap().len() as u32;
+                                                    let _ = sm.send_heartbeat(player_count).await;
+                                                }
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -457,6 +477,44 @@ async fn start_network_node(
                                         crash_report_file: None,
                                         resource_snapshot: None,
                                         allocated_ram_mb: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Aviso não-fatal do sidecar Go (ex: host inalcançável na malha durante
+                        // uma sessão de guest já estabelecida — ver startGuestHealthCheck em
+                        // main.go). Diferente do bloco "error" acima, isso NÃO precede a saída
+                        // do processo: o túnel continua de pé tentando se recuperar sozinho.
+                        if trimmed.starts_with('{') && trimmed.contains("\"warning\"") {
+                            if let Ok(warn_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                if let Some(code) = warn_val.get("warning").and_then(|v| v.as_str()) {
+                                    let detail = warn_val.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                                    let (title, message) = map_sidecar_warning_code(code, detail);
+                                    log_to_file(&app_clone, &format!("[Sidecar] Aviso: código={}, detail={}", code, detail));
+                                    let _ = app_clone.emit("network-diagnostic", DiagnosticPayload {
+                                        level: "warning".to_string(),
+                                        title,
+                                        message,
+                                        detail: if detail.is_empty() { None } else { Some(detail.to_string()) },
+                                        code: Some(code.to_string()),
+                                        crash_report_text: None,
+                                        crash_report_file: None,
+                                        resource_snapshot: None,
+                                        allocated_ram_mb: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Recuperação de um aviso anterior (ex: host voltou a responder).
+                        if trimmed.starts_with('{') && trimmed.contains("\"recovered\"") {
+                            if let Ok(rec_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                if let Some(code) = rec_val.get("recovered").and_then(|v| v.as_str()) {
+                                    log_to_file(&app_clone, &format!("[Sidecar] Recuperado: {}", code));
+                                    let _ = app_clone.emit("network-log", NetworkLogPayload {
+                                        message: "Conexão com o host da malha restabelecida.".to_string(),
+                                        is_error: false,
                                     });
                                 }
                             }
@@ -502,6 +560,15 @@ async fn start_network_node(
                         // de "o sidecar morreu sozinho" (crash real) para não marcar uma
                         // desconexão manual como erro na Central de Diagnósticos.
                         let was_requested = app_state.network_stop_requested.swap(false, Ordering::SeqCst);
+                        // Sidecar morreu sozinho (não foi um stop pedido pelo usuário): registra
+                        // a falha na ConnectionSession para a API poder revogar a credencial —
+                        // se fosse um stop explícito, stop_network_node_internal já cuidou disso.
+                        if !was_requested {
+                            let sm = session_manager_events.clone();
+                            tauri::async_runtime::spawn(async move {
+                                sm.set_failed(session_manager::TerminationReason::ProviderError, "sidecar terminou inesperadamente").await;
+                            });
+                        }
                         // Causa específica já reportada via "network-diagnostic" enquanto o
                         // sidecar ainda rodava (ver parsing do stdout acima)? Se sim, evitar
                         // duplicar um segundo aviso genérico sobre o mesmo evento.
@@ -531,48 +598,65 @@ async fn start_network_node(
                 }
             }
         });
-    } else if session.provider == "mock" {
-        // Implementação do provedor simulado (Mock) para fins de teste sem internet ou Tailscale
-        *state.is_mock_active.lock().unwrap() = true;
-
-        let app_clone = app.clone();
-        let fake_ip = session.credentials.get("fakeIp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("100.99.99.99")
-            .to_string();
-
-        tauri::async_runtime::spawn(async move {
-            let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: "[mock-provider] Inicializando provedor de testes (Mock)...".to_string(),
-                is_error: false,
-            });
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            
-            let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: "[mock-provider] Autenticando nó virtual de rede mesh simulado...".to_string(),
-                is_error: false,
-            });
-            tokio::time::sleep(Duration::from_millis(800)).await;
-
-            let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: format!("[mock-provider] Nó registrado com IP virtual simulado: {}", fake_ip),
-                is_error: false,
-            });
-            let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: format!("[mock-provider] Proxy reverso simulado escutando em localhost:{}", local_port),
-                is_error: false,
-            });
-
-            let _ = app_clone.emit("network-status", NetworkStatusPayload {
-                status: "online".to_string(),
-                ip: Some(fake_ip),
-            });
-        });
-    } else {
-        return Err(format!("Provedor de rede '{}' não é suportado na versão atual.", session.provider));
     }
 
     Ok(())
+}
+
+/// Opt-in de desenvolvimento: procura um `network_session.json` local (cwd,
+/// pasta pai, pasta do executável ou AppData — cobre tanto `tauri dev` quanto
+/// produção) e só retorna algo se `provider` for exatamente "mock". Qualquer
+/// outro valor (incluindo um "tailscale" antigo) é ignorado — não existe mais
+/// fallback silencioso de credenciais reais via arquivo (ver CLAUDE.md).
+fn load_local_mock_session(app: &tauri::AppHandle) -> Option<NetworkSession> {
+    let file_name = "network_session.json";
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(file_name));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join(file_name));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(file_name));
+        }
+    }
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
+        candidates.push(data_dir.join(file_name));
+    }
+
+    for path in &candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(session) = serde_json::from_str::<NetworkSession>(&content) {
+                if session.provider == "mock" {
+                    return Some(session);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Aguarda (com timeout) o processo do PID informado sair de fato do SO —
+/// `CommandChild::kill()` (tauri-plugin-shell) só envia o sinal de encerramento
+/// e retorna na hora, sem garantir que o processo (e os sockets que ele tinha
+/// aberto, como a porta local do proxy do sidecar) já foi liberado.
+async fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let sys_pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    loop {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true);
+        if sys.process(sys_pid).is_none() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn stop_network_node_internal(
@@ -580,6 +664,8 @@ async fn stop_network_node_internal(
     state: &tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     log_to_file(app, "=== PARANDO NÓ DE REDE ===");
+    *state.active_network_mode.lock().unwrap() = None;
+
     // 1. Tratar limpeza do provedor simulado Mock
     // IMPORTANTE: O MutexGuard não é `Send` e não pode ser mantido vivo
     // durante um `.await`. Por isso, extraímos o valor e liberamos o lock
@@ -603,7 +689,33 @@ async fn stop_network_node_internal(
         });
     }
 
-    // 2. Tratar limpeza do processo do provedor Tailscale
+    // 2. Encerrar a ConnectionSession ativa (se houver): notifica a API central,
+    // que revoga a credencial do Tailscale (device já conectado ou key ainda
+    // não usada — ver handleDeleteConnectionSession no Worker) em vez de
+    // esperar a limpeza automática de nós efêmeros, que tem atraso. Usa
+    // `cleanup()` (best-effort, sem validar estado) em vez de `stop()` porque
+    // este caminho também roda no início de todo novo `start_network_node` —
+    // pode encontrar a sessão em qualquer estado, inclusive ainda conectando.
+    let session_id_ended = {
+        let sm_opt = state.active_session_manager.lock().unwrap().take();
+        if let Some(sm) = sm_opt {
+            let sid = sm.get_session_id();
+            sm.cleanup().await;
+            sid
+        } else {
+            None
+        }
+    };
+    if let Some(sid) = session_id_ended {
+        if let Ok(data_dir) = app.path().app_local_data_dir() {
+            let per_session_config = data_dir.join(format!("tsnet_{}.json", sid));
+            if per_session_config.exists() {
+                let _ = std::fs::remove_file(&per_session_config);
+            }
+        }
+    }
+
+    // 3. Tratar limpeza do processo do provedor Tailscale
     // Mesmo padrão: extrair e liberar o guard antes de qualquer operação assíncrona
     let child_to_kill = {
         let mut process = state.sidecar_process.lock().unwrap();
@@ -614,17 +726,25 @@ async fn stop_network_node_internal(
         // Marcar ANTES de matar o processo: o handler de CommandEvent::Terminated
         // roda em outra task assíncrona e precisa saber que esta morte foi solicitada.
         state.network_stop_requested.store(true, Ordering::SeqCst);
+        let pid = child.pid();
         let _ = child.kill();
+        // kill() só *pede* o encerramento e retorna na hora — não espera o processo
+        // sair de fato. start_network_node chama stop_network_node_internal e, na
+        // sequência, já tenta religar um sidecar novo na mesma porta local: sem
+        // esperar aqui, uma reconexão rápida (ou troca host/guest) podia disputar
+        // o bind contra uma porta que o processo antigo ainda não tinha liberado.
+        wait_for_process_exit(pid, Duration::from_millis(1500)).await;
     }
 
-    // 3. Remover arquivo JSON de credenciais temporárias do Tailscale
+    // 4. Remover arquivo JSON de credenciais temporárias do Tailscale (formato
+    // antigo, de uso único fixo — mantido por segurança caso algo ainda o crie)
     let data_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let config_path = data_dir.join("tsnet_config.json");
     if config_path.exists() {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    // 4. Emitir status offline apenas se havia um processo rodando
+    // 5. Emitir status offline apenas se havia um processo rodando
     //    (evita resetar isStarting no frontend durante start_network_node)
     if had_child {
         let _ = app.emit("network-status", NetworkStatusPayload {
@@ -1030,6 +1150,23 @@ fn detect_known_mc_error(line: &str) -> Option<(String, String, String)> {
     None
 }
 
+/// Detecta as mensagens padrão do servidor vanilla/Forge/Fabric/Paper que indicam
+/// entrada/saída de um jogador ("X joined the game" / "X left the game"), extraindo
+/// o nome (sempre a última palavra antes do sufixo, independente do prefixo de
+/// timestamp/thread). Mesma lógica do listener de "minecraft-log" no frontend
+/// (page.tsx) — replicada aqui para alimentar o heartbeat da ConnectionSession
+/// com a contagem real de jogadores, já que o Rust não tem RCON/consulta de estado.
+fn parse_player_event(line: &str) -> Option<(String, bool)> {
+    for (suffix, joined) in [(" joined the game", true), (" left the game", false)] {
+        if let Some(name) = line.strip_suffix(suffix) {
+            if let Some(name) = name.split_whitespace().last() {
+                return Some((name.to_string(), joined));
+            }
+        }
+    }
+    None
+}
+
 /// Trunca uma string em um limite de caracteres (não bytes, para não quebrar
 /// UTF-8) — usado para caber o texto de crash-reports/logs no payload do evento.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -1143,7 +1280,7 @@ async fn start_minecraft_server(
     }
 
     // Iniciar processo Java com stdin/stdout/stderr redirecionados
-    let mut child = std::process::Command::new(&java_path)
+    let mut child = silent_command(&java_path)
         .args(&args)
         .current_dir(&server_dir)
         .stdin(std::process::Stdio::piped())
@@ -1171,6 +1308,13 @@ async fn start_minecraft_server(
     // Guardar processo e stdin no estado global
     {
         state.minecraft_stop_requested.store(false, Ordering::SeqCst);
+        // Reseta para esta nova execução — sem isso, um restart reaproveitaria o
+        // "true" da execução anterior e get_system_status reportaria "online"
+        // antes mesmo do servidor novo terminar de subir (ver bug do bootstrap
+        // do Fabric: a instalação inicial mantém o processo vivo por minutos
+        // sem abrir a porta nem imprimir "Done (").
+        state.minecraft_was_online.store(false, Ordering::SeqCst);
+        state.minecraft_online_players.lock().unwrap().clear();
         *state.minecraft_stdin.lock().unwrap() = stdin;
         *state.minecraft_process.lock().unwrap() = Some(child);
         *state.minecraft_last_error.lock().unwrap() = None;
@@ -1223,6 +1367,17 @@ async fn start_minecraft_server(
                             let mut last_error = state_ref.minecraft_last_error.lock().unwrap();
                             if last_error.is_none() {
                                 *last_error = Some(cause);
+                            }
+                        }
+                        // Manter a contagem de jogadores online (ver comentário no campo
+                        // minecraft_online_players) em sincronia com o mesmo log que o
+                        // frontend já usa para o painel de Jogadores.
+                        if let Some((name, joined)) = parse_player_event(&l) {
+                            let mut players = state_ref.minecraft_online_players.lock().unwrap();
+                            if joined {
+                                players.insert(name);
+                            } else {
+                                players.remove(&name);
                             }
                         }
                     }
@@ -1539,7 +1694,7 @@ async fn run_forge_installer(
     log_to_file(&app, &format!("Executando: {} {:?} em {}", java_path, args, server_dir));
     
     // Iniciar processo Java com stdin/stdout/stderr redirecionados
-    let mut child = std::process::Command::new(&java_path)
+    let mut child = silent_command(&java_path)
         .args(&args)
         .current_dir(&server_dir)
         .stdin(std::process::Stdio::piped())
@@ -1669,7 +1824,7 @@ async fn run_fabric_client_installer(
 
     log_to_file(&app, &format!("Executando: {} {:?}", java_path, args));
 
-    let mut child = std::process::Command::new(&java_path)
+    let mut child = silent_command(&java_path)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1815,7 +1970,7 @@ async fn run_forge_client_installer(
 
     log_to_file(&app, &format!("Executando: {} {:?}", java_path, args));
 
-    let mut child = std::process::Command::new(&java_path)
+    let mut child = silent_command(&java_path)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2021,35 +2176,41 @@ async fn get_system_status(
     // Verificar se o servidor Minecraft ainda está rodando
     // Usamos try_lock() para não travar se a monitor thread estiver com o lock
     let mc_status = {
-        match state.minecraft_process.try_lock() {
+        // Processo vivo != servidor pronto: o Fabric (e instaladores em geral)
+        // ficam minutos rodando sem abrir a porta na primeira execução (baixando
+        // o server + instalando o loader). "online" só é reportado quando
+        // `minecraft_was_online` foi de fato marcada (stdout "Done (" ou conexão
+        // TCP bem-sucedida) — senão reportamos "starting" mesmo com o processo vivo.
+        enum ProcState { Alive, NoProcess, CrashExit }
+        let proc_state = match state.minecraft_process.try_lock() {
             Ok(mut guard) => {
                 if let Some(ref mut child) = *guard {
                     match child.try_wait() {
-                        Ok(None) => { // processo ainda vivo
-                            drop(guard);
-                            "online"
-                        },
-                        Ok(Some(status)) => {
-                            drop(guard);
-                            if status.success() { "offline" } else { "crashed" }
-                        }
-                        Err(_) => {
-                            drop(guard);
-                            "offline"
-                        }
+                        Ok(None) => ProcState::Alive,
+                        Ok(Some(status)) => if status.success() { ProcState::NoProcess } else { ProcState::CrashExit },
+                        Err(_) => ProcState::NoProcess,
                     }
                 } else {
-                    drop(guard);
-                    // Processo handle é None, mas tentar TCP como fallback
-                    "offline"
+                    ProcState::NoProcess
                 }
             }
             Err(_) => {
-                // Lock está ocupado pela thread de monitoramento.
-                // Isso significa que o processo Minecraft ainda está vivo
-                // (a thread só segura o lock durante child.wait()).
-                log_to_file(&app, "[get_system_status] Lock minecraft_process ocupado. Assumindo ONLINE.");
-                "online"
+                // Lock está ocupado pela thread de monitoramento (ela só segura o
+                // lock durante child.wait()), então o processo Minecraft ainda está vivo.
+                log_to_file(&app, "[get_system_status] Lock minecraft_process ocupado (processo vivo).");
+                ProcState::Alive
+            }
+        };
+
+        match proc_state {
+            ProcState::NoProcess => "offline",
+            ProcState::CrashExit => "crashed",
+            ProcState::Alive => {
+                if state.minecraft_was_online.load(Ordering::SeqCst) {
+                    "online"
+                } else {
+                    "starting"
+                }
             }
         }
     };
@@ -2065,11 +2226,18 @@ async fn get_system_status(
         }
     };
 
-    log_to_file(&app, &format!("[get_system_status] MC={}, Net={}", mc_status, net_status));
+    // Papel ("host"/"guest") do nó de rede ativo, se houver — permite a UI saber
+    // DE QUEM é a conexão que está de pé (ver active_network_mode em AppState).
+    // Sem isso, ao recarregar com uma conexão de guest ativa, a aba Host não
+    // tinha como saber que "Parar Rede Mesh" não é sobre a rede dela.
+    let net_mode = state.active_network_mode.lock().unwrap().clone();
+
+    log_to_file(&app, &format!("[get_system_status] MC={}, Net={}, NetMode={:?}", mc_status, net_status, net_mode));
 
     Ok(serde_json::json!({
         "minecraftStatus": mc_status,
         "netStatus": net_status,
+        "netMode": net_mode,
         "ip": null,
     }))
 }
@@ -3985,165 +4153,19 @@ async fn sync_delete_server(
     }
 }
 
-/// Cria/atualiza uma sessão de jogo na API Central.
-#[tauri::command]
-async fn sync_create_session(
-    app: tauri::AppHandle,
-    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
-    short_code: String,
-    provider: String,
-    host_ip: String,
-    port: u16,
-    status: String,
-    current_players: Option<u16>,
-    max_players: Option<u16>,
-) -> Result<serde_json::Value, String> {
-    log_to_file(&app, &format!("[SYNC] sync_create_session: short_code={}, provider={}", short_code, provider));
-    
-    let payload = serde_json::json!({
-        "shortCode": short_code,
-        "provider": provider,
-        "hostIp": host_ip,
-        "port": port,
-        "status": status,
-        "currentPlayers": current_players,
-        "maxPlayers": max_players,
-    });
-    
-    let op_id = enqueue_operation(&app, SyncOperationType::CreateSession, payload);
-    
-    let queue = load_sync_queue(&app);
-    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
-        match execute_sync_operation(&app, op, &telemetry).await {
-            Ok(_) => {
-                remove_operation(&app, &op_id);
-                Ok(serde_json::json!({ "success": true, "code": "SESSION_CREATED", "message": "Sessão criada." }))
-            }
-            Err(e) => {
-                Ok(serde_json::json!({
-                    "success": true, "code": "QUEUED",
-                    "message": format!("Operação enfileirada: {}", e),
-                    "data": { "operationId": op_id, "pending": true },
-                }))
-            }
-        }
-    } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
-    }
-}
-
-/// Atualiza o status de uma sessão na API Central.
-#[tauri::command]
-async fn sync_update_session(
-    app: tauri::AppHandle,
-    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
-    short_code: String,
-    status: String,
-    current_players: Option<u16>,
-) -> Result<serde_json::Value, String> {
-    log_to_file(&app, &format!("[SYNC] sync_update_session: short_code={}, status={}", short_code, status));
-    
-    let payload = serde_json::json!({
-        "shortCode": short_code,
-        "status": status,
-        "currentPlayers": current_players,
-    });
-    
-    let op_id = enqueue_operation(&app, SyncOperationType::UpdateSession, payload);
-    
-    let queue = load_sync_queue(&app);
-    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
-        match execute_sync_operation(&app, op, &telemetry).await {
-            Ok(_) => {
-                remove_operation(&app, &op_id);
-                Ok(serde_json::json!({ "success": true, "code": "SESSION_UPDATED", "message": "Sessão atualizada." }))
-            }
-            Err(e) => {
-                Ok(serde_json::json!({
-                    "success": true, "code": "QUEUED",
-                    "message": format!("Operação enfileirada: {}", e),
-                    "data": { "operationId": op_id, "pending": true },
-                }))
-            }
-        }
-    } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
-    }
-}
-
-/// Encerra uma sessão na API Central.
-#[tauri::command]
-async fn sync_delete_session(
-    app: tauri::AppHandle,
-    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
-    short_code: String,
-) -> Result<serde_json::Value, String> {
-    log_to_file(&app, &format!("[SYNC] sync_delete_session: short_code={}", short_code));
-    
-    let payload = serde_json::json!({ "shortCode": short_code });
-    let op_id = enqueue_operation(&app, SyncOperationType::DeleteSession, payload);
-    
-    let queue = load_sync_queue(&app);
-    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
-        match execute_sync_operation(&app, op, &telemetry).await {
-            Ok(_) => {
-                remove_operation(&app, &op_id);
-                Ok(serde_json::json!({ "success": true, "code": "SESSION_DELETED", "message": "Sessão encerrada." }))
-            }
-            Err(e) => {
-                Ok(serde_json::json!({
-                    "success": true, "code": "QUEUED",
-                    "message": format!("Operação enfileirada: {}", e),
-                    "data": { "operationId": op_id, "pending": true },
-                }))
-            }
-        }
-    } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
-    }
-}
-
-/// Envia heartbeat para a API Central (via fila de sincronização).
-#[tauri::command]
-async fn sync_send_heartbeat(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
-    short_code: String,
-    status: String,
-    current_players: Option<u16>,
-) -> Result<serde_json::Value, String> {
-    log_to_file(&app, &format!("[SYNC] sync_send_heartbeat: short_code={}, status={}", short_code, status));
-
-    *state.active_short_code.lock().unwrap() = Some(short_code.clone());
-
-    let payload = serde_json::json!({
-        "shortCode": short_code,
-        "status": status,
-        "currentPlayers": current_players,
-    });
-    
-    let op_id = enqueue_operation(&app, SyncOperationType::Heartbeat, payload);
-    
-    let queue = load_sync_queue(&app);
-    if let Some(op) = queue.operations.iter().find(|o| o.id == op_id) {
-        match execute_sync_operation(&app, op, &telemetry).await {
-            Ok(_) => {
-                remove_operation(&app, &op_id);
-                Ok(serde_json::json!({ "success": true, "code": "HEARTBEAT_RECEIVED", "message": "Heartbeat enviado." }))
-            }
-            Err(e) => {
-                Ok(serde_json::json!({
-                    "success": true, "code": "QUEUED",
-                    "message": format!("Heartbeat enfileirado: {}", e),
-                    "data": { "operationId": op_id, "pending": true },
-                }))
-            }
-        }
-    } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Heartbeat enfileirado." }))
-    }
-}
+// As antigas sync_create_session/sync_update_session/sync_delete_session/
+// sync_send_heartbeat foram removidas: eram um sistema paralelo de heartbeat
+// (SessionEntity simples, sem Tailscale) que a UI mantinha via timer JS. O
+// ciclo de vida real agora é o ConnectionSession (ver session_manager.rs),
+// conduzido pelo Rust a partir dos eventos do sidecar em start_network_node —
+// dispara "online" com o IP real assim que a malha conecta, envia heartbeats
+// periódicos e encerra/revoga a credencial do Tailscale no fim (ver
+// stop_network_node_internal e graceful_shutdown_and_exit). Os endpoints
+// legados que essas funções chamavam (`/sessions`, PATCH via heartbeat) já
+// nem existem mais no Worker. `execute_create_session`/`execute_update_session`/
+// `execute_delete_session`/`execute_heartbeat` continuam existindo só para não
+// quebrar a desserialização de operações já enfileiradas por instalações
+// antigas — nada novo os enfileira mais.
 
 /// Retorna o estado atual da fila de sincronização.
 #[tauri::command]
@@ -4285,28 +4307,20 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
     }
   }
 
-  // 4. Notificar a API Central que o servidor ficou offline (best-effort,
-  // timeout curto para não travar o fechamento em caso de rede lenta/indisponível).
-  // Sem isso, fechar o app deixava o status "online" na API até o timeout de
-  // 5min do lado do servidor, mostrando informação falsa para os convidados.
-  let short_code_opt = {
-    let state_ref = app.state::<AppState>();
-    let sc = state_ref.active_short_code.lock().unwrap().clone();
-    sc
-  };
-  if let Some(short_code) = short_code_opt {
-    log_to_file(&app, &format!("[SHUTDOWN] Notificando API Central: {} está offline...", short_code));
-    let payload = serde_json::json!({
-      "shortCode": short_code,
-      "status": "offline",
-      "currentPlayers": null,
-    });
-    if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
-      let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
-      match client.post(&url).json(&payload).send().await {
-        Ok(_) => log_to_file(&app, "[SHUTDOWN] API Central notificada com sucesso."),
-        Err(e) => log_to_file(&app, &format!("[SHUTDOWN] Falha ao notificar API Central (offline): {}", e)),
-      }
+  // 4. Encerrar a ConnectionSession ativa (se houver) — revoga a credencial do
+  // Tailscale (device ou key não usada) em vez de deixar o nó pendurado até a
+  // limpeza automática de efêmeros. Best-effort: não deve travar o fechamento
+  // em caso de rede lenta/indisponível (ver session_manager::cleanup).
+  {
+    let sm_opt = {
+      let state_ref = app.state::<AppState>();
+      let taken = state_ref.active_session_manager.lock().unwrap().take();
+      taken
+    };
+    if let Some(sm) = sm_opt {
+      log_to_file(&app, "[SHUTDOWN] Encerrando ConnectionSession ativa...");
+      sm.cleanup().await;
+      log_to_file(&app, "[SHUTDOWN] ConnectionSession encerrada.");
     }
   }
 
@@ -4328,6 +4342,26 @@ pub fn run() {
   let telemetry_clone = telemetry.clone();
   
   tauri::Builder::default()
+    // Precisa ser o primeiro plugin registrado (exigência do próprio plugin no
+    // Windows). Se o usuário tentar abrir uma nova instância enquanto a atual
+    // ainda está viva no system tray (janela fechada, mas processo rodando),
+    // esse callback roda NA INSTÂNCIA JÁ ABERTA: só reexibimos a janela dela
+    // em vez de deixar um segundo processo subir.
+    .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+      if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+      }
+      // Se a segunda instância foi disparada por um deep link (login via
+      // navegador — ver docs/entrar/), repassa a URL pro frontend em vez de
+      // deixar o clique se perder; a instância nova encerra sozinha logo em
+      // seguida, só esta sobrevive.
+      if let Some(url) = args.iter().find(|a| a.starts_with("cubicase://")) {
+        let _ = app.emit("deep-link-received", url.clone());
+      }
+    }))
+    .plugin(tauri_plugin_deep_link::init())
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_os::init())
     .plugin(tauri_plugin_fs::init())
@@ -4343,7 +4377,18 @@ pub fn run() {
             .build(),
         )?;
       }
-      
+
+      // Registro em runtime do esquema `cubicase://` (login via navegador —
+      // ver docs/entrar/). No Windows/Linux o instalador já grava essa
+      // associação (ver `deep-link.desktop.schemes` no tauri.conf.json), mas
+      // builds de dev/portáteis não passam pelo instalador, então registramos
+      // aqui também. No macOS a associação vem só do Info.plist (mesma config),
+      // não há registro em runtime.
+      #[cfg(any(windows, target_os = "linux"))]
+      {
+        let _ = app.deep_link().register("cubicase");
+      }
+
       // Limpar operações obsoletas da fila (que usavam PATCH /sessions, agora inexistente)
       // e operações com mais de 5 tentativas para não poluir a fila com lixo
       {
@@ -4484,10 +4529,6 @@ pub fn run() {
        sync_register_server,
        sync_update_server,
        sync_delete_server,
-       sync_create_session,
-       sync_update_session,
-       sync_delete_session,
-       sync_send_heartbeat,
        get_sync_queue_status,
        force_sync_now,
        get_sync_telemetry,

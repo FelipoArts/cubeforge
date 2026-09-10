@@ -641,3 +641,34 @@ fn crop_and_resize_icon_always_outputs_64x64_square() {
     let result = crop_and_resize_icon(square);
     assert_eq!((result.width(), result.height()), (64, 64));
 }
+
+// ------------------------------------------------------------
+// ConnectionSessionResponse — desserialização da resposta da API Central
+// ------------------------------------------------------------
+// A API (api/src/index.ts, handleCreateConnectionSession) devolve o payload
+// em camelCase. Já aconteceu do struct ficar sem `rename_all` e todo
+// `start_network_node` falhar com "missing field `session_id`" — trava a
+// UI logo depois de "Autenticando sessão de rede". Este teste existe pra
+// pegar essa regressão no `cargo test` em vez de só na hora de testar a UI.
+
+#[test]
+fn connection_session_response_parses_camel_case_payload() {
+    let payload = serde_json::json!({
+        "sessionId": "sess_abc123",
+        "launcher": "tsnet-v1",
+        "launcherVersion": 1,
+        "protocolVersion": 1,
+        "credentials": { "authKey": "tskey-auth-xxx", "hostname": "cf-host-e4595926" },
+        "leaseDurationMs": 60000,
+        "expiresAt": "2026-09-09T00:00:00Z",
+    });
+
+    let parsed: crate::api_client::ConnectionSessionResponse =
+        serde_json::from_value(payload).expect("deve desserializar o payload camelCase da API");
+
+    assert_eq!(parsed.session_id, "sess_abc123");
+    assert_eq!(parsed.launcher_version, 1);
+    assert_eq!(parsed.protocol_version, 1);
+    assert_eq!(parsed.lease_duration_ms, 60000);
+    assert_eq!(parsed.expires_at, "2026-09-09T00:00:00Z");
+}
