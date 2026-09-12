@@ -140,7 +140,7 @@ export function ImportModpackModal({ isOpen, onClose, onImport, installProgress,
               <div className="space-y-4">
                 <p className="text-sm text-theme-secondary leading-relaxed">
                   Selecione o arquivo <code className="text-xs bg-theme-muted px-1.5 py-0.5 rounded">.zip</code> (CurseForge) ou{" "}
-                  <code className="text-xs bg-theme-muted px-1.5 py-0.5 rounded">.mrpack</code> (Modrinth) do modpack. O CubeForge Dash vai
+                  <code className="text-xs bg-theme-muted px-1.5 py-0.5 rounded">.mrpack</code> (Modrinth) do modpack. O Cubicase vai
                   identificar a versão do Minecraft, o mod loader e baixar todos os mods automaticamente.
                 </p>
                 {parseError && (

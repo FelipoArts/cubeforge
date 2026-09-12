@@ -16,11 +16,13 @@ import {
   Database,
   ChevronDown,
   Globe,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
 import { documentDir, join } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { readTextFile, remove } from "@tauri-apps/plugin-fs";
 import { useAppStore, type ServerStatus } from "@/app/store";
 import { pushDiagnostic } from "@/app/diagnostics";
@@ -34,6 +36,7 @@ import {
   importExistingServer,
   scanExternalServer,
   getJavaVersion,
+  updateStoredShortCode,
   type ServerInfo,
   type ServerInstallProgress,
 } from "@/lib/server";
@@ -49,6 +52,7 @@ import { CreateServerModal } from "./CreateServerModal";
 import { ImportModpackModal } from "./ImportModpackModal";
 import { DeleteConfirmModal } from "./DeleteConfirmModal";
 import { SettingsModal } from "./SettingsModal";
+import { ConfirmActionModal } from "./ConfirmActionModal";
 
 // ============================================================
 // HostView
@@ -173,11 +177,20 @@ export function HostView({
     removeImportedServerPath,
   } = useAppStore();
 
+  // Espelho de localServers na store (ver comentário em page.tsx: "para o
+  // GuestView") — usado só pro badge de wake-on-demand abaixo, pra refletir
+  // instantaneamente o toggle feito na aba Assinatura sem depender do próximo
+  // refresh da lista local (que é a fonte de verdade normal desta view, via
+  // prop `localServers`).
+  const wakeOnDemandServerInfo = useAppStore((s) => s.localServers.find((sv) => sv.name === selectedServer));
+
   // --- Estado ---
   const [isImporting, setIsImporting] = useState(false);
   const [showCrashDetail, setShowCrashDetail] = useState(false);
   const [showImportModpack, setShowImportModpack] = useState(false);
   const [showDonationModal, setShowDonationModal] = useState(false);
+  const [showRegenerateCode, setShowRegenerateCode] = useState(false);
+  const [idleShutdownWarning, setIdleShutdownWarning] = useState<number | null>(null);
 
   // Refs para evitar closure stale
   const selectedServerRef = useRef<string | null>(null);
@@ -192,6 +205,36 @@ export function HostView({
   useEffect(() => { localServersRef.current = localServers; }, [localServers]);
   useEffect(() => { serverConfigPortRef.current = serverConfigPort; }, [serverConfigPort]);
   useEffect(() => { netStatusRef.current = netStatus; }, [netStatus]);
+
+  // Aviso de desligamento por inatividade (wake-on-demand) — emitido pelo Rust
+  // um tick (60s) antes de desligar de verdade (ver idle-shutdown-warning em
+  // lib.rs). "Manter ligado" reseta o contador no Rust; aqui só fecha o aviso.
+  useEffect(() => {
+    const unlisten = listen<{ secondsRemaining: number }>("idle-shutdown-warning", (event) => {
+      setIdleShutdownWarning(event.payload.secondsRemaining);
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
+  const handleCancelIdleShutdown = async () => {
+    setIdleShutdownWarning(null);
+    try {
+      await invoke("cancel_idle_shutdown");
+    } catch (err) {
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao cancelar desligamento", message: String(err) });
+    }
+  };
+
+  // Contagem local só visual (o desligamento de verdade é decidido pelo
+  // Rust); some sozinho ao chegar em 0 ou se um jogador aparecer nesse meio
+  // tempo (o Rust também vai zerar o próprio contador no próximo tick).
+  useEffect(() => {
+    if (idleShutdownWarning === null) return;
+    if (onlinePlayers.length > 0) { setIdleShutdownWarning(null); return; }
+    if (idleShutdownWarning <= 0) { setIdleShutdownWarning(null); return; }
+    const timer = setTimeout(() => setIdleShutdownWarning((s) => (s === null ? null : s - 1)), 1000);
+    return () => clearTimeout(timer);
+  }, [idleShutdownWarning, onlinePlayers.length]);
 
   // --- Efeitos ---
 
@@ -408,6 +451,12 @@ export function HostView({
       setRunningServer(currentSelectedServer);
       onSetMcLogs([]);
       onSetMcLogs(prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${selectedServer}"...`]);
+
+      // Registrar (idempotente) mesmo sem a rede mesh ligada: é o que dá ao
+      // Rust um shortCode em `active_short_code` pra reportar o status deste
+      // servidor à API Central — sem isso o convidado nunca saberia que o
+      // Minecraft está de pé quando o host optou por não usar a malha agora.
+      await onRegisterServer(serverInfo);
 
       const version = serverInfo.version || "1.20.1";
       const javaVer = getJavaVersion(version);
@@ -644,6 +693,26 @@ export function HostView({
     onSetShowSettings(false);
   };
 
+  // Invalida o código atual na API Central e gera um novo (ex.: o código
+  // vazou publicamente). Derruba, de propósito, qualquer sessão de rede presa
+  // ao código antigo — inclusive a própria, se este servidor estiver
+  // hospedando agora — por isso o botão fica desabilitado enquanto online
+  // (ver condição no JSX abaixo), evitando o susto de cair a própria sessão
+  // sem querer no meio do jogo.
+  const handleRegenerateCode = async () => {
+    const info = selectedServer ? localServers.find(s => s.name === selectedServer) : null;
+    if (!info?.shortCode) return;
+    try {
+      const result = await invoke<{ shortCode: string }>("regenerate_server_code", { shortCode: info.shortCode });
+      await updateStoredShortCode(info.path, result.shortCode);
+      onSetLocalServers(localServers.map(s => s.name === info.name ? { ...s, shortCode: result.shortCode } : s));
+      pushDiagnostic({ level: "info", source: "Servidor", title: "Código regenerado", message: `Novo código: CF-${result.shortCode}. O código antigo não funciona mais.` });
+    } catch (err) {
+      console.error(err);
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao regenerar código", message: String(err) });
+    }
+  };
+
   // --- Render ---
 
   const serverInfo = selectedServer ? localServers.find(s => s.name === selectedServer) : null;
@@ -711,6 +780,15 @@ export function HostView({
                     >
                       {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowRegenerateCode(true)}
+                      disabled={serverStatus !== "offline"}
+                      className="p-1.5 bg-theme-muted text-theme-secondary rounded-lg hover:bg-theme-card hover:text-indigo-600 transition-all active:scale-95 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      title={serverStatus !== "offline" ? "Pare o servidor para gerar um novo código" : "Gerar novo código (invalida o atual)"}
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 )}
               </div>
@@ -732,6 +810,13 @@ export function HostView({
                        serverStatus === "crashed" ? "Crash" : "Offline"}
                     </span>
                   </div>
+
+                  {wakeOnDemandServerInfo?.wakeOnDemandEnabled && serverStatus === "offline" && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 rounded-xl text-xs font-bold text-indigo-600 dark:text-indigo-300">
+                      <div className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+                      <span className="uppercase tracking-wider">Em espera</span>
+                    </div>
+                  )}
 
                   {/* Indicador leve de saúde: RAM/CPU real da máquina, atualizado a
                       cada ~15s (ver src-tauri thread de amostragem + mc-resource-sample).
@@ -775,6 +860,22 @@ export function HostView({
                 </div>
               )}
             </div>
+
+            {idleShutdownWarning !== null && (
+              <div className="p-4 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-2xl text-sm flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0" />
+                  <span>Desligando por inatividade em <strong>{idleShutdownWarning}s</strong> — sem jogadores há um tempo.</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelIdleShutdown}
+                  className="px-4 h-10 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs flex-shrink-0 cursor-pointer transition-colors"
+                >
+                  Manter ligado
+                </button>
+              </div>
+            )}
 
             {serverStatus === "crashed" && (
               <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl text-sm">
@@ -1086,6 +1187,18 @@ export function HostView({
         onClose={() => onSetShowSettings(false)}
         currentPort={minecraftPort || 25565}
         onSave={handleSaveSettings}
+      />
+
+      <ConfirmActionModal
+        isOpen={showRegenerateCode}
+        title="Gerar novo código?"
+        message={`O código atual (CF-${displayShortCode}) deixa de funcionar imediatamente — qualquer pessoa que ainda o tenha (inclusive quem não deveria) não vai mais conseguir entrar. Você vai precisar compartilhar o novo código com quem já joga com você.`}
+        confirmLabel="Gerar novo código"
+        onClose={() => setShowRegenerateCode(false)}
+        onConfirm={async () => {
+          await handleRegenerateCode();
+          setShowRegenerateCode(false);
+        }}
       />
 
       <AnimatePresence>

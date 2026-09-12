@@ -34,6 +34,10 @@ export interface ServerInfo {
   forgeVersion: string | null;
   /** Versão do mod loader para Fabric (ex: "0.19.3") ou número da build para Paper (ex: "2"). Null para os demais tipos. */
   modLoaderVersion: string | null;
+  /** Wake-on-demand (Cubicase Plus) ligado para este servidor — ver src/lib/subscription.ts */
+  wakeOnDemandEnabled: boolean;
+  /** Minutos sem jogadores até desligar sozinho. null = usa o padrão (15) quando ligado. */
+  idleTimeoutMinutes: number | null;
 }
 
 export interface ServerInstallProgress {
@@ -1343,6 +1347,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
   let schemaVersion = 1;
   let forgeVersion: string | null = null;
   let modLoaderVersion: string | null = null;
+  let wakeOnDemandEnabled = false;
+  let idleTimeoutMinutes: number | null = null;
 
   if (await exists(metaPath)) {
     try {
@@ -1354,6 +1360,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
         schemaVersion?: number;
         forgeVersion?: string;
         modLoaderVersion?: string;
+        wakeOnDemandEnabled?: boolean;
+        idleTimeoutMinutes?: number | null;
       };
       uuid = meta.uuid ?? null;
       shortCode = meta.shortCode ?? null;
@@ -1361,6 +1369,10 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
       schemaVersion = meta.schemaVersion ?? 1;
       forgeVersion = meta.forgeVersion ?? null;
       modLoaderVersion = meta.modLoaderVersion ?? null;
+      // Preserva a config de wake-on-demand num reimport — sem isso, reimportar
+      // um servidor já configurado apagaria essa escolha silenciosamente.
+      wakeOnDemandEnabled = meta.wakeOnDemandEnabled ?? false;
+      idleTimeoutMinutes = meta.idleTimeoutMinutes ?? null;
     } catch { /* ignora */ }
   }
 
@@ -1387,6 +1399,8 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
     launchArgsDir,
     forgeVersion,
     modLoaderVersion,
+    wakeOnDemandEnabled,
+    idleTimeoutMinutes,
     createdAt: new Date().toISOString(),
     tags: [],
     imported: true,
@@ -1408,7 +1422,45 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
     launchArgsDir,
     forgeVersion,
     modLoaderVersion,
+    wakeOnDemandEnabled,
+    idleTimeoutMinutes,
   };
+}
+
+/**
+ * Atualiza só o shortCode salvo no cubicase-meta.json de um servidor já
+ * existente (ex.: depois de regenerar o código na API Central porque o
+ * antigo vazou — ver regenerate_server_code no Rust). Preserva todo o resto
+ * do arquivo intacto; se ele não existir ainda por algum motivo, é criado só
+ * com esse campo (o próximo start/import completa o resto).
+ */
+export async function updateStoredShortCode(serverPath: string, newShortCode: string): Promise<void> {
+  const metaPath = await join(serverPath, "cubicase-meta.json");
+  let meta: Record<string, unknown> = {};
+  if (await exists(metaPath)) {
+    try {
+      meta = JSON.parse(await readTextFile(metaPath));
+    } catch { /* arquivo corrompido: recria só com o shortCode abaixo */ }
+  }
+  meta.shortCode = newShortCode;
+  await writeTextFile(metaPath, JSON.stringify(meta, null, 2));
+}
+
+/** Mesmo molde de updateStoredShortCode, pros dois campos de wake-on-demand. */
+export async function updateWakeOnDemandConfig(
+  serverPath: string,
+  config: { enabled: boolean; idleTimeoutMinutes: number | null }
+): Promise<void> {
+  const metaPath = await join(serverPath, "cubicase-meta.json");
+  let meta: Record<string, unknown> = {};
+  if (await exists(metaPath)) {
+    try {
+      meta = JSON.parse(await readTextFile(metaPath));
+    } catch { /* arquivo corrompido: recria só com os campos abaixo */ }
+  }
+  meta.wakeOnDemandEnabled = config.enabled;
+  meta.idleTimeoutMinutes = config.idleTimeoutMinutes;
+  await writeTextFile(metaPath, JSON.stringify(meta, null, 2));
 }
 
 /**
@@ -1435,6 +1487,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
   let launchArgsDir: string | null = null;
   let forgeVersion: string | null = null;
   let modLoaderVersion: string | null = null;
+  let wakeOnDemandEnabled = false;
+  let idleTimeoutMinutes: number | null = null;
 
   const metaPath = await join(serverPath, "cubicase-meta.json");
   if (await exists(metaPath)) {
@@ -1451,6 +1505,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
           launchArgsDir?: string;
           forgeVersion?: string;
           modLoaderVersion?: string;
+          wakeOnDemandEnabled?: boolean;
+          idleTimeoutMinutes?: number | null;
         };
         version = meta.version ?? null;
         uuid = meta.uuid ?? null;
@@ -1462,6 +1518,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
         launchArgsDir = meta.launchArgsDir ?? null;
         forgeVersion = meta.forgeVersion ?? null;
         modLoaderVersion = meta.modLoaderVersion ?? null;
+        wakeOnDemandEnabled = meta.wakeOnDemandEnabled ?? false;
+        idleTimeoutMinutes = meta.idleTimeoutMinutes ?? null;
     } catch { /* ignora */ }
   }
 
@@ -1500,6 +1558,8 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
     launchArgsDir,
     forgeVersion,
     modLoaderVersion,
+    wakeOnDemandEnabled,
+    idleTimeoutMinutes,
   };
 }
 
@@ -1773,6 +1833,8 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
     let launchArgsDir: string | null = null;
     let forgeVersion: string | null = null;
     let modLoaderVersion: string | null = null;
+    let wakeOnDemandEnabled = false;
+    let idleTimeoutMinutes: number | null = null;
     const metaPath = await join(serverPath, "cubicase-meta.json");
     if (await exists(metaPath)) {
       try {
@@ -1788,6 +1850,8 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
           launchArgsDir?: string;
           forgeVersion?: string;
           modLoaderVersion?: string;
+          wakeOnDemandEnabled?: boolean;
+          idleTimeoutMinutes?: number | null;
         };
         version = meta.version ?? null;
         uuid = meta.uuid ?? null;
@@ -1799,6 +1863,8 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
         launchArgsDir = meta.launchArgsDir ?? null;
         forgeVersion = meta.forgeVersion ?? null;
         modLoaderVersion = meta.modLoaderVersion ?? null;
+        wakeOnDemandEnabled = meta.wakeOnDemandEnabled ?? false;
+        idleTimeoutMinutes = meta.idleTimeoutMinutes ?? null;
       } catch { /* ignora erros de parse */ }
     }
 
@@ -1833,7 +1899,7 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
     // Verificar status do EULA
     const eulaAccepted = await checkEulaAccepted(serverPath);
 
-    servers.push({ name: entry.name, path: serverPath, version, uuid, shortCode, serverType, description, schemaVersion, eulaAccepted, serverJar, launchArgsDir, forgeVersion, modLoaderVersion });
+    servers.push({ name: entry.name, path: serverPath, version, uuid, shortCode, serverType, description, schemaVersion, eulaAccepted, serverJar, launchArgsDir, forgeVersion, modLoaderVersion, wakeOnDemandEnabled, idleTimeoutMinutes });
   }
 
   return servers;

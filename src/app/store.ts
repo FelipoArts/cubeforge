@@ -2,8 +2,10 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { ServerInfo } from '@/lib/server';
 
-// Estado do ciclo de vida do servidor Minecraft
-export type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
+// Estado do ciclo de vida do servidor Minecraft. 'sleeping' só se aplica a
+// KnownServer.minecraftStatus (wake-on-demand armado, ver PlayersPanel/
+// GuestView) — nunca é um valor real do processo local deste host.
+export type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed' | 'sleeping';
 
 // Causa do último crash, já traduzida pelo analisador de regras
 // (src/lib/crashAnalyzer.ts) ou pelo diagnóstico genérico do Rust —
@@ -31,7 +33,13 @@ export interface KnownServer {
   version: string;
   serverType: string;
   description: string;
+  // Status da rede mesh do host (Tailscale) — só diz se dá pra alcançar o host
+  // pelo túnel do CubeForge, não se o Minecraft em si está de pé (ver minecraftStatus).
   status: ServerStatus;
+  // Status do processo Java do Minecraft no host, reportado independente da rede
+  // mesh (ver report_mc_status em lib.rs) — null quando a API Central nunca recebeu
+  // nenhum heartbeat dele (host nunca iniciou o servidor, ou registro expirou).
+  minecraftStatus: ServerStatus | null;
   port: number;
   maxPlayers: number;
   currentPlayers: number;
@@ -100,6 +108,13 @@ interface AppSettings {
   // Servidores locais do host (runtime, não persistido separadamente)
   localServers: ServerInfo[];
 
+  // shortCode do servidor ao qual o Convidado está conectado agora (persistido —
+  // sobrevive a F5/reabertura do app). A ÚNICA fonte de verdade pra "desconectado"
+  // é a rede mesh cair de verdade (evento "network-status" offline) ou o usuário
+  // clicar em Desconectar — nunca um simples reload de página. Ver GuestView.tsx
+  // e o restore em page.tsx (get_system_status).
+  guestConnectedShortCode: string | null;
+
   // Caminhos de servidores importados (persistido - são pastas fora do padrão)
   importedServerPaths: string[];
 
@@ -126,10 +141,11 @@ interface AppSettings {
   setLastCrashInfo: (info: CrashInfo | null) => void;
   setUser: (user: AuthUser | null) => void;
   setLocalServers: (servers: ServerInfo[]) => void;
+  setGuestConnectedShortCode: (shortCode: string | null) => void;
   setKnownServers: (servers: KnownServer[]) => void;
   addKnownServer: (server: KnownServer) => void;
   removeKnownServer: (shortCode: string) => void;
-  updateKnownServerStatus: (shortCode: string, status: ServerStatus, currentPlayers?: number) => void;
+  updateKnownServerStatus: (shortCode: string, status: ServerStatus, minecraftStatus?: ServerStatus | null, currentPlayers?: number) => void;
   addImportedServerPath: (path: string) => void;
   removeImportedServerPath: (path: string) => void;
   setLogs: (logs: any) => void;
@@ -155,6 +171,7 @@ export const useAppStore = create<AppSettings>()(
       user: null,
       knownServers: [],
       localServers: [],
+      guestConnectedShortCode: null,
       importedServerPaths: [],
       logs: [],
       mcLogsByServer: {},
@@ -183,6 +200,7 @@ export const useAppStore = create<AppSettings>()(
       setLastCrashInfo: (info) => set({ lastCrashInfo: info }),
       setUser: (user) => set({ user }),
       setLocalServers: (servers) => set({ localServers: servers }),
+      setGuestConnectedShortCode: (shortCode) => set({ guestConnectedShortCode: shortCode }),
       setKnownServers: (servers) => set({ knownServers: servers }),
       addKnownServer: (server) => set((state) => {
         const exists = state.knownServers.find(s => s.shortCode === server.shortCode);
@@ -192,12 +210,13 @@ export const useAppStore = create<AppSettings>()(
       removeKnownServer: (shortCode) => set((state) => ({
         knownServers: state.knownServers.filter(s => s.shortCode !== shortCode),
       })),
-      updateKnownServerStatus: (shortCode, status, currentPlayers) => set((state) => ({
+      updateKnownServerStatus: (shortCode, status, minecraftStatus, currentPlayers) => set((state) => ({
         knownServers: state.knownServers.map(s =>
           s.shortCode === shortCode
             ? {
                 ...s,
                 status,
+                minecraftStatus: minecraftStatus !== undefined ? minecraftStatus : s.minecraftStatus,
                 currentPlayers: currentPlayers ?? s.currentPlayers,
                 lastSeenOnline: status === 'online' ? new Date().toISOString() : s.lastSeenOnline,
                 // Marca o início da sessão "online" apenas na transição para online;
@@ -248,6 +267,7 @@ export const useAppStore = create<AppSettings>()(
         mode: state.mode,
         runningServer: state.runningServer,
         knownServers: state.knownServers,
+        guestConnectedShortCode: state.guestConnectedShortCode,
         importedServerPaths: state.importedServerPaths,
         logs: state.logs,
         mcLogsByServer: state.mcLogsByServer,

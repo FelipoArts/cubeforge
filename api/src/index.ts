@@ -32,20 +32,20 @@ interface Env {
   //   wrangler secret put STRIPE_WEBHOOK_SECRET   (whsec_..., gerado ao criar o
   //     endpoint de webhook em Developers > Webhooks, apontando pra
   //     .../api/v1/donations/webhook, eventos checkout.session.completed e
-  //     checkout.session.async_payment_succeeded)
+  //     checkout.session.async_payment_succeeded — e, desde a assinatura
+  //     Cubicase Plus, também customer.subscription.created/updated/deleted)
   STRIPE_RESTRICTED_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
-  // Secrets do Mercado Pago — nunca em wrangler.toml. Configurar com:
-  //   wrangler secret put MERCADOPAGO_ACCESS_TOKEN   (Access Token de produção,
-  //     em Suas integrações > [app] > Credenciais de produção)
-  //   wrangler secret put MERCADOPAGO_WEBHOOK_SECRET  (chave secreta gerada ao
-  //     configurar o webhook em Suas integrações > [app] > Webhooks, apontando
-  //     pra .../api/v1/donations/mercadopago/webhook, evento "Pagamentos")
-  MERCADOPAGO_ACCESS_TOKEN?: string;
-  MERCADOPAGO_WEBHOOK_SECRET?: string;
+  // Secret — nunca em wrangler.toml. Bypassa RLS inteiro (só o Worker usa,
+  // pra gravar assinaturas a partir do webhook do Stripe — ver
+  // supabaseRestUpsertSubscription). Configurar com:
+  //   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+  SUPABASE_SERVICE_ROLE_KEY?: string;
 }
 
-type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed';
+// 'sleeping' = wake-on-demand armado, host de pé só em modo de espera (sem
+// Java nem malha rodando) — ver handleHeartbeat/handleWakeServer.
+type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed' | 'sleeping';
 type SessionStatus = 'creating' | 'starting_provider' | 'waiting_provider' | 'online' | 'degraded' | 'stopping' | 'stopped' | 'failed' | 'cancelled';
 type TerminationReason = 'user_stopped' | 'application_closed' | 'provider_error' | 'api_error' | 'crash' | 'timeout' | 'lease_expired';
 
@@ -78,10 +78,50 @@ const ResponseCodes = {
   CONNECTION_SESSION_CREATED: 'CONNECTION_SESSION_CREATED', HEARTBEAT_RECEIVED: 'HEARTBEAT_RECEIVED',
   BAD_REQUEST: 'BAD_REQUEST', NOT_FOUND: 'NOT_FOUND', SERVER_NOT_FOUND: 'SERVER_NOT_FOUND', SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   CONFLICT: 'CONFLICT', INTERNAL_ERROR: 'INTERNAL_ERROR', VALIDATION_ERROR: 'VALIDATION_ERROR',
-  STALE_WRITE: 'STALE_WRITE', OPERATION_IN_PROGRESS: 'OPERATION_IN_PROGRESS',
+  STALE_WRITE: 'STALE_WRITE', OPERATION_IN_PROGRESS: 'OPERATION_IN_PROGRESS', RATE_LIMITED: 'RATE_LIMITED',
 } as const;
 
 const SHORT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// ============================================================
+// RATE LIMITING — proteção básica contra brute-force de shortCode
+// ============================================================
+// shortCode é a única credencial (6 chars, alfabeto de 32 → ~1.07 bilhão de
+// combinações) — sem isso, nada impede um script tentando milhares de
+// códigos por minuto contra /servers/{sc} (descoberta) ou mintando sessões
+// de convidado à toa via /connection-sessions.
+//
+// KV não tem incremento atômico (isso exigiria Durable Objects) — sob
+// rajadas concorrentes da MESMA origem numa janela de poucos segundos,
+// algumas requisições podem escapar da contagem exata. "Best effort" é
+// suficiente aqui: o objetivo é inviabilizar brute-force sequencial
+// automatizado, não dar uma garantia forte contra um atacante distribuído
+// (isso já é papel de uma regra de rate-limit no dashboard da Cloudflare).
+const RATE_LIMIT_WINDOW_SECONDS = 60;
+const DISCOVER_RATE_LIMIT = 60;  // status/descoberta: guest legítimo faz polling frequente enquanto aguarda o servidor subir
+const JOIN_RATE_LIMIT = 10;      // connection-sessions: minta uma authKey Tailscale de verdade, mais sensível
+const REGEN_CODE_RATE_LIMIT = 5; // regenerar código: ação manual e rara, sem motivo legítimo pra repetir muitas vezes por minuto
+const SUB_CHECKOUT_RATE_LIMIT = 5;  // assinar: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
+const SUB_PORTAL_RATE_LIMIT = 10;   // gerenciar assinatura: pode ser reaberto ao focar o painel de configurações
+const WAKE_RATE_LIMIT = 10;         // por IP/min — mesmo raciocínio de JOIN_RATE_LIMIT
+const WAKE_COOLDOWN_SECONDS = 20;   // por shortCode, independente do IP — ver handleWakeServer
+
+function clientIp(req: Request): string {
+  return req.headers.get('CF-Connecting-IP') || 'unknown';
+}
+
+async function checkRateLimit(env: Env, bucket: string, ip: string, limit: number): Promise<boolean> {
+  const key = `ratelimit:${bucket}:${ip}`;
+  const raw = await env.CUBEFORGE_REGISTRY.get(key);
+  const count = raw ? parseInt(raw, 10) : 0;
+  if (count >= limit) return false;
+  await env.CUBEFORGE_REGISTRY.put(key, String(count + 1), { expirationTtl: RATE_LIMIT_WINDOW_SECONDS });
+  return true;
+}
+
+function rateLimitedResponse(cors: Record<string, string>): Response {
+  return json(fail(ResponseCodes.RATE_LIMITED, 'Muitas tentativas. Aguarde um minuto e tente de novo.'), 429, cors);
+}
 
 let technicalIdCounter = 0;
 
@@ -219,7 +259,14 @@ async function handleHeartbeat(shortCode: string, req: Request, env: Env, cfg: {
     const ns: SessionEntity = { shortCode, provider: 'tailscale', hostIp: body.hostIp || '0.0.0.0', port: body.port || 25565, status: body.status || 'starting', currentPlayers: body.currentPlayers || 0, maxPlayers: body.maxPlayers || 20, lastHeartbeat: now.toISOString(), createdAt: now.toISOString(), expiresAt: exp.toISOString() };
     await env.CUBEFORGE_REGISTRY.put(key, JSON.stringify(ns), { expirationTtl: cfg.ttlSeconds });
   }
-  return json(ok(ResponseCodes.HEARTBEAT_RECEIVED, 'Heartbeat recebido.', { shortCode, expiresAt: exp.toISOString() }), 200, cors);
+  // Consome (delete) o pedido de despertar, se houver — ver handleWakeServer.
+  // Checado incondicionalmente: inofensivo pros chamadores comuns (report_mc_status
+  // no Rust), que sempre vão receber wakeRequested:false.
+  const wakeKey = `wake:${shortCode}`;
+  const wakeRequested = (await env.CUBEFORGE_REGISTRY.get(wakeKey)) !== null;
+  if (wakeRequested) await env.CUBEFORGE_REGISTRY.delete(wakeKey);
+
+  return json(ok(ResponseCodes.HEARTBEAT_RECEIVED, 'Heartbeat recebido.', { shortCode, expiresAt: exp.toISOString(), wakeRequested }), 200, cors);
 }
 
 // ============================================================
@@ -245,32 +292,139 @@ async function handleDiscoverServer(shortCode: string, env: Env, cors: Record<st
   const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
   if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
   const sv: ServerEntity = JSON.parse(sj);
-  // "host" porque este endpoint existe pra convidados descobrirem o status do
-  // servidor antes de entrar — a sessão relevante é sempre a de quem hospeda.
+
+  // Rede mesh: vem da ConnectionSession do host ("host" porque este endpoint existe
+  // pra convidados descobrirem o status antes de entrar — a sessão relevante é
+  // sempre a de quem hospeda), se houver uma ativa agora.
   const csid = await env.CUBEFORGE_REGISTRY.get(`csession-by-shortcode:${shortCode}:host`);
-  let se: SessionEntity | null = null;
+  let networkStatus: SessionStatus | null = null;
+  let provider = 'tailscale', hostIp = '', port = 25565, maxPlayers = 20, currentPlayers = 0, lastHeartbeat: string | null = null;
   if (csid) {
     const csj = await env.CUBEFORGE_REGISTRY.get(`csession:${csid}`);
-    if (csj) { const cs: ConnectionSessionEntity = JSON.parse(csj); se = { shortCode: cs.shortCode, provider: cs.launcher, hostIp: cs.hostIp || '', port: cs.port, status: cs.status as ServerStatus, currentPlayers: cs.currentPlayers, maxPlayers: cs.maxPlayers, lastHeartbeat: cs.lastHeartbeat, createdAt: cs.createdAt, expiresAt: cs.expiresAt }; }
+    if (csj) {
+      const cs: ConnectionSessionEntity = JSON.parse(csj);
+      networkStatus = cs.status;
+      provider = cs.launcher; hostIp = cs.hostIp || ''; port = cs.port;
+      maxPlayers = cs.maxPlayers; currentPlayers = cs.currentPlayers; lastHeartbeat = cs.lastHeartbeat;
+    }
   }
-  if (!se) { const lj = await env.CUBEFORGE_REGISTRY.get(`session:${shortCode}`); if (lj) se = JSON.parse(lj); }
-  return json(ok(ResponseCodes.SUCCESS, 'Servidor encontrado.', { server: sv, session: se ? { provider: se.provider, hostIp: se.hostIp, port: se.port, status: se.status, currentPlayers: se.currentPlayers, maxPlayers: se.maxPlayers, lastHeartbeat: se.lastHeartbeat } : null }), 200, cors);
+
+  // Minecraft: vem do heartbeat leve por shortCode (ver handleHeartbeat), que o host
+  // manda independente da rede mesh estar ligada — é o que permite dizer "servidor
+  // rodando, mas sem malha" ou "malha pronta, servidor desligado" em vez de um
+  // único status combinado.
+  const mcj = await env.CUBEFORGE_REGISTRY.get(`session:${shortCode}`);
+  const mc: SessionEntity | null = mcj ? JSON.parse(mcj) : null;
+  if (mc) currentPlayers = mc.currentPlayers;
+
+  return json(ok(ResponseCodes.SUCCESS, 'Servidor encontrado.', {
+    server: sv,
+    session: {
+      // Mantido por compatibilidade: builds antigas só conheciam este campo,
+      // e ele sempre foi o status da malha, nunca o do Minecraft.
+      status: networkStatus,
+      networkStatus,
+      minecraftStatus: mc?.status ?? null,
+      provider, hostIp, port, currentPlayers, maxPlayers, lastHeartbeat,
+    },
+  }), 200, cors);
 }
 
 // ============================================================
 // DELETE SERVER
 // ============================================================
 
+/**
+ * Encerra qualquer ConnectionSession ativa (host e guest) presa a um shortCode,
+ * revogando de verdade a credencial Tailscale de cada uma — não só apagando o
+ * registro do KV — para que ninguém continue com acesso à malha depois. Usado
+ * tanto ao remover um servidor quanto ao regenerar seu código (ver
+ * handleRegenerateCode), já que nos dois casos o shortCode antigo deixa de ser
+ * válido e qualquer sessão presa a ele precisa cair.
+ */
+async function terminateActiveSessionsForShortCode(env: Env, shortCode: string): Promise<void> {
+  for (const m of ['host', 'guest'] as const) {
+    const csid = await env.CUBEFORGE_REGISTRY.get(`csession-by-shortcode:${shortCode}:${m}`);
+    if (!csid) continue;
+    const csj = await env.CUBEFORGE_REGISTRY.get(`csession:${csid}`);
+    if (csj) {
+      const cs: ConnectionSessionEntity = JSON.parse(csj);
+      if (cs.tailscaleDeviceId) await deleteTailscaleDevice(env, cs.tailscaleDeviceId);
+      else if (cs.tailscaleKeyId) await revokeTailscaleKey(env, cs.tailscaleKeyId);
+    }
+    await env.CUBEFORGE_REGISTRY.delete(`csession:${csid}`);
+    await env.CUBEFORGE_REGISTRY.delete(`csession-by-shortcode:${shortCode}:${m}`);
+  }
+}
+
 async function handleDeleteServer(shortCode: string, env: Env, cors: Record<string, string>): Promise<Response> {
   const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
   if (sj) { const sv: ServerEntity = JSON.parse(sj); await env.CUBEFORGE_REGISTRY.delete(`server:${shortCode}`); await env.CUBEFORGE_REGISTRY.delete(`shortCode:${sv.uuid}`); }
-  // Host e guest têm sessões independentes (ver handleCreateConnectionSession) — limpa as duas.
-  for (const m of ['host', 'guest'] as const) {
-    const csid = await env.CUBEFORGE_REGISTRY.get(`csession-by-shortcode:${shortCode}:${m}`);
-    if (csid) { await env.CUBEFORGE_REGISTRY.delete(`csession:${csid}`); await env.CUBEFORGE_REGISTRY.delete(`csession-by-shortcode:${shortCode}:${m}`); }
-  }
+  await terminateActiveSessionsForShortCode(env, shortCode);
   await env.CUBEFORGE_REGISTRY.delete(`session:${shortCode}`);
   return json(ok(ResponseCodes.SERVER_DELETED, 'Servidor removido.'), 200, cors);
+}
+
+// ============================================================
+// REGENERATE SERVER CODE
+// ============================================================
+//
+// Gera um novo shortCode para um servidor já existente, mantendo uuid e
+// metadados intactos — usado quando o código atual vazou (ver discussão de
+// segurança da ACL). Só o Worker decide o novo código (via genCode, mesma
+// checagem de colisão do cadastro inicial) para nunca haver risco de dois
+// clientes gerarem o mesmo valor.
+//
+// Encerra de propósito qualquer sessão ativa presa ao código antigo — se
+// alguém (inclusive um estranho que tinha o código vazado) estava conectado
+// na malha, cai na hora. O host precisa reconectar/reiniciar a hospedagem
+// depois, o que já re-registra tudo do zero com o código novo.
+
+async function handleRegenerateCode(oldShortCode: string, env: Env, cfg: { shortCodeLength: number }, cors: Record<string, string>): Promise<Response> {
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${oldShortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+  const sv: ServerEntity = JSON.parse(sj);
+
+  const newShortCode = await genCode(env, cfg.shortCodeLength);
+  const updated: ServerEntity = { ...sv, shortCode: newShortCode, updatedAt: new Date().toISOString() };
+
+  await env.CUBEFORGE_REGISTRY.put(`server:${newShortCode}`, JSON.stringify(updated));
+  await env.CUBEFORGE_REGISTRY.put(`shortCode:${sv.uuid}`, newShortCode);
+  await env.CUBEFORGE_REGISTRY.delete(`server:${oldShortCode}`);
+
+  // Sessão legada de heartbeat (ver handleHeartbeat) e qualquer ConnectionSession
+  // ativa ficam órfãs/inválidas presas ao código antigo — melhor derrubar tudo
+  // agora do que deixar lixo (ou, pior, acesso de rede) associado a um código
+  // que não existe mais.
+  await terminateActiveSessionsForShortCode(env, oldShortCode);
+  await env.CUBEFORGE_REGISTRY.delete(`session:${oldShortCode}`);
+
+  return json(ok(ResponseCodes.SERVER_UPDATED, 'Código regenerado.', updated), 200, cors);
+}
+
+// ============================================================
+// WAKE-ON-DEMAND — acordar servidor em espera (Cubicase Plus)
+// ============================================================
+// Só grava um "pedido de despertar" (TTL curto) que o host consome no
+// próximo heartbeat de "sleeping" que mandar (ver handleHeartbeat) — o
+// Worker nunca fala direto com o host, é sempre o host puxando (polling
+// curto do lado dele). Duas proteções, não uma: rate limit por IP (padrão
+// já usado nas outras rotas) E um cooldown por shortCode — este último é o
+// que realmente impede alguém de ficar ligando o PC de um estranho remoto
+// repetidamente com um código vazado, independente de trocar de IP.
+
+async function handleWakeServer(shortCode: string, env: Env, cors: Record<string, string>): Promise<Response> {
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+
+  const cooldownKey = `wakecooldown:${shortCode}`;
+  if (await env.CUBEFORGE_REGISTRY.get(cooldownKey)) {
+    return json(fail(ResponseCodes.RATE_LIMITED, 'Pedido de despertar já enviado recentemente. Aguarde alguns segundos.'), 429, cors);
+  }
+  await env.CUBEFORGE_REGISTRY.put(cooldownKey, '1', { expirationTtl: WAKE_COOLDOWN_SECONDS });
+  await env.CUBEFORGE_REGISTRY.put(`wake:${shortCode}`, '1', { expirationTtl: 120 });
+
+  return json(ok(ResponseCodes.SUCCESS, 'Pedido de despertar enviado.'), 200, cors);
 }
 
 // ============================================================
@@ -415,7 +569,7 @@ async function handleLegacyDiscover(shortCode: string, env: Env, cors: Record<st
 // ============================================================
 //
 // A API da CurseForge exige uma API key (x-api-key) para qualquer chamada.
-// Essa key nunca pode ir para o cliente desktop, já que o CubeForge Dash é
+// Essa key nunca pode ir para o cliente desktop, já que o Cubicase é
 // distribuído publicamente. Este proxy injeta a key aqui no Worker (via
 // Cloudflare secret, `wrangler secret put CURSEFORGE_API_KEY` — nunca em
 // wrangler.toml/git) e só repassa um allowlist fixo de endpoints
@@ -544,6 +698,206 @@ async function handleCreateDonationCheckout(env: Env, cors: Record<string, strin
   return json(ok(ResponseCodes.SUCCESS, 'Sessão de checkout criada.', { url: data.url }), 200, cors);
 }
 
+// ============================================================
+// Cubicase Plus (Stripe Subscriptions) — assinatura recorrente
+// ============================================================
+// Mesmo princípio da doação acima (fetch puro contra a API do Stripe, sem
+// SDK), mas com duas diferenças importantes:
+//
+// 1. Precisa saber QUEM está assinando — diferente da doação (anônima), a
+//    entitlement precisa ficar amarrada a um usuário do Supabase. Como o
+//    Worker não tem sessão nenhuma do usuário, `resolveSupabaseUserId`
+//    valida o próprio access token do Supabase (mandado pelo app no header
+//    Authorization) contra o Supabase Auth antes de fazer qualquer coisa —
+//    nunca confia num userId vindo solto no body, senão qualquer um
+//    conseguiria abrir o Portal de cobrança (ou até "assinar em nome") de
+//    outra pessoa só adivinhando o UUID dela.
+//
+// 2. O vínculo Stripe <-> Supabase viaja em `subscription_data.metadata`
+//    na criação da Checkout Session — o Stripe copia isso pro objeto
+//    Subscription, então todo evento de webhook da vida útil dessa
+//    assinatura (created/updated/deleted) já chega com o supabase_user_id,
+//    sem precisar guardar um mapeamento à parte nem consultar o Supabase a
+//    cada evento.
+//
+// A tabela `subscriptions` (ver scripts/supabase-subscriptions.sql) só é
+// escrita por aqui, via SUPABASE_SERVICE_ROLE_KEY (bypassa RLS) — o app só
+// LÊ, direto do Supabase, com a própria sessão do usuário.
+
+const SUPABASE_URL = 'https://rtfxcyvymlxebvemgwaj.supabase.co';
+// Mesma publishable key de src/lib/supabaseClient.ts — pública por design
+// (RLS protege os dados, não o segredo desta key).
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_ggAEPrue0lgmIlXGkv4vUg_Hot7Xe0Y';
+
+// Criados uma vez no Dashboard do Stripe (Product "Cubicase Plus", dois
+// Prices recorrentes) — IDs de preço não são segredo, só a chave de API é.
+const SUBSCRIPTION_PRICE_MONTHLY = 'price_1UEtMAJrnDGUaagEswwcRrr0'; // R$14,90/mês
+const SUBSCRIPTION_PRICE_ANNUAL = 'price_1UEtMAJrnDGUaagEv7oGwtQq';  // R$149,90/ano
+
+type SubscriptionPlan = 'monthly' | 'annual';
+
+function priceIdForPlan(plan: string): string | null {
+  if (plan === 'monthly') return SUBSCRIPTION_PRICE_MONTHLY;
+  if (plan === 'annual') return SUBSCRIPTION_PRICE_ANNUAL;
+  return null;
+}
+
+function planForPriceId(priceId: string | undefined): SubscriptionPlan | null {
+  if (priceId === SUBSCRIPTION_PRICE_MONTHLY) return 'monthly';
+  if (priceId === SUBSCRIPTION_PRICE_ANNUAL) return 'annual';
+  return null;
+}
+
+/** Valida o Bearer token do Supabase contra o próprio Supabase Auth — nunca confia num userId vindo do cliente. */
+async function resolveSupabaseUserId(req: Request): Promise<string | null> {
+  const auth = req.headers.get('Authorization');
+  if (!auth?.startsWith('Bearer ')) return null;
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: auth },
+    });
+    if (!resp.ok) return null;
+    const data: any = await resp.json().catch(() => null);
+    return data?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Busca o stripe_customer_id já salvo para este usuário (evita duplicar Customer no Stripe ao reassinar). */
+async function supabaseRestGetCustomerId(env: Env, userId: string): Promise<string | null> {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${encodeURIComponent(userId)}&select=stripe_customer_id`,
+      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+    );
+    if (!resp.ok) return null;
+    const rows: any = await resp.json().catch(() => []);
+    return rows?.[0]?.stripe_customer_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Upsert (por user_id) da linha de assinatura — chamado a partir do webhook, nunca do fluxo síncrono de checkout. */
+async function supabaseRestUpsertSubscription(env: Env, row: {
+  user_id: string;
+  stripe_customer_id: string;
+  stripe_subscription_id: string;
+  plan: SubscriptionPlan;
+  status: string;
+  current_period_end: string | null;
+  cancel_at_period_end: boolean;
+}): Promise<void> {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('SUPABASE_SERVICE_ROLE_KEY ausente — assinatura não sincronizada com o Supabase.');
+    return;
+  }
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=user_id`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+    });
+    if (!resp.ok) {
+      console.error('Falha ao gravar assinatura no Supabase:', resp.status, await resp.text().catch(() => ''));
+    }
+  } catch (e) {
+    console.error('Falha ao contatar o Supabase:', e);
+  }
+}
+
+/** POST /api/v1/subscriptions/checkout-session — abre o Checkout de assinatura (mensal ou anual). */
+async function handleCreateSubscriptionCheckout(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.STRIPE_RESTRICTED_KEY) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Assinaturas não estão configuradas neste servidor.'), 503, cors);
+  }
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+
+  let body: any; try { body = await req.json(); } catch { body = {}; }
+  const priceId = priceIdForPlan(body.plan);
+  if (!priceId) return json(fail(ResponseCodes.VALIDATION_ERROR, 'plan precisa ser "monthly" ou "annual".'), 400, cors);
+
+  const existingCustomerId = await supabaseRestGetCustomerId(env, userId);
+
+  const params = new URLSearchParams();
+  params.set('mode', 'subscription');
+  params.set('success_url', 'https://cubicase.net/assinatura/sucesso/?session_id={CHECKOUT_SESSION_ID}');
+  params.set('cancel_url', 'https://cubicase.net/download/');
+  params.set('line_items[0][quantity]', '1');
+  params.set('line_items[0][price]', priceId);
+  // client_reference_id é só pra visibilidade no Dashboard — a reconciliação
+  // de verdade usa subscription_data.metadata (ver comentário no topo desta
+  // seção), que persiste em todo evento de webhook da assinatura.
+  params.set('client_reference_id', userId);
+  params.set('subscription_data[metadata][supabase_user_id]', userId);
+  if (existingCustomerId) params.set('customer', existingCustomerId);
+  // Sem payment_method_types de propósito, idem doações.
+  params.set('integration_identifier', `cubicase_${randomLowercaseLetters(8)}`);
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${STRIPE_API_BASE}/checkout/sessions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.STRIPE_RESTRICTED_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Stripe-Version': STRIPE_API_VERSION,
+      },
+      body: params.toString(),
+    });
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar o Stripe.', { error: String(e) }), 502, cors);
+  }
+
+  const data: any = await upstream.json().catch(() => null);
+  if (!upstream.ok || !data?.url) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Não foi possível criar a sessão de assinatura.', { stripeError: data?.error?.message }), 502, cors);
+  }
+  return json(ok(ResponseCodes.SUCCESS, 'Sessão de checkout criada.', { url: data.url }), 200, cors);
+}
+
+/** POST /api/v1/subscriptions/portal-session — abre o Stripe Billing Portal (gerenciar/cancelar). */
+async function handleCreateBillingPortalSession(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  if (!env.STRIPE_RESTRICTED_KEY) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Portal de assinatura não está configurado neste servidor.'), 503, cors);
+  }
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+
+  const customerId = await supabaseRestGetCustomerId(env, userId);
+  if (!customerId) return json(fail(ResponseCodes.NOT_FOUND, 'Nenhuma assinatura encontrada.'), 404, cors);
+
+  const params = new URLSearchParams({ customer: customerId, return_url: 'https://cubicase.net/download/' });
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${STRIPE_API_BASE}/billing_portal/sessions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.STRIPE_RESTRICTED_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Stripe-Version': STRIPE_API_VERSION,
+      },
+      body: params.toString(),
+    });
+  } catch (e) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar o Stripe.', { error: String(e) }), 502, cors);
+  }
+
+  const data: any = await upstream.json().catch(() => null);
+  if (!upstream.ok || !data?.url) {
+    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Não foi possível abrir o portal de assinatura.', { stripeError: data?.error?.message }), 502, cors);
+  }
+  return json(ok(ResponseCodes.SUCCESS, 'Sessão de portal criada.', { url: data.url }), 200, cors);
+}
+
 /** Verifica a assinatura `Stripe-Signature` de um webhook (HMAC-SHA256, via Web Crypto — sem depender do SDK do Stripe). */
 async function verifyStripeSignature(payload: string, header: string | null, secret: string): Promise<boolean> {
   if (!header) return false;
@@ -607,175 +961,43 @@ async function handleStripeWebhook(req: Request, env: Env, cors: Record<string, 
     }
   }
 
+  // Assinatura Cubicase Plus: created/updated cobrem alta (status inicial já
+  // vem preenchido, sem precisar de uma chamada de volta ao Stripe pra
+  // buscar a subscription) e qualquer mudança de status durante a vida da
+  // assinatura (renovação, pagamento atrasado, etc). deleted é o fim de
+  // verdade — mantém a linha (status:'canceled') em vez de apagar, pra não
+  // perder histórico. Sem handler dedicado pra invoice.payment_failed: uma
+  // cobrança falha já reflete em sub.status (ex.: 'past_due') e chega aqui
+  // via customer.subscription.updated.
+  if (
+    event.type === 'customer.subscription.created' ||
+    event.type === 'customer.subscription.updated' ||
+    event.type === 'customer.subscription.deleted'
+  ) {
+    const sub = event.data?.object;
+    const userId = sub?.metadata?.supabase_user_id;
+    if (sub && userId) {
+      const priceId = sub.items?.data?.[0]?.price?.id;
+      const plan = planForPriceId(priceId);
+      // current_period_end mudou de lugar entre versões da API do Stripe
+      // (do topo da Subscription pra dentro de cada item) — lê defensivo.
+      const periodEndUnix = sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end ?? null;
+      await supabaseRestUpsertSubscription(env, {
+        user_id: userId,
+        stripe_customer_id: sub.customer,
+        stripe_subscription_id: sub.id,
+        plan: plan ?? 'monthly',
+        status: event.type === 'customer.subscription.deleted' ? 'canceled' : sub.status,
+        current_period_end: periodEndUnix ? new Date(periodEndUnix * 1000).toISOString() : null,
+        cancel_at_period_end: !!sub.cancel_at_period_end,
+      });
+    } else {
+      console.error('Webhook de assinatura sem metadata.supabase_user_id:', event.id, event.type);
+    }
+  }
+
   // Sempre 200 pro Stripe não ficar reenviando eventos que já processamos
   // (ou que não nos interessam) indefinidamente.
-  return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
-}
-
-// ============================================================
-// Doações via Pix (Mercado Pago) — complemento ao Stripe
-// ============================================================
-// O Stripe (acima) não libera Pix pra contas pessoa física novas — pra não
-// perder quem prefere Pix a preencher cartão, esse segundo caminho usa o
-// Checkout Pro do Mercado Pago, que aceita conta de pessoa física sem
-// carência. O app mostra as duas opções (Cartão → Stripe, Pix → Mercado
-// Pago) e cada uma abre sua própria página hospedada no navegador.
-//
-// Diferença importante em relação ao Stripe: o Checkout Pro do Mercado
-// Pago não tem "o cliente escolhe o valor" — o valor precisa vir fixo na
-// criação da preferência. Por isso este endpoint recebe o valor (em
-// centavos, mesma unidade que o resto do app usa) no corpo da requisição;
-// a escolha do valor acontece numa etapa curta dentro do próprio Cubicase
-// (não é dado de pagamento, só um número).
-
-const MERCADOPAGO_API_BASE = 'https://api.mercadopago.com';
-const DONATION_MIN_CENTS = 50; // R$0,50 — mesmo mínimo do Price do Stripe
-const DONATION_MAX_CENTS = 100_000; // R$1.000,00 — mesmo teto do Stripe
-
-async function handleCreateMercadoPagoCheckout(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
-  if (!env.MERCADOPAGO_ACCESS_TOKEN) {
-    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Doações via Pix não estão configuradas neste servidor.'), 503, cors);
-  }
-
-  let body: any;
-  try {
-    body = await req.json();
-  } catch {
-    body = {};
-  }
-  const amountCents = Math.round(Number(body?.amountCents));
-  if (!Number.isFinite(amountCents) || amountCents < DONATION_MIN_CENTS || amountCents > DONATION_MAX_CENTS) {
-    return json(fail(ResponseCodes.VALIDATION_ERROR, `O valor precisa estar entre R$${(DONATION_MIN_CENTS / 100).toFixed(2)} e R$${(DONATION_MAX_CENTS / 100).toFixed(2)}.`), 400, cors);
-  }
-
-  const preference = {
-    items: [
-      {
-        title: 'Doação para o Cubicase',
-        quantity: 1,
-        unit_price: amountCents / 100,
-        currency_id: 'BRL',
-      },
-    ],
-    back_urls: {
-      success: 'https://cubicase.net/obrigado/',
-      failure: 'https://cubicase.net/download/',
-      pending: 'https://cubicase.net/obrigado/',
-    },
-    auto_return: 'approved',
-    notification_url: 'https://cubeforge-api.cubeforge.workers.dev/api/v1/donations/mercadopago/webhook',
-    // Restringe ao Pix — cartão já é coberto pelo Stripe, não faz sentido
-    // duplicar aqui (e evita confundir o doador com métodos redundantes).
-    payment_methods: {
-      excluded_payment_types: [{ id: 'credit_card' }, { id: 'debit_card' }, { id: 'ticket' }, { id: 'atm' }],
-    },
-  };
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${MERCADOPAGO_API_BASE}/checkout/preferences`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.MERCADOPAGO_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(preference),
-    });
-  } catch (e) {
-    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao contatar o Mercado Pago.', { error: String(e) }), 502, cors);
-  }
-
-  const data: any = await upstream.json().catch(() => null);
-  if (!upstream.ok || !data?.init_point) {
-    return json(
-      fail(ResponseCodes.INTERNAL_ERROR, 'Não foi possível criar a cobrança Pix.', { mercadoPagoError: data?.message || data }),
-      502,
-      cors
-    );
-  }
-
-  return json(ok(ResponseCodes.SUCCESS, 'Cobrança Pix criada.', { url: data.init_point }), 200, cors);
-}
-
-/** Verifica a assinatura `x-signature` de um webhook do Mercado Pago (HMAC-SHA256 sobre um manifest fixo — ver docs.mercadopago.com/webhooks). */
-async function verifyMercadoPagoSignature(dataId: string, requestId: string | null, signatureHeader: string | null, secret: string): Promise<boolean> {
-  if (!signatureHeader || !requestId) return false;
-  const parts = Object.fromEntries(
-    signatureHeader.split(',').map((kv) => {
-      const [k, v] = kv.split('=');
-      return [k?.trim(), v?.trim()];
-    })
-  );
-  const ts = parts['ts'];
-  const v1 = parts['v1'];
-  if (!ts || !v1) return false;
-
-  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const signed = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(manifest));
-  const expected = Array.from(new Uint8Array(signed))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  if (expected.length !== v1.length) return false;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
-  return diff === 0;
-}
-
-async function handleMercadoPagoWebhook(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
-  if (!env.MERCADOPAGO_ACCESS_TOKEN || !env.MERCADOPAGO_WEBHOOK_SECRET) {
-    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Webhook do Mercado Pago não está configurado.'), 503, cors);
-  }
-
-  const url = new URL(req.url);
-  let payload: any = {};
-  try {
-    payload = await req.json();
-  } catch {
-    payload = {};
-  }
-
-  // O Mercado Pago manda o id do pagamento tanto na query string (formato
-  // IPN legado) quanto no corpo (formato webhook novo) — aceita os dois.
-  const dataId = payload?.data?.id || url.searchParams.get('data.id') || url.searchParams.get('id');
-  const topic = payload?.type || url.searchParams.get('type') || url.searchParams.get('topic');
-
-  if (!dataId || topic !== 'payment') {
-    // Outros tópicos (merchant_order, etc) não interessam aqui — sempre 200
-    // pro Mercado Pago não ficar reentregando.
-    return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
-  }
-
-  const validSig = await verifyMercadoPagoSignature(String(dataId), req.headers.get('x-request-id'), req.headers.get('x-signature'), env.MERCADOPAGO_WEBHOOK_SECRET);
-  if (!validSig) {
-    return json(fail(ResponseCodes.BAD_REQUEST, 'Assinatura do webhook inválida.'), 400, cors);
-  }
-
-  // O payload do webhook não traz o status do pagamento — precisa buscar
-  // direto na API pra confirmar de verdade (nunca confiar só na notificação).
-  let payment: any;
-  try {
-    const resp = await fetch(`${MERCADOPAGO_API_BASE}/v1/payments/${dataId}`, {
-      headers: { Authorization: `Bearer ${env.MERCADOPAGO_ACCESS_TOKEN}` },
-    });
-    payment = await resp.json().catch(() => null);
-  } catch (e) {
-    return json(fail(ResponseCodes.INTERNAL_ERROR, 'Falha ao confirmar o pagamento no Mercado Pago.', { error: String(e) }), 502, cors);
-  }
-
-  if (payment && payment.status === 'approved') {
-    await env.CUBEFORGE_REGISTRY.put(
-      `donation:mp_${dataId}`,
-      JSON.stringify({
-        provider: 'mercadopago',
-        amountTotal: Math.round((payment.transaction_amount || 0) * 100),
-        currency: payment.currency_id,
-        createdAt: new Date().toISOString(),
-      })
-    );
-  }
-
   return json(ok(ResponseCodes.SUCCESS, 'ok'), 200, cors);
 }
 
@@ -793,7 +1015,24 @@ export default {
 
       // POST /api/v1/servers/{sc}/connection-sessions
       const m1 = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/connection-sessions$/);
-      if (m === 'POST' && m1) return await handleCreateConnectionSession(m1[1].toUpperCase(), req, env, cfg, cors);
+      if (m === 'POST' && m1) {
+        if (!(await checkRateLimit(env, 'join', clientIp(req), JOIN_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleCreateConnectionSession(m1[1].toUpperCase(), req, env, cfg, cors);
+      }
+
+      // POST /api/v1/servers/{sc}/regenerate-code
+      const m1r = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/regenerate-code$/);
+      if (m === 'POST' && m1r) {
+        if (!(await checkRateLimit(env, 'regen', clientIp(req), REGEN_CODE_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleRegenerateCode(m1r[1].toUpperCase(), env, cfg, cors);
+      }
+
+      // POST /api/v1/servers/{sc}/wake — acordar servidor em espera (wake-on-demand)
+      const m1w = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/wake$/);
+      if (m === 'POST' && m1w) {
+        if (!(await checkRateLimit(env, 'wake', clientIp(req), WAKE_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleWakeServer(m1w[1].toUpperCase(), env, cors);
+      }
 
       // PATCH/DELETE /api/v1/connection-sessions/{id}
       const m1u = p.match(/^\/api\/v1\/connection-sessions\/([A-Za-z0-9-]+)$/);
@@ -813,14 +1052,20 @@ export default {
 
       // GET /api/v1/servers/{sc}
       const m3 = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)$/);
-      if (m === 'GET' && m3) return await handleDiscoverServer(m3[1].toUpperCase(), env, cors);
+      if (m === 'GET' && m3) {
+        if (!(await checkRateLimit(env, 'discover', clientIp(req), DISCOVER_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleDiscoverServer(m3[1].toUpperCase(), env, cors);
+      }
 
       // DELETE /api/v1/servers/{sc}
       if (m === 'DELETE' && m3) return await handleDeleteServer(m3[1].toUpperCase(), env, cors);
 
       // LEGADO: GET /api/servers/{sc}
       const m4 = p.match(/^\/api\/servers\/([A-Za-z0-9]+)$/);
-      if (m === 'GET' && m4) return await handleLegacyDiscover(m4[1].toUpperCase(), env, cors);
+      if (m === 'GET' && m4) {
+        if (!(await checkRateLimit(env, 'discover', clientIp(req), DISCOVER_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleLegacyDiscover(m4[1].toUpperCase(), env, cors);
+      }
       if (m === 'DELETE' && m4) return await handleDeleteServer(m4[1].toUpperCase(), env, cors);
 
       // LEGADO: POST /api/servers/{sc}/heartbeat
@@ -845,13 +1090,21 @@ export default {
       if (m === 'POST' && p === '/api/v1/donations/checkout-session') return await handleCreateDonationCheckout(env, cors);
 
       // POST /api/v1/donations/webhook — confirmação de pagamento do Stripe
+      // (nome mantido por compatibilidade com o endpoint já configurado no
+      // Dashboard: trata tanto doação avulsa quanto eventos de assinatura)
       if (m === 'POST' && p === '/api/v1/donations/webhook') return await handleStripeWebhook(req, env, cors);
 
-      // POST /api/v1/donations/mercadopago/checkout-session — doação via Pix
-      if (m === 'POST' && p === '/api/v1/donations/mercadopago/checkout-session') return await handleCreateMercadoPagoCheckout(req, env, cors);
+      // POST /api/v1/subscriptions/checkout-session — assinar Cubicase Plus
+      if (m === 'POST' && p === '/api/v1/subscriptions/checkout-session') {
+        if (!(await checkRateLimit(env, 'sub-checkout', clientIp(req), SUB_CHECKOUT_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleCreateSubscriptionCheckout(req, env, cors);
+      }
 
-      // POST /api/v1/donations/mercadopago/webhook — confirmação de pagamento do Mercado Pago
-      if (m === 'POST' && p === '/api/v1/donations/mercadopago/webhook') return await handleMercadoPagoWebhook(req, env, cors);
+      // POST /api/v1/subscriptions/portal-session — gerenciar/cancelar assinatura
+      if (m === 'POST' && p === '/api/v1/subscriptions/portal-session') {
+        if (!(await checkRateLimit(env, 'sub-portal', clientIp(req), SUB_PORTAL_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleCreateBillingPortalSession(req, env, cors);
+      }
 
       if (m === 'GET' && p === '/health') return new Response(JSON.stringify(ok(ResponseCodes.SUCCESS, 'OK', { status: 'ok', version: 'v1' })), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });
 

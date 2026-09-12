@@ -88,6 +88,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [enablingWhitelist, setEnablingWhitelist] = useState(false);
 
   const [whitelistInput, setWhitelistInput] = useState("");
   const [opInput, setOpInput] = useState("");
@@ -141,6 +142,31 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     await loadAll();
+  };
+
+  // Com `white-list=false` (padrão do servidor, ver server.ts), qualquer pessoa
+  // que alcance a porta consegue entrar e jogar com qualquer nome — a whitelist
+  // é a defesa real caso o código do servidor vaze. "whitelist on" é o comando
+  // vanilla que liga o enforcement e já persiste em server.properties sozinho
+  // (evita editar o arquivo direto com o servidor rodando, que seria sobrescrito).
+  const handleEnableWhitelist = async () => {
+    if (enablingWhitelist) return;
+    setEnablingWhitelist(true);
+    setError(null);
+    try {
+      if (isOnline) {
+        await onSendCommand("whitelist on");
+      } else {
+        await invoke("write_server_properties", { serverDir, props: { "white-list": "true" } });
+      }
+      setWhitelistEnabled(true);
+      await loadAll();
+    } catch (err) {
+      setError(String(err));
+      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao ativar whitelist", message: String(err) });
+    } finally {
+      setEnablingWhitelist(false);
+    }
   };
 
   const handleAddWhitelist = async () => {
@@ -318,6 +344,23 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
         <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" />
           Servidor online: as ações abaixo são enviadas como comando pelo console e têm efeito imediato.
+        </div>
+      )}
+
+      {whitelistEnabled === false && (
+        <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs flex-wrap">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+          <span className="flex-1 min-w-[200px]">
+            Whitelist desativada: qualquer pessoa com o código do servidor consegue entrar, mesmo desconhecidos.
+          </span>
+          <button
+            type="button"
+            onClick={handleEnableWhitelist}
+            disabled={enablingWhitelist}
+            className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs disabled:opacity-50 cursor-pointer transition-colors"
+          >
+            {enablingWhitelist ? "Ativando…" : "Ativar whitelist"}
+          </button>
         </div>
       )}
 

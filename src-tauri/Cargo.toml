@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.0"
+version = "0.3.0"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -25,8 +25,9 @@ tauri = { version = "2.11.2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-shell = "2"
-reqwest = { version = "0.12", features = ["json", "default-tls"] }
+reqwest = { version = "0.12", features = ["json", "default-tls", "stream"] }
 tokio = { version = "1", features = ["time", "net", "io-util", "sync", "macros", "rt-multi-thread"] }
+futures-util = "0.3"
 async-trait = "0.1"
 rand = "0.8"
 tiny_http = "0.12"

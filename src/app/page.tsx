@@ -267,6 +267,10 @@ export default function Home() {
       owner: null,
       forgeVersion: serverInfo.forgeVersion ?? null,
       modLoaderVersion: serverInfo.modLoaderVersion ?? null,
+      // Usado pela rota mesh "GET /mods" (sincronização de mods do convidado)
+      // pra saber de qual pasta ler mods/ quando alguém pedir este shortCode —
+      // ver AppState::active_server_dir em lib.rs.
+      serverDir: serverInfo.path,
     }).then((responseJson: any) => {
       try {
         const response = typeof responseJson === "string" ? JSON.parse(responseJson) : responseJson;
@@ -402,6 +406,10 @@ export default function Home() {
           setNetIp(null);
           setIsStarting(false);
           pendingMcStartRef.current = false;
+          // Rede mesh caiu de verdade (evento vindo do sidecar) — só aqui (ou em
+          // desconexão manual/falha de conexão) é correto limpar a conexão do
+          // Convidado. Nunca em um simples reload de página.
+          useAppStore.getState().setGuestConnectedShortCode(null);
         }
       });
 
@@ -621,6 +629,16 @@ export default function Home() {
           setNetStatus("online");
           setNetMode(status.netMode ?? null);
           setNetIp(status.ip || null);
+          // Se a rede mesh restaurada não for do Convidado, qualquer
+          // guestConnectedShortCode persistido de uma sessão anterior está
+          // desatualizado (ex: o usuário virou host nesse meio tempo).
+          if (status.netMode !== "guest") {
+            useAppStore.getState().setGuestConnectedShortCode(null);
+          }
+        } else {
+          // Mesh real está offline agora — a conexão do Convidado persistida
+          // (se houver) não reflete mais a realidade.
+          useAppStore.getState().setGuestConnectedShortCode(null);
         }
         if (status.minecraftStatus === "online") {
           setServerStatus("online");
@@ -704,6 +722,7 @@ export default function Home() {
     if (!hostIp) {
       setNetStatus("offline");
       setNetMode(null);
+      useAppStore.getState().setGuestConnectedShortCode(null);
       setLogs(prev => [...prev, `[ERR] Não foi possível encontrar esse servidor online. Confira o código ou peça para o host verificar se a rede mesh dele está ativa.`]);
       pushDiagnostic({
         level: "error",
@@ -748,6 +767,7 @@ export default function Home() {
       console.error(err);
       setNetStatus("offline");
       setNetMode(null);
+      useAppStore.getState().setGuestConnectedShortCode(null);
       setLogs(prev => [...prev, `[ERR] Falha ao conectar: ${err}`]);
       pushDiagnostic({
         level: "error",
@@ -765,6 +785,7 @@ export default function Home() {
       setNetMode(null);
       setNetIp(null);
       setDiscoveredServer(null);
+      useAppStore.getState().setGuestConnectedShortCode(null);
       setLogs(prev => [...prev, `[INFO] Conexão encerrada.`]);
     } catch (err) {
       console.error(err);

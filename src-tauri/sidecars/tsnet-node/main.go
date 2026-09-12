@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -26,6 +27,14 @@ type Config struct {
 	TargetIP string `json:"targetIp,omitempty"` // Virtual IP of the host (for guest mode)
 	LocalPort int   `json:"localPort"`           // Local port to listen on or forward to
 }
+
+// modsHttpLocalPort é a porta local (só loopback, na máquina do convidado) que
+// encaminha bytes crus de TCP até TargetIP:25566 (a API HTTP que o host expõe
+// na mesh — ver startHTTPServer). Fixa, como as demais portas do protocolo
+// interno do CubeForge (25565 jogo, 25566 API mesh, 25567 registro local do
+// Rust) — só existe UMA sessão de convidado por instalação, então não há
+// disputa de porta entre processos deste próprio app.
+const modsHttpLocalPort = 25568
 
 // ErrorPayload é o formato estruturado impresso no stdout antes de sair em caso
 // de erro fatal. O processo Rust pai parseia essa linha (procura por `"error"`
@@ -198,6 +207,7 @@ func startGuestMode(ctx context.Context, s *tsnet.Server, cfg Config, ln net.Lis
 	fmt.Printf("{\"info\": \"Guest listening on localhost:%d -> %s:25565\"}\n", cfg.LocalPort, cfg.TargetIP)
 
 	go startGuestHealthCheck(ctx, s, cfg)
+	go startGuestModsProxy(ctx, s, cfg)
 
 	for {
 		conn, err := ln.Accept()
@@ -273,6 +283,59 @@ func startGuestHealthCheck(ctx context.Context, s *tsnet.Server, cfg Config) {
 	}
 }
 
+// startGuestModsProxy escuta em 127.0.0.1:modsHttpLocalPort (só loopback) e
+// encaminha cada conexão crua de TCP até TargetIP:25566 via tsnet — o mesmo
+// padrão de proxyConn/handleProxy já usado para a porta do próprio jogo,
+// só que para a API HTTP do host em vez do servidor Minecraft. Isso deixa o
+// front-end falar HTTP normal (fetch) com "localhost:25568" sem precisar
+// entender nada de Tailscale: o túnel some dentro deste proxy.
+//
+// Deliberadamente não-fatal: se a porta 25568 já estiver ocupada por outra
+// coisa na máquina do convidado, a sincronização de mods fica indisponível
+// (o front-end trata isso como "não foi possível falar com o host"), mas o
+// túnel do jogo (a única coisa crítica) continua funcionando normalmente.
+func startGuestModsProxy(ctx context.Context, s *tsnet.Server, cfg Config) {
+	addr := fmt.Sprintf("127.0.0.1:%d", modsHttpLocalPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("[ModsProxy] Não foi possível escutar em %s (sincronização de mods ficará indisponível): %v", addr, err)
+		if b, mErr := json.Marshal(map[string]string{"warning": "mods_proxy_unavailable", "detail": err.Error()}); mErr == nil {
+			fmt.Println(string(b))
+		}
+		return
+	}
+	defer ln.Close()
+	log.Printf("[ModsProxy] Escutando em %s -> %s:25566", addr, cfg.TargetIP)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("[ModsProxy] Accept error: %v", err)
+				continue
+			}
+		}
+
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		targetConn, err := s.Dial(dialCtx, "tcp", fmt.Sprintf("%s:25566", cfg.TargetIP))
+		cancel()
+		if err != nil {
+			log.Printf("[ModsProxy] Dial error: %v", err)
+			conn.Close()
+			continue
+		}
+		go handleProxy(conn, targetConn)
+	}
+}
+
 // startHTTPServer inicia um servidor HTTP na Tailscale (porta 25566)
 // que serve como API pública para descoberta de servidores.
 // Ele faz proxy das requisições para o servidor HTTP interno do Rust (127.0.0.1:25567).
@@ -317,7 +380,40 @@ func startHTTPServer(ctx context.Context, s *tsnet.Server) {
 		
 		// Fazer proxy para o Rust
 		log.Printf("[HTTP] Fazendo proxy para Rust: http://127.0.0.1:25567/registry/resolve?code=%s", shortCode)
-		proxyToRust(w, fmt.Sprintf("http://127.0.0.1:25567/registry/resolve?code=%s", shortCode))
+		proxyToRust(w, fmt.Sprintf("http://127.0.0.1:25567/registry/resolve?code=%s", shortCode), 5*time.Second, "")
+	})
+
+	// GET /mods?code=XXXXXX — Lista os mods do servidor atualmente hospedado
+	// (com a origem já resolvida pelo Rust: registro local, hash no Modrinth,
+	// ou desconhecida). Puramente leitura, mesmo padrão de /resolve.
+	mux.HandleFunc("/mods", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		proxyToRust(w, fmt.Sprintf("http://127.0.0.1:25567/registry/mods?code=%s", url.QueryEscape(code)), 10*time.Second, "")
+	})
+
+	// GET /mods/file?code=XXXXXX&name=arquivo.jar — Bytes de um mod específico.
+	// Repassa o header Range (download retomável) e usa timeout bem mais alto
+	// que as outras rotas, já que aqui a resposta é o arquivo inteiro, não só
+	// metadados — tudo roda em loopback (Go -> Rust), então mesmo um arquivo
+	// grande deve fluir rápido, mas não pode competir com o timeout de 5s usado
+	// pelas rotas de metadados.
+	mux.HandleFunc("/mods/file", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		name := r.URL.Query().Get("name")
+		targetURL := fmt.Sprintf(
+			"http://127.0.0.1:25567/registry/mods/file?code=%s&name=%s",
+			url.QueryEscape(code),
+			url.QueryEscape(name),
+		)
+		proxyToRust(w, targetURL, 2*time.Minute, r.Header.Get("Range"))
 	})
 
 	// GET /status — Health check
@@ -379,27 +475,41 @@ func extractShortCode(code string) string {
 	return ""
 }
 
-// proxyToRust faz uma requisição HTTP para o servidor interno do Rust e escreve a resposta
-func proxyToRust(w http.ResponseWriter, url string) {
+// proxyToRust faz uma requisição HTTP para o servidor interno do Rust e
+// escreve a resposta (status, headers e corpo) direto no ResponseWriter —
+// sem bufferizar o corpo inteiro em memória (io.Copy transmite em stream),
+// o que importa pra rota de download de arquivo de mod. `rangeHeader`,
+// quando não-vazio, é repassado pro Rust como header "Range" (download
+// retomável); "" significa pedir o arquivo inteiro.
+func proxyToRust(w http.ResponseWriter, url string, timeout time.Duration, rangeHeader string) {
 	client := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout: timeout,
 	}
-	
-	resp, err := client.Get(url)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"internal request build error: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Proxy error: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error":"internal server error: %v"}`, err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	// Copiar headers
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
-	
+
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }

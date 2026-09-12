@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Plus,
@@ -22,9 +22,18 @@ import {
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
+import { join } from "@tauri-apps/api/path";
 import { useAppStore, type KnownServer, type ServerStatus } from "@/app/store";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
-import { installFabricClient, installForgeClient, getInstanceDir } from "@/lib/clientSetup";
+import {
+  installFabricClient,
+  installForgeClient,
+  getInstanceDir,
+  findInstalledFabricVersion,
+  findInstalledForgeVersion,
+} from "@/lib/clientSetup";
+import { planModSync, runModSync, INITIAL_PREP_STATE, type PrepState } from "@/lib/modSync";
+import { ModSyncModal } from "./ModSyncModal";
 
 /** Tipos de servidor cobertos pelo fluxo "Jogar" (abrir o launcher já pronto). */
 const PLAYABLE_SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
@@ -61,6 +70,8 @@ export function GuestView({
     removeKnownServer,
     updateKnownServerStatus,
     localServers,
+    guestConnectedShortCode: connectedShortCode,
+    setGuestConnectedShortCode: setConnectedShortCode,
   } = useAppStore();
 
   const [showAddModal, setShowAddModal] = useState(false);
@@ -71,8 +82,11 @@ export function GuestView({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastRefreshTime, setLastRefreshTime] = useState<Date | null>(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
-  const [connectedShortCode, setConnectedShortCode] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Wake-on-demand: shortCode do servidor que estamos tentando acordar agora
+  // (null = nenhum) + erro por shortCode, pra não confundir cards diferentes.
+  const [wakingShortCode, setWakingShortCode] = useState<string | null>(null);
+  const [wakeError, setWakeError] = useState<{ shortCode: string; message: string } | null>(null);
   // Contador de tempo online é calculado localmente (a partir de onlineSince) e
   // precisa de um "tick" próprio para atualizar a UI a cada segundo, já que o
   // polling da API Central acontece só a cada 30s.
@@ -82,97 +96,204 @@ export function GuestView({
     return () => clearInterval(interval);
   }, []);
 
-  // `handleConnect` marca connectedShortCode otimisticamente antes da conexão real
-  // (assíncrona, tratada em page.tsx) terminar. Se ela falhar ou cair depois, netStatus
-  // volta para "offline" — sem isso, o card ficava travado mostrando "Desconectar"
-  // até o usuário clicar manualmente.
-  useEffect(() => {
-    if (netStatus === "offline" && connectedShortCode !== null) {
-      setConnectedShortCode(null);
-    }
-  }, [netStatus, connectedShortCode]);
+  // connectedShortCode é persistido (ver store.ts) para sobreviver a F5/reabertura
+  // do app — só é limpo quando a rede mesh cai de verdade, o usuário desconecta
+  // manualmente, ou a tentativa de conexão falha (todos tratados em page.tsx, que
+  // é quem recebe o evento real "network-status" e o resultado de handleGuestConnect).
 
-  // Status do fluxo "Jogar" (Vanilla/Paper/Fabric/Forge/NeoForge) por servidor
-  // — instala o mod loader se precisar e abre o Minecraft Launcher já com o
-  // perfil certo selecionado, assim que o túnel sobe. `launcherTriggeredFor`
-  // evita disparar de novo a cada re-render enquanto a mesma conexão segue online.
-  const [launcherMessage, setLauncherMessage] = useState<Record<string, string>>({});
-  const [launcherProgress, setLauncherProgress] = useState<Record<string, number>>({});
-  const launcherTriggeredFor = useRef<string | null>(null);
+  // Fluxo "Preparar e Jogar" (instala o mod loader se precisar, sincroniza os
+  // mods com o que o host tem agora, e só então deixa abrir o Minecraft
+  // Launcher já com o perfil certo selecionado) — sempre uma ação explícita
+  // do jogador (botão próprio, nunca dispara sozinho ao conectar: era
+  // exatamente esse auto-disparo que fazia o Explorer "abrir do nada" quando
+  // a ativação do launcher via shell:AppsFolder falhava em silêncio pra quem
+  // não tem a versão da Microsoft Store instalada).
+  //
+  // `prepStates` guarda o progresso/relatório por shortCode (sobrevive ao
+  // fechamento do modal, então reabrir mostra o último resultado); `prepModalFor`
+  // é qual servidor está com o modal aberto agora (null = nenhum).
+  const [prepModalFor, setPrepModalFor] = useState<string | null>(null);
+  const [prepStates, setPrepStates] = useState<Record<string, PrepState>>({});
 
   const loaderLabel = (serverType: string): string =>
     serverType === "neoforge" ? "NeoForge" : serverType === "forge" ? "Forge" : "Fabric";
 
-  const handleOpenLauncher = async (server: KnownServer) => {
-    const setStatus = (status: string, percent?: number) => {
-      setLauncherMessage(prev => ({ ...prev, [server.shortCode]: status }));
-      if (percent !== undefined) setLauncherProgress(prev => ({ ...prev, [server.shortCode]: percent }));
-    };
+  const patchPrepState = (shortCode: string, patch: Partial<PrepState>) => {
+    setPrepStates(prev => ({ ...prev, [shortCode]: { ...(prev[shortCode] ?? INITIAL_PREP_STATE), ...patch } }));
+  };
 
-    setStatus("Preparando o Minecraft...", 0);
+  /** Passo 1: checa o que já está instalado/sincronizado e monta o resumo mostrado no modal — não baixa nada ainda. */
+  const handlePrepareAndPlay = async (server: KnownServer) => {
+    setPrepModalFor(server.shortCode);
+    patchPrepState(server.shortCode, { ...INITIAL_PREP_STATE, phase: "checking" });
+
+    if ((server.serverType === "forge" || server.serverType === "neoforge") && !server.forgeVersion) {
+      patchPrepState(server.shortCode, {
+        phase: "error",
+        errorMessage: `Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em localhost:${minecraftPort}.`,
+      });
+      return;
+    }
+
     try {
-      let versionId = server.version ?? "";
-      let alreadyInstalled = false;
-      let gameDir: string | null = null;
+      let loaderNote: string | null = null;
+      let instanceModsDir = "";
+      let plan = { entries: [] as PrepState["modEntries"], remoteMods: [] as PrepState["remoteMods"], alreadyInstalledCount: 0, totalBytesToDownload: 0 };
 
-      if (server.serverType === "fabric") {
-        gameDir = await getInstanceDir(server.shortCode);
-        versionId = await installFabricClient(server.version, (p) => setStatus(p.status, p.percent));
-      } else if (server.serverType === "forge" || server.serverType === "neoforge") {
-        if (!server.forgeVersion) {
-          setStatus(`Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em localhost:${minecraftPort}.`);
-          return;
+      if (ISOLATED_SERVER_TYPES.has(server.serverType)) {
+        const gameDir = await getInstanceDir(server.shortCode);
+        instanceModsDir = await join(gameDir, "mods");
+
+        if (server.serverType === "fabric") {
+          const already = await findInstalledFabricVersion(server.version);
+          loaderNote = already ? null : "Instalar o Fabric no seu Minecraft (ainda não instalado).";
+        } else {
+          const already = server.forgeVersion ? await findInstalledForgeVersion(server.forgeVersion) : null;
+          loaderNote = already ? null : `Instalar o ${loaderLabel(server.serverType)} ${server.forgeVersion} no seu Minecraft (ainda não instalado).`;
         }
-        gameDir = await getInstanceDir(server.shortCode);
-        versionId = await installForgeClient(server.serverType, server.version, server.forgeVersion, (p) => setStatus(p.status, p.percent));
-      } else {
-        const installed = await invoke<string[]>("find_installed_minecraft_versions").catch(() => [] as string[]);
-        alreadyInstalled = !!server.version && installed.includes(server.version);
+
+        plan = await planModSync(server.shortCode, instanceModsDir);
       }
 
-      setStatus("Selecionando o perfil no launcher...", 92);
+      patchPrepState(server.shortCode, {
+        phase: "confirm",
+        loaderNote,
+        instanceModsDir,
+        modEntries: plan.entries,
+        remoteMods: plan.remoteMods,
+        alreadyInstalledCount: plan.alreadyInstalledCount,
+        totalBytesToDownload: plan.totalBytesToDownload,
+      });
+    } catch (err) {
+      patchPrepState(server.shortCode, { phase: "error", errorMessage: String(err) });
+    }
+  };
+
+  /** Último passo comum a todos os caminhos de sucesso: seleciona o perfil no launcher (nunca o abre — isso só no clique final "Abrir Minecraft"). */
+  const finalizeLauncherProfile = async (
+    server: KnownServer,
+    versionId: string,
+    gameDir: string | null,
+    extra: Partial<PrepState> = {}
+  ) => {
+    patchPrepState(server.shortCode, { stageMessage: "Selecionando o perfil no launcher...", stagePercent: 92 });
+    try {
       const prepResult = await invoke<string>("prepare_launcher_profile", {
         versionId,
         profileName: `Cubicase — ${server.name}`,
         gameDir,
       });
-
       if (prepResult === "not_found") {
-        setStatus(`Não encontramos sua instalação do Minecraft — abra o jogo e conecte em localhost:${minecraftPort} manualmente.`);
+        patchPrepState(server.shortCode, {
+          phase: "error",
+          errorMessage: `Não encontramos sua instalação do Minecraft — abra o jogo e conecte em localhost:${minecraftPort} manualmente.`,
+        });
         return;
       }
-
-      await invoke("open_minecraft_launcher");
-      setStatus(
-        ISOLATED_SERVER_TYPES.has(server.serverType)
-          ? `${loaderLabel(server.serverType)} instalado e perfil selecionado — é só clicar em Play!`
-          : alreadyInstalled
-            ? "Minecraft aberto com o perfil certo selecionado — é só clicar em Play!"
-            : "Minecraft aberto! O launcher vai baixar essa versão automaticamente ao clicar em Play.",
-        100
-      );
+      patchPrepState(server.shortCode, { phase: "done", versionId, gameDir, ...extra });
     } catch (err) {
-      console.warn("[GuestView] Falha ao preparar o Minecraft automaticamente:", err);
-      setStatus(`Não conseguimos preparar o Minecraft automaticamente — abra manualmente e conecte em localhost:${minecraftPort}.`);
+      patchPrepState(server.shortCode, { phase: "error", errorMessage: String(err) });
     }
   };
 
-  // Assim que o túnel de um servidor Vanilla/Paper/Fabric sobe, prepara e abre
-  // o launcher sozinho — para os demais tipos (Forge/NeoForge) ainda não
-  // instalamos o mod loader certo automaticamente, então não prometemos nada.
-  useEffect(() => {
-    if (netStatus !== "online" || !connectedShortCode) {
-      launcherTriggeredFor.current = null;
-      return;
+  /** Passo 2 (clique em "Preparar agora"): instala o loader (se precisar) e sincroniza os mods que faltam. */
+  const handleConfirmPrepare = async (server: KnownServer) => {
+    const current = prepStates[server.shortCode];
+    if (!current) return;
+
+    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: "Preparando...", stagePercent: 0 });
+
+    try {
+      let versionId = server.version ?? "";
+      let gameDir: string | null = null;
+
+      if (server.serverType === "fabric") {
+        gameDir = await getInstanceDir(server.shortCode);
+        versionId = await installFabricClient(server.version, (p) =>
+          patchPrepState(server.shortCode, { stageMessage: p.status, stagePercent: p.percent * 0.5 })
+        );
+      } else if (server.serverType === "forge" || server.serverType === "neoforge") {
+        gameDir = await getInstanceDir(server.shortCode);
+        versionId = await installForgeClient(server.serverType, server.version, server.forgeVersion!, (p) =>
+          patchPrepState(server.shortCode, { stageMessage: p.status, stagePercent: p.percent * 0.5 })
+        );
+      }
+
+      if (ISOLATED_SERVER_TYPES.has(server.serverType) && current.modEntries.length > 0) {
+        const entries = current.modEntries.map(e => ({ ...e }));
+        await runModSync({
+          shortCode: server.shortCode,
+          instanceModsDir: current.instanceModsDir,
+          remoteMods: current.remoteMods,
+          entries,
+          onProgress: (updated) => patchPrepState(server.shortCode, { modEntries: [...updated] }),
+        });
+
+        if (entries.some(e => e.status === "failed")) {
+          // Não prepara o perfil ainda — espera o jogador decidir (tentar de
+          // novo só os que falharam, ou continuar mesmo assim).
+          patchPrepState(server.shortCode, { phase: "done", modEntries: entries, versionId, gameDir });
+          return;
+        }
+      }
+
+      await finalizeLauncherProfile(server, versionId, gameDir);
+    } catch (err) {
+      patchPrepState(server.shortCode, { phase: "error", errorMessage: String(err) });
     }
-    if (launcherTriggeredFor.current === connectedShortCode) return;
+  };
 
-    const server = knownServers.find(s => s.shortCode === connectedShortCode);
-    if (!server || !PLAYABLE_SERVER_TYPES.has(server.serverType)) return;
+  /** "Tentar de novo (N)" no relatório final: baixa de novo só os mods que falharam. */
+  const handleRetryFailedOnly = async (server: KnownServer) => {
+    const current = prepStates[server.shortCode];
+    if (!current) return;
 
-    launcherTriggeredFor.current = connectedShortCode;
-    void handleOpenLauncher(server);
-  }, [netStatus, connectedShortCode, knownServers]);
+    const reset = current.modEntries.map(e => (e.status === "failed" ? { ...e, status: "pending" as const, error: undefined } : e));
+    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: "Tentando de novo os mods que falharam...", stagePercent: 50, modEntries: reset });
+
+    const toRetry = reset.filter(e => e.status === "pending");
+    await runModSync({
+      shortCode: server.shortCode,
+      instanceModsDir: current.instanceModsDir,
+      remoteMods: current.remoteMods,
+      entries: toRetry,
+      onProgress: (updated) => {
+        setPrepStates(prev => {
+          const latest = prev[server.shortCode];
+          const merged = latest.modEntries.map(e => updated.find(u => u.filename === e.filename) ?? e);
+          return { ...prev, [server.shortCode]: { ...latest, modEntries: merged } };
+        });
+      },
+    });
+
+    // `reset` e `toRetry` compartilham as MESMAS referências de objeto pros
+    // itens que estavam "pending" — runModSync muta `entry.status` direto
+    // neles, então `reset` já reflete o resultado final aqui, sem precisar
+    // ler `prepStates` de volta (evitaria pegar um snapshot desatualizado
+    // do closure, já que o estado avançou via setPrepStates durante o await).
+    if (reset.some(e => e.status === "failed")) {
+      patchPrepState(server.shortCode, { phase: "done" });
+    } else {
+      await finalizeLauncherProfile(server, current.versionId, current.gameDir);
+    }
+  };
+
+  /** "Continuar mesmo assim" no relatório final: aceita prosseguir com mods faltando. */
+  const handleContinueAnyway = async (server: KnownServer) => {
+    const current = prepStates[server.shortCode];
+    if (!current) return;
+    await finalizeLauncherProfile(server, current.versionId, current.gameDir, { acceptedPartial: true });
+  };
+
+  /** Clique final "Abrir Minecraft" — só aqui o launcher é de fato aberto. */
+  const handleOpenMinecraftFinal = async () => {
+    try {
+      await invoke("open_minecraft_launcher");
+    } catch (err) {
+      console.warn("[GuestView] Falha ao abrir o Minecraft Launcher:", err);
+    }
+    setPrepModalFor(null);
+  };
 
   // Sincronizar servidores locais do host na biblioteca do guest
   // Adiciona servidores locais novos e remove os que foram deletados
@@ -193,6 +314,7 @@ export function GuestView({
           serverType: server.serverType || "vanilla",
           description: server.description || `Servidor Minecraft Vanilla ${server.version || "1.20.1"}`,
           status: "offline",
+          minecraftStatus: null,
           port: 25565,
           maxPlayers: 20,
           currentPlayers: 0,
@@ -216,22 +338,26 @@ export function GuestView({
     for (const s of serversToRemove) {
       removeKnownServer(s.shortCode);
     }
-  }, [localServers]);
+    // knownServers muda (nova referência) a cada add/remove/update no store —
+    // incluindo os feitos por ESTE próprio efeito. Isso faz o efeito rodar de
+    // novo depois de cada add/remove, mas aí já converge: na segunda
+    // passagem, os servidores que acabaram de ser adicionados/removidos já
+    // batem com localServers, então os dois loops acima não encontram mais
+    // nada a fazer e o efeito não dispara uma terceira vez.
+  }, [localServers, knownServers, addKnownServer, removeKnownServer]);
 
-  // Atualizar status de todos os servidores conhecidos ao abrir
-  useEffect(() => {
-    refreshAllServers();
-  }, []);
-
-  // Atualizar status periodicamente (a cada 30 segundos)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      refreshAllServers(true);
-    }, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const refreshAllServers = async (silent = false) => {
+  // Lê `knownServers` direto do store (não do closure do componente) e é
+  // estável entre renders (useCallback com deps vazias) — de propósito: os
+  // dois efeitos abaixo rodam só uma vez (montagem) e a cada 30s, e não
+  // devem reiniciar o intervalo a cada atualização de status (que também
+  // muda `knownServers`, já que updateKnownServerStatus escreve nele). Antes,
+  // como a função fechava sobre `knownServers` do render de montagem e os
+  // efeitos nunca re-rodavam ([] como dependência), o polling periódico
+  // ficava preso pra sempre olhando o `knownServers` de quando o componente
+  // montou — se a lista estivesse vazia nesse instante, o refresh periódico
+  // nunca via os servidores adicionados depois.
+  const refreshAllServers = useCallback(async (silent = false) => {
+    const knownServers = useAppStore.getState().knownServers;
     if (knownServers.length === 0) return;
     if (!silent) setIsRefreshing(true);
 
@@ -247,18 +373,22 @@ export function GuestView({
           // session vem null quando o host nunca teve uma sessão ativa (ou ela expirou) —
           // trata como "offline" em vez de deixar o status como undefined.
           const session = envelope?.data?.session ?? {};
-          const status = (session.status ?? "offline") as ServerStatus;
-          console.log(`[GuestView] Servidor ${server.shortCode} (${server.name}): status da API = ${status}`);
+          // networkStatus (rede mesh) e minecraftStatus (processo Java) são
+          // independentes — ver handleDiscoverServer na API Central.
+          const status = (session.networkStatus ?? session.status ?? "offline") as ServerStatus;
+          const minecraftStatus = (session.minecraftStatus ?? null) as ServerStatus | null;
+          console.log(`[GuestView] Servidor ${server.shortCode} (${server.name}): rede=${status}, minecraft=${minecraftStatus}`);
           updateKnownServerStatus(
             server.shortCode,
             status,
+            minecraftStatus,
             session.currentPlayers ?? undefined
           );
         } else {
           console.warn(`[GuestView] Servidor ${server.shortCode}: API retornou HTTP ${response.status}`);
           // Servidor não encontrado na API (removido pelo host)
           if (response.status === 404) {
-            updateKnownServerStatus(server.shortCode, "offline");
+            updateKnownServerStatus(server.shortCode, "offline", null);
           }
         }
       } catch (err) {
@@ -275,6 +405,75 @@ export function GuestView({
 
     setLastRefreshTime(new Date());
     if (!silent) setIsRefreshing(false);
+  }, [updateKnownServerStatus]);
+
+  // Atualizar status de todos os servidores conhecidos ao abrir. Disparado
+  // via setTimeout (não chamado direto no corpo do efeito) porque
+  // refreshAllServers muda estado (setIsRefreshing) já na sua primeira linha,
+  // antes do primeiro await — chamar isso de forma síncrona dentro do efeito
+  // encadearia um re-render ainda durante a fase de commit do React.
+  useEffect(() => {
+    const id = setTimeout(() => refreshAllServers(), 0);
+    return () => clearTimeout(id);
+  }, [refreshAllServers]);
+
+  // Atualizar status periodicamente (a cada 30 segundos)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshAllServers(true);
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [refreshAllServers]);
+
+  // Wake-on-demand: pede pro host acordar (POST /wake) e faz um poll rápido
+  // (3s, só deste servidor) até minecraftStatus sair de "sleeping" — bem mais
+  // frequente que o refreshAllServers de 30s, pra não deixar quem clicou
+  // esperando sem feedback por muito tempo. Desiste depois de ~90s.
+  const handleWakeServer = async (server: KnownServer) => {
+    setWakingShortCode(server.shortCode);
+    setWakeError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/servers/${server.shortCode}/wake`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const message = res.status === 429
+          ? "Pedido de despertar já enviado recentemente. Aguarde alguns segundos e tente de novo."
+          : (body?.message || `Não foi possível acordar o servidor (HTTP ${res.status}).`);
+        throw new Error(message);
+      }
+
+      const POLL_INTERVAL_MS = 3000;
+      const MAX_ATTEMPTS = 30; // ~90s no total
+      let attempts = 0;
+      const poll = async () => {
+        attempts += 1;
+        if (attempts > MAX_ATTEMPTS) {
+          setWakingShortCode(null);
+          setWakeError({ shortCode: server.shortCode, message: "O servidor demorou demais pra responder. Tente de novo." });
+          return;
+        }
+        try {
+          const discoverRes = await fetch(`${API_BASE}/api/v1/servers/${server.shortCode}`);
+          if (discoverRes.ok) {
+            const envelope = await discoverRes.json();
+            const session = envelope?.data?.session ?? {};
+            const status = (session.networkStatus ?? session.status ?? "offline") as ServerStatus;
+            const minecraftStatus = (session.minecraftStatus ?? null) as ServerStatus | null;
+            updateKnownServerStatus(server.shortCode, status, minecraftStatus, session.currentPlayers ?? undefined);
+            if (minecraftStatus !== "sleeping") {
+              setWakingShortCode(null);
+              return;
+            }
+          }
+        } catch { /* mantém tentando até o limite de tentativas */ }
+        setTimeout(poll, POLL_INTERVAL_MS);
+      };
+      poll();
+    } catch (err) {
+      setWakingShortCode(null);
+      const message = err instanceof Error ? err.message : String(err);
+      setWakeError({ shortCode: server.shortCode, message });
+    }
   };
 
   const handleAddServer = async () => {
@@ -305,18 +504,20 @@ export function GuestView({
       const envelope = await response.json();
       const server = envelope?.data?.server ?? {};
       const session = envelope?.data?.session ?? {};
+      const networkStatus = session.networkStatus ?? session.status ?? "offline";
       addKnownServer({
         shortCode: server.shortCode,
         name: server.name,
         version: server.version,
         serverType: server.serverType || "vanilla",
         description: server.description || `Servidor Minecraft ${server.version}`,
-        status: session.status || "offline",
+        status: networkStatus,
+        minecraftStatus: session.minecraftStatus ?? null,
         port: session.port || 25565,
         maxPlayers: session.maxPlayers || 20,
         currentPlayers: session.currentPlayers || 0,
-        lastSeenOnline: session.status === "online" ? new Date().toISOString() : null,
-        onlineSince: session.status === "online" ? new Date().toISOString() : null,
+        lastSeenOnline: networkStatus === "online" ? new Date().toISOString() : null,
+        onlineSince: networkStatus === "online" ? new Date().toISOString() : null,
         lastConfirmedAt: new Date().toISOString(),
         addedAt: new Date().toISOString(),
         isOwnServer: false,
@@ -335,7 +536,7 @@ export function GuestView({
   };
 
   const handleConnect = (server: KnownServer) => {
-    if (server.status !== "online" || isServerStale(server)) return;
+    if (server.status !== "online" || isServerStale(server, now)) return;
     setConnectedShortCode(server.shortCode);
     onConnect(`CF-${server.shortCode}`);
   };
@@ -358,9 +559,9 @@ export function GuestView({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const formatLastSeen = (iso: string | null): string => {
+  const formatLastSeen = (iso: string | null, nowMs: number): string => {
     if (!iso) return "Nunca";
-    const diff = Date.now() - new Date(iso).getTime();
+    const diff = nowMs - new Date(iso).getTime();
     const minutes = Math.floor(diff / 60000);
     if (minutes < 1) return "Agora mesmo";
     if (minutes < 60) return `Há ${minutes} min`;
@@ -388,29 +589,53 @@ export function GuestView({
   // que a API esteja fora do ar ou as requisições estejam falhando repetidamente —
   // o que passaria informação falsa para o convidado.
   const STALE_THRESHOLD_MS = 100_000; // ~3 ciclos de 30s
-  const isServerStale = (server: KnownServer): boolean => {
+  const isServerStale = (server: KnownServer, nowMs: number): boolean => {
     if (!server.lastConfirmedAt) return true;
-    return Date.now() - new Date(server.lastConfirmedAt).getTime() > STALE_THRESHOLD_MS;
+    return nowMs - new Date(server.lastConfirmedAt).getTime() > STALE_THRESHOLD_MS;
   };
 
-  const getStatusColor = (status: string): string => {
-    switch (status) {
-      case "online": return "bg-emerald-500";
-      case "starting": return "bg-amber-500";
-      case "stopping": return "bg-orange-500";
-      case "crashed": return "bg-rose-500";
-      default: return "bg-slate-400";
-    }
-  };
+  // Rede mesh (status) e Minecraft (minecraftStatus) são reportados de forma
+  // independente pela API Central — um host pode ligar só um dos dois (ex: rodar
+  // o servidor sem usar a malha do CubeForge, acessível só por IP local/LAN ou
+  // outra VPN). Por isso o badge combina os dois em 4 estados em vez de repetir
+  // o "Offline" genérico sempre que falta qualquer uma das duas partes.
+  const getDisplayStatus = (server: KnownServer): { color: string; textClass: string; label: string } => {
+    const networkOnline = server.status === "online";
+    const mc = server.minecraftStatus;
+    const mcOnline = mc === "online";
 
-  const getStatusLabel = (status: string): string => {
-    switch (status) {
-      case "online": return "Online";
-      case "starting": return "Iniciando";
-      case "stopping": return "Encerrando";
-      case "crashed": return "Erro";
-      default: return "Offline";
+    if (networkOnline && mcOnline) {
+      return { color: "bg-emerald-500", textClass: "text-emerald-600 dark:text-emerald-400", label: "Online" };
     }
+    if (networkOnline) {
+      // Rede pronta, mas o processo Java não está de pé.
+      const label =
+        mc === "starting" ? "Servidor iniciando" :
+        mc === "stopping" ? "Servidor encerrando" :
+        mc === "crashed" ? "Servidor com erro" :
+        "Servidor desligado";
+      return {
+        color: mc === "crashed" ? "bg-rose-500" : "bg-amber-500",
+        textClass: mc === "crashed" ? "text-rose-600 dark:text-rose-400" : "text-amber-600 dark:text-amber-400",
+        label,
+      };
+    }
+    if (mcOnline) {
+      // Minecraft rodando, mas sem a rede mesh do CubeForge — só acessível
+      // diretamente (IP local/LAN) ou por outra VPN, não pelo "Conectar" daqui.
+      return { color: "bg-sky-500", textClass: "text-sky-600 dark:text-sky-400", label: "Rodando sem rede mesh" };
+    }
+    if (mc === "crashed") {
+      // Sem rede E o Minecraft crashou — mantém consistente com o botão de ação
+      // abaixo, que já trata esse caso separadamente do "Offline" genérico.
+      return { color: "bg-rose-500", textClass: "text-rose-600 dark:text-rose-400", label: "Servidor com erro" };
+    }
+    if (mc === "sleeping") {
+      // Wake-on-demand armado: rede mesh de propósito desligada até alguém
+      // pedir pra entrar (ver botão "Acordar servidor" abaixo).
+      return { color: "bg-indigo-400", textClass: "text-indigo-500 dark:text-indigo-400", label: "Em espera" };
+    }
+    return { color: "bg-slate-400", textClass: "text-theme-secondary", label: "Offline" };
   };
 
   const isConnecting = netStatus === "connecting";
@@ -511,8 +736,10 @@ export function GuestView({
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {knownServers.map((server, index) => {
-            const stale = isServerStale(server);
+            const stale = isServerStale(server, now);
             const isThisConnected = connectedShortCode === server.shortCode;
+            const display = getDisplayStatus(server);
+            const isFullyOnline = server.status === "online" && server.minecraftStatus === "online";
             return (
             <motion.div
               key={server.shortCode}
@@ -534,19 +761,20 @@ export function GuestView({
                     {/* Status indicator */}
                     <div className={cn(
                       "w-2.5 h-2.5 rounded-full",
-                      stale ? "bg-slate-400" : getStatusColor(server.status),
-                      !stale && server.status === "online" && "animate-pulse"
+                      stale ? "bg-slate-400" : display.color,
+                      !stale && isFullyOnline && "animate-pulse"
                     )} />
                     <span className={cn(
                       "text-[10px] font-bold uppercase tracking-wider",
-                      stale ? "text-theme-secondary" :
-                      server.status === "online" ? "text-emerald-600 dark:text-emerald-400" :
-                      server.status === "crashed" ? "text-rose-600 dark:text-rose-400" :
-                      "text-theme-secondary"
-                    )} title={stale ? "Não foi possível confirmar o status recentemente com a API Central" : undefined}>
+                      stale ? "text-theme-secondary" : display.textClass
+                    )} title={
+                      stale ? "Não foi possível confirmar o status recentemente com a API Central" :
+                      display.label === "Rodando sem rede mesh" ? "O Minecraft está de pé, mas o host não ligou a rede mesh do CubeForge — só dá pra acessar pelo IP local (LAN) ou outra VPN." :
+                      undefined
+                    }>
                       {/* Status desatualizado: não sabemos mais se ainda é verdade, então
                           não afirmamos online/offline — só que não está confirmado. */}
-                      {stale ? "Não confirmado" : getStatusLabel(server.status)}
+                      {stale ? "Não confirmado" : display.label}
                     </span>
                   </div>
 
@@ -589,7 +817,7 @@ export function GuestView({
                     <Server className="w-3 h-3" />
                     Vanilla {server.version}
                   </span>
-                  {server.currentPlayers !== undefined && server.status === "online" && (
+                  {server.currentPlayers !== undefined && server.minecraftStatus === "online" && (
                     <span className="flex items-center gap-1">
                       <Users className="w-3 h-3" />
                       {server.currentPlayers}/{server.maxPlayers} jogadores
@@ -597,16 +825,18 @@ export function GuestView({
                   )}
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {server.status === "online" && !stale
+                    {isFullyOnline && !stale
                       ? `Online há ${formatUptime(server.onlineSince)}`
-                      : formatLastSeen(server.lastSeenOnline)}
+                      : formatLastSeen(server.lastSeenOnline, now)}
                   </span>
                 </div>
 
                 {isThisConnected ? (
                   // Conectado: em vez de uma div separada abaixo da lista, as informações
                   // de conexão ficam centralizadas dentro do próprio card (que já mudou
-                  // de cor para indicar o estado), junto do progresso de preparo do launcher.
+                  // de cor para indicar o estado). Preparar o launcher (loader + mods +
+                  // abrir o Minecraft) é sempre uma ação explícita à parte — ver botão
+                  // "Preparar e Jogar" nas ações do card, nunca dispara sozinho ao conectar.
                   <div className="flex flex-col items-center text-center gap-2.5 py-1">
                     <div className="w-11 h-11 bg-emerald-100 dark:bg-emerald-900/40 rounded-2xl flex items-center justify-center">
                       <Zap className="w-5 h-5 text-emerald-600 fill-current" />
@@ -629,23 +859,6 @@ export function GuestView({
                       {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                       {copied ? "Copiado!" : "Copiar endereço"}
                     </button>
-
-                    {launcherMessage[server.shortCode] && (
-                      <div className="w-full space-y-1">
-                        <p className="text-[10px] text-theme-secondary leading-relaxed">
-                          {launcherMessage[server.shortCode]}
-                        </p>
-                        {(launcherProgress[server.shortCode] ?? 100) < 100 && (
-                          <div className="h-1 bg-theme-muted rounded-full overflow-hidden">
-                            <motion.div
-                              className="h-full bg-indigo-500"
-                              animate={{ width: `${launcherProgress[server.shortCode] ?? 0}%` }}
-                              transition={{ duration: 0.3 }}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </div>
                 ) : (
                   // Endereço de conexão: o app tuneliza a porta local para o servidor via
@@ -671,13 +884,25 @@ export function GuestView({
               {/* Ações do card */}
               <div className="px-5 pb-5 pt-0 flex items-center gap-2">
                 {isThisConnected ? (
-                  <button
-                    type="button"
-                    onClick={() => handleDisconnect()}
-                    className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
-                  >
-                    <X className="w-3.5 h-3.5" /> Desconectar
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleDisconnect()}
+                      className="h-10 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
+                    >
+                      <X className="w-3.5 h-3.5" /> Desconectar
+                    </button>
+                    {PLAYABLE_SERVER_TYPES.has(server.serverType) && (
+                      <button
+                        type="button"
+                        onClick={() => handlePrepareAndPlay(server)}
+                        disabled={prepModalFor === server.shortCode && prepStates[server.shortCode]?.phase !== "error" && prepStates[server.shortCode]?.phase !== "done"}
+                        className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current" /> Preparar e Jogar
+                      </button>
+                    )}
+                  </>
                 ) : stale ? (
                   // Não conseguimos confirmar o status recentemente com a API Central —
                   // melhor não afirmar "Online" nem "Offline" (nenhuma das duas seria confiável)
@@ -691,7 +916,7 @@ export function GuestView({
                     // Servidor do próprio host: não permite conectar (não pode conectar na própria mesh)
                     <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
                       <Zap className="w-3 h-3 text-indigo-400" />
-                      Online
+                      {display.label}
                     </div>
                   ) : PLAYABLE_SERVER_TYPES.has(server.serverType) ? (
                     // Um clique conecta e já prepara + abre o Minecraft com o perfil certo
@@ -716,7 +941,37 @@ export function GuestView({
                       <Zap className="w-3.5 h-3.5 fill-current" /> Conectar
                     </button>
                   )
-                ) : server.status === "crashed" ? (
+                ) : server.minecraftStatus === "sleeping" ? (
+                  server.isOwnServer ? (
+                    <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
+                      <Zap className="w-3 h-3 text-indigo-400" />
+                      {display.label}
+                    </div>
+                  ) : wakingShortCode === server.shortCode ? (
+                    <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Acordando, aguarde...
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleWakeServer(server)}
+                      className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
+                    >
+                      <Zap className="w-3.5 h-3.5 fill-current" /> Acordar servidor
+                    </button>
+                  )
+                ) : server.minecraftStatus === "online" ? (
+                  // Minecraft de pé, mas sem a rede mesh do CubeForge: não dá pra conectar
+                  // por aqui — só via IP local (LAN) ou outra VPN que o host esteja usando.
+                  <div
+                    className="flex-1 h-10 rounded-xl bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-sky-600 dark:text-sky-400"
+                    title="O host ligou o servidor, mas não a rede mesh do CubeForge. Só dá pra entrar pelo IP local (LAN) ou outra VPN."
+                  >
+                    <Server className="w-3 h-3" />
+                    Sem rede mesh
+                  </div>
+                ) : server.minecraftStatus === "crashed" ? (
                   <div className="flex-1 h-10 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-rose-500">
                     <AlertTriangle className="w-3 h-3" />
                     Servidor com erro
@@ -748,11 +1003,32 @@ export function GuestView({
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               </div>
+              {wakeError?.shortCode === server.shortCode && (
+                <p className="px-5 pb-4 -mt-2 text-[10px] text-rose-500">{wakeError.message}</p>
+              )}
             </motion.div>
             );
           })}
         </div>
       )}
+
+      {/* Modal de Preparar e Jogar (instalar loader + sincronizar mods + abrir launcher) */}
+      {prepModalFor && prepStates[prepModalFor] && (() => {
+        const prepServer = knownServers.find(s => s.shortCode === prepModalFor);
+        if (!prepServer) return null;
+        return (
+          <ModSyncModal
+            serverName={prepServer.name}
+            state={prepStates[prepModalFor]}
+            onCancel={() => setPrepModalFor(null)}
+            onConfirm={() => handleConfirmPrepare(prepServer)}
+            onRetryAll={() => handlePrepareAndPlay(prepServer)}
+            onRetryFailedOnly={() => handleRetryFailedOnly(prepServer)}
+            onContinueAnyway={() => handleContinueAnyway(prepServer)}
+            onOpenMinecraft={() => handleOpenMinecraftFinal()}
+          />
+        );
+      })()}
 
       {/* Modal de Adicionar Servidor */}
       <AnimatePresence>

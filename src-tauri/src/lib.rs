@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::fs::File;
 use std::io::{Write, BufRead, BufReader};
@@ -157,7 +157,19 @@ struct AppState {
     // shortCode do servidor atualmente registrado na API Central (se houver).
     // Usado no shutdown gracioso para notificar a API de que o servidor ficou
     // offline mesmo quando o fechamento acontece antes de qualquer heartbeat do JS.
-    active_short_code: Mutex<Option<String>>,
+    //
+    // Arc (não só Mutex) porque o mesmo ponteiro também é compartilhado com a
+    // thread do servidor HTTP do registro (ver start_registry_http_server em
+    // run()) — ela precisa saber, sem depender de AppHandle/Tauri, qual
+    // shortCode/pasta correspondem ao servidor que ESTE host está hospedando
+    // agora, pra responder "GET /mods" só para quem pedir o código certo.
+    active_short_code: Arc<Mutex<Option<String>>>,
+
+    // Pasta do servidor local correspondente a `active_short_code` — é dela
+    // que a rota "GET /mods" (mesh) lê a pasta mods/ pra montar a lista
+    // exposta ao convidado. Atualizada junto de active_short_code em
+    // sync_register_server (ver comentário lá).
+    active_server_dir: Arc<Mutex<Option<String>>>,
 
     // ConnectionSession ativa (host ou guest) na rede mesh — dono do session_id
     // usado para heartbeat e para encerrar/revogar a credencial do Tailscale no
@@ -189,6 +201,24 @@ struct AppState {
     // Serve de fonte para o heartbeat da ConnectionSession reportar currentPlayers
     // de verdade à API Central em vez do valor fixo que existia antes.
     minecraft_online_players: Mutex<std::collections::HashSet<String>>,
+
+    // Wake-on-demand (Cubicase Plus) — ver seção dedicada perto de
+    // arm_wake_on_demand/spawn_sleeping_loop. `Some` cobre TANTO a fase
+    // "dormindo" quanto "já acordou e está hospedando" (só vira `None` ao
+    // desarmar) — é o que o auto-shutdown por inatividade (dentro do loop de
+    // heartbeat "online") lê pra saber se deve contar inatividade.
+    wake_on_demand: Mutex<Option<Arc<WakeOnDemandConfig>>>,
+    // Bumped a cada arma/desarma/reentrada em espera — task solta do loop de
+    // espera confere isso a cada tick pra saber se ainda é "a atual" (mesmo
+    // padrão de sinalização por flag já usado neste arquivo, sem precisar
+    // guardar um JoinHandle em lugar nenhum).
+    wake_loop_generation: AtomicU64,
+    // Minutos consecutivos sem jogadores, contados pelo loop de heartbeat
+    // "online" — só incrementa enquanto wake_on_demand está armado.
+    idle_ticks: AtomicU32,
+    // "Manter ligado" pedido pelo frontend — consumido (setado de volta a
+    // false) no próximo tick do loop de heartbeat "online".
+    idle_shutdown_reset_requested: AtomicBool,
 }
 
 /// Retrato de RAM/CPU do sistema (e do processo do servidor) em um instante,
@@ -448,6 +478,42 @@ async fn start_network_node(
                                                     let player_count = app_for_hb.state::<AppState>()
                                                         .minecraft_online_players.lock().unwrap().len() as u32;
                                                     let _ = sm.send_heartbeat(player_count).await;
+
+                                                    // Wake-on-demand: auto-shutdown por inatividade. Só ativa
+                                                    // quando o recurso está armado (wake_on_demand = Some) —
+                                                    // hospedagem comum, sem isso ligado, fica exatamente igual.
+                                                    let wake_cfg = app_for_hb.state::<AppState>()
+                                                        .wake_on_demand.lock().unwrap().clone();
+                                                    if let Some(cfg) = wake_cfg {
+                                                        let state_now = app_for_hb.state::<AppState>();
+                                                        if state_now.idle_shutdown_reset_requested.swap(false, Ordering::SeqCst) {
+                                                            state_now.idle_ticks.store(0, Ordering::SeqCst);
+                                                        }
+                                                        if player_count > 0 {
+                                                            state_now.idle_ticks.store(0, Ordering::SeqCst);
+                                                        } else {
+                                                            let ticks = state_now.idle_ticks.fetch_add(1, Ordering::SeqCst) + 1;
+                                                            drop(state_now);
+                                                            if ticks + 1 == cfg.idle_timeout_minutes {
+                                                                let _ = app_for_hb.emit("idle-shutdown-warning", serde_json::json!({ "secondsRemaining": 60 }));
+                                                            }
+                                                            if ticks >= cfg.idle_timeout_minutes {
+                                                                log_to_file(&app_for_hb, "[WakeOnDemand] Desligando por inatividade, voltando ao modo de espera.");
+                                                                let state_ref = app_for_hb.state::<AppState>();
+                                                                stop_minecraft_server_internal(&app_for_hb, &state_ref).await;
+                                                                let _ = stop_network_node_internal(&app_for_hb, &state_ref).await;
+                                                                state_ref.idle_ticks.store(0, Ordering::SeqCst);
+                                                                let still_armed = state_ref.wake_on_demand.lock().unwrap().clone();
+                                                                drop(state_ref);
+                                                                if let Some(cfg2) = still_armed {
+                                                                    let new_gen = app_for_hb.state::<AppState>()
+                                                                        .wake_loop_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                                                                    spawn_sleeping_loop(app_for_hb.clone(), cfg2, new_gen);
+                                                                }
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             });
                                         }
@@ -1084,6 +1150,113 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
     Err(format!("Falha ao baixar após {} tentativas: {}", MAX_ATTEMPTS, last_err))
 }
 
+/// Calcula o SHA1 de um arquivo local qualquer — usado pelo front-end na
+/// sincronização de mods do convidado, pra comparar o que já existe na
+/// instância isolada local contra o que o host diz que o servidor precisa
+/// (ver resolve_server_mods/GET "/mods", do lado do host, e src/lib/modSync.ts
+/// do lado do convidado).
+#[tauri::command]
+async fn compute_file_sha1(path: String) -> Result<String, String> {
+    sha1_of_file(std::path::Path::new(&path))
+}
+
+/// Baixa um mod (do CDN do Modrinth ou direto do host pela mesh, via a rota
+/// "/mods/file" — para quem chama, é só uma URL HTTP) em streaming pro disco
+/// (nunca carrega o arquivo inteiro em memória, diferente de
+/// `download_server_jar`, pensado pra arquivos menores) e, em caso de falha
+/// no meio (link da mesh instável, por exemplo), RETOMA de onde parou via
+/// "Range: bytes=<já escrito>-" em vez de reiniciar do zero — importante
+/// porque mods individuais de um modpack grande podem passar de 50-100MB, e
+/// reiniciar repetidamente do zero sobre um link instável faria o progresso
+/// nunca avançar. O arquivo parcial só é descartado se o SHA1 final não
+/// bater (corrupção) ou depois de esgotar todas as tentativas.
+#[tauri::command]
+async fn download_mod_file(url: String, dest_path: String, expected_sha1: Option<String>) -> Result<(), String> {
+    use futures_util::StreamExt;
+
+    if let Some(parent) = std::path::Path::new(&dest_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    const MAX_ATTEMPTS: u32 = 5;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600)) // mod individual, mas a mesh pode ser lenta
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let already_written: u64 = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+
+        let mut req = client.get(&url);
+        if already_written > 0 {
+            req = req.header("Range", format!("bytes={}-", already_written));
+        }
+
+        let attempt_result: Result<(), String> = async {
+            let response = req.send().await.map_err(|e| e.to_string())?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+            // 206 = o servidor aceitou retomar do byte que já tínhamos; qualquer
+            // outro 2xx (normalmente 200) significa que ele mandou o arquivo
+            // inteiro de novo desde o início — nesse caso o arquivo local
+            // precisa ser recriado do zero, não apendado.
+            let resumed = status.as_u16() == 206;
+
+            let mut file = if resumed {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&dest_path)
+                    .map_err(|e| e.to_string())?
+            } else {
+                File::create(&dest_path).map_err(|e| e.to_string())?
+            };
+
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| e.to_string())?;
+                file.write_all(&chunk).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        .await;
+
+        match attempt_result {
+            Ok(()) => {
+                let verified = match &expected_sha1 {
+                    Some(expected) => sha1_of_file(std::path::Path::new(&dest_path))
+                        .map(|actual| actual.eq_ignore_ascii_case(expected))
+                        .unwrap_or(false),
+                    None => true,
+                };
+                if verified {
+                    return Ok(());
+                }
+                // Hash não bateu: o arquivo pode estar corrompido em qualquer
+                // ponto (não só no fim), então descarta tudo e recomeça do
+                // zero na próxima tentativa — diferente de uma falha de rede
+                // no meio, onde o que já foi escrito continua confiável.
+                let _ = std::fs::remove_file(&dest_path);
+                last_err = "Checksum SHA1 não confere após o download.".to_string();
+            }
+            Err(e) => {
+                last_err = e;
+                // Não apaga o arquivo parcial aqui — é exatamente o que permite
+                // retomar via Range na próxima tentativa em vez de reiniciar.
+            }
+        }
+
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(500 * 2u64.pow((attempt - 1).min(6)))).await;
+        }
+    }
+
+    let _ = std::fs::remove_file(&dest_path);
+    Err(format!("Falha ao baixar mod após {} tentativas: {}", MAX_ATTEMPTS, last_err))
+}
+
 #[derive(Serialize, Clone)]
 struct DiagnosticPayload {
     level: String, // "info" | "warning" | "error" | "critical"
@@ -1189,6 +1362,25 @@ fn read_log_tail(server_dir: &str, max_lines: usize) -> Option<String> {
     Some(lines[start..].join("\n"))
 }
 
+/// Reporta o status do processo Minecraft (online/offline/starting/stopping/crashed)
+/// pra API Central, pelo shortCode do servidor ativo (`active_short_code`) —
+/// independente da rede mesh estar ligada ou não (ver POST .../heartbeat em
+/// handleHeartbeat no Worker). Reaproveita a fila de sincronização já existente
+/// (SyncOperationType::Heartbeat/execute_heartbeat), que já sabe fazer retry/backoff.
+/// Sem shortCode ativo (servidor nunca foi registrado na API Central), não há o
+/// que reportar.
+fn report_mc_status(app: &tauri::AppHandle, state: &AppState, status: &str) {
+    let short_code = state.active_short_code.lock().unwrap().clone();
+    if let Some(sc) = short_code {
+        let current_players = state.minecraft_online_players.lock().unwrap().len() as u32;
+        enqueue_operation(app, SyncOperationType::Heartbeat, serde_json::json!({
+            "shortCode": sc,
+            "status": status,
+            "currentPlayers": current_players,
+        }));
+    }
+}
+
 /// Inicia o servidor Minecraft usando o Java instalado pelo CubeForge.
 /// Redireciona stdout/stderr para eventos `minecraft-log`.
 /// Usa polling TCP para detectar quando o servidor está realmente pronto
@@ -1212,6 +1404,7 @@ async fn start_minecraft_server(
 
     // Parar qualquer servidor que já esteja rodando
     stop_minecraft_server_internal(&app, &state).await;
+    report_mc_status(&app, state.inner(), "starting");
 
     // Construir argumentos do Java
     let mut args = vec![
@@ -1360,6 +1553,7 @@ async fn start_minecraft_server(
                             // não emitir "crashed" quando o servidor for parado depois)
                             state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
                             let _ = app_stdout.emit("minecraft-status-changed", "online");
+                            report_mc_status(&app_stdout, state_ref, "online");
                         }
                         // Guardar a causa raiz do crash (primeiro padrão reconhecido vence —
                         // erros em cascata depois costumam ser só consequência do primeiro).
@@ -1448,6 +1642,7 @@ async fn start_minecraft_server(
                 let state_ref = unsafe { &*(state_tcp_handle as *const AppState) };
                 state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
                 let _ = app_tcp.emit("minecraft-status-changed", "online");
+                report_mc_status(&app_tcp, state_ref, "online");
                 break;
             }
 
@@ -1467,6 +1662,7 @@ async fn start_minecraft_server(
     std::thread::spawn(move || {
         let mut sys = System::new_all();
         let pid = Pid::from_u32(mc_pid);
+        let mut heartbeat_tick: u32 = 0;
         loop {
             let state_ref = unsafe { &*(state_resources_handle as *const AppState) };
             let process_alive = {
@@ -1479,6 +1675,15 @@ async fn start_minecraft_server(
             };
             if !process_alive {
                 break;
+            }
+
+            // A cada 3 iterações (~45s, já que esta thread roda a cada 15s) reafirma
+            // "online" pra API Central — o registro de status do Minecraft expira em
+            // 90s (ver SESSION_TTL_SECONDS no Worker), e um servidor pode ficar horas
+            // sem nenhuma transição de status pra renovar isso sozinho.
+            heartbeat_tick += 1;
+            if heartbeat_tick % 3 == 0 {
+                report_mc_status(&app_resources, state_ref, "online");
             }
 
             sys.refresh_cpu_usage();
@@ -1623,6 +1828,8 @@ async fn start_minecraft_server(
         if is_normal_shutdown && !is_crash_by_report {
             log_to_file(&app_monitor, "[MC] Parada NORMAL detectada. Emitindo 'offline'.");
             let _ = app_monitor.emit("minecraft-status-changed", "offline");
+            let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
+            report_mc_status(&app_monitor, state_ref, "offline");
         } else {
             let reason = if is_crash_by_report {
                 "via crash-reports".to_string()
@@ -1631,6 +1838,8 @@ async fn start_minecraft_server(
             };
             log_to_file(&app_monitor, &format!("[MC] CRASH detectado ({}). Causa conhecida: {:?}. Emitindo 'crashed'.", reason, known_cause));
             let _ = app_monitor.emit("minecraft-status-changed", "crashed");
+            let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
+            report_mc_status(&app_monitor, state_ref, "crashed");
 
             // Sem crash-report novo (crash nativo da JVM, OOM muito cedo, etc):
             // cai para a cauda de logs/latest.log, que ainda dá contexto pro analisador.
@@ -2106,6 +2315,7 @@ async fn stop_minecraft_server_internal(
 
     // Emitir status de parada
     let _ = app.emit("minecraft-status-changed", "stopping");
+    report_mc_status(app, state.inner(), "stopping");
 
     // Aguardar até 15 segundos pelo processo encerrar de forma limpa
     for _ in 0..15 {
@@ -2914,7 +3124,7 @@ async fn ban_player(server_dir: String, name: String, reason: Option<String>) ->
         uuid,
         name,
         created: current_ban_timestamp(),
-        source: "CubeForge Dash".to_string(),
+        source: "Cubicase".to_string(),
         expires: "forever".to_string(),
         reason: reason
             .filter(|r| !r.trim().is_empty())
@@ -2952,7 +3162,7 @@ async fn ban_ip(server_dir: String, ip: String, reason: Option<String>) -> Resul
     let entry = BannedIpEntry {
         ip,
         created: current_ban_timestamp(),
-        source: "CubeForge Dash".to_string(),
+        source: "Cubicase".to_string(),
         expires: "forever".to_string(),
         reason: reason
             .filter(|r| !r.trim().is_empty())
@@ -3265,19 +3475,28 @@ async fn extract_modpack_overrides(zip_path: String, dest_dir: String, overrides
 
 // ============================================================
 // Server Registry — Servidor HTTP local para descoberta de servidores
+// e sincronização de mods do convidado
 // ============================================================
 //
 // O Rust mantém um registro em memória dos servidores Minecraft disponíveis
 // e expõe só leitura via HTTP em 127.0.0.1:25567 (loopback — só processos
 // nesta mesma máquina alcançam):
 //
-// - GET /registry/resolve?code={shortCode} → retorna metadados do servidor
-// - GET /status                            → health check
+// - GET /registry/resolve?code={shortCode}            → metadados do servidor
+// - GET /registry/mods?code={shortCode}                → lista de mods da pasta
+//   mods/ do servidor ATUALMENTE hospedado por este app, com a origem de cada
+//   um já resolvida (registro local de instalação, hash reconhecido no
+//   Modrinth, ou desconhecida) — ver resolve_server_mods.
+// - GET /registry/mods/file?code={shortCode}&name={arquivo} → bytes de um mod
+//   específico (com suporte a Range, pra download retomável). Só serve
+//   arquivos de dentro da própria pasta mods/ do servidor hospedado — ver
+//   validação de path em handle_mods_file.
+// - GET /status                                        → health check
 //
 // O sidecar Go é o único consumidor: ele escuta em :25566 na interface
 // virtual do Tailscale (tsnet, sem stack de rede real — só outros peers da
-// mesh chegam ali) e faz proxy só desses dois GETs para cá. Deliberadamente
-// NÃO existe:
+// mesh chegam ali) e faz proxy dessas rotas para cá. Deliberadamente NÃO
+// existe:
 //
 // - Um listener em 0.0.0.0: escutar em todas as interfaces expunha isso pra
 //   qualquer um na mesma rede local/Wi-Fi, não só pra quem está na mesh
@@ -3288,6 +3507,14 @@ async fn extract_modpack_overrides(zip_path: String, dest_dir: String, overrides
 //   os comandos Tauri `update_server_registry`/`remove_server_registry` —
 //   não há necessidade de aceitar isso pela rede, então essa capacidade nem
 //   existe aqui (não dá pra explorar uma rota que não existe).
+//
+// `active_short_code`/`active_server_dir` (ver AppState) identificam qual
+// servidor local corresponde ao "código" que um convidado está pedindo —
+// atualizados por sync_register_server sempre que o host seleciona/registra
+// um servidor. Uma única instalação só hospeda um servidor por vez, então
+// não há necessidade de um mapa completo aqui (diferente do ServerRegistry
+// abaixo, que é uma estrutura mais antiga, não usada pelo fluxo atual do
+// front-end, mas mantida por compatibilidade da rota /resolve).
 
 use std::collections::BTreeMap;
 
@@ -3311,7 +3538,20 @@ struct ServerRegistry {
 /// Inicia o servidor HTTP de registro (só leitura) numa thread separada,
 /// escutando em 127.0.0.1:25567 — ver o comentário do módulo acima para por
 /// que não existe (e não deve existir) um listener em 0.0.0.0.
-fn start_registry_http_server(registry: Arc<ServerRegistry>) {
+///
+/// Cada requisição aceita dispara sua PRÓPRIA thread (em vez de um loop
+/// único processando uma por vez, como era antes) — necessário desde que a
+/// rota /mods/file passou a existir: sem isso, o download de um arquivo de
+/// mod em andamento bloquearia até o /status usado pelo health-check do
+/// convidado (ver startGuestHealthCheck no sidecar Go), fazendo a malha
+/// parecer instável por causa da própria sincronização de mods. O volume de
+/// requisições aqui é baixo (alguns convidados, esporadicamente) — não
+/// precisa de um pool de threads dedicado.
+fn start_registry_http_server(
+    registry: Arc<ServerRegistry>,
+    active_short_code: Arc<Mutex<Option<String>>>,
+    active_server_dir: Arc<Mutex<Option<String>>>,
+) {
     thread::spawn(move || {
         let addr = "127.0.0.1:25567";
         let server = match tiny_http::Server::http(addr) {
@@ -3328,12 +3568,12 @@ fn start_registry_http_server(registry: Arc<ServerRegistry>) {
         loop {
             match server.recv() {
                 Ok(request) => {
-                    let url = request.url().to_string();
-                    let method = request.method().as_str().to_string();
-                    eprintln!("[Registry] Requisição recebida: {} {}", method, url);
-
-                    let response = handle_registry_request(&registry, &method, &url);
-                    let _ = request.respond(tiny_http::Response::from_string(response));
+                    let registry = registry.clone();
+                    let active_short_code = active_short_code.clone();
+                    let active_server_dir = active_server_dir.clone();
+                    thread::spawn(move || {
+                        handle_registry_connection(request, &registry, &active_short_code, &active_server_dir);
+                    });
                 }
                 Err(e) => {
                     eprintln!("[Registry] Erro no servidor HTTP local: {}", e);
@@ -3343,38 +3583,497 @@ fn start_registry_http_server(registry: Arc<ServerRegistry>) {
     });
 }
 
-/// Processa uma requisição HTTP do registro e retorna a resposta como string.
-/// Só leitura, deliberadamente — ver o comentário do módulo acima.
-fn handle_registry_request(registry: &ServerRegistry, method: &str, url: &str) -> String {
-    match (method, url) {
-        // GET /registry/resolve?code={shortCode}
-        ("GET", url_str) if url_str.starts_with("/registry/resolve") || url_str.starts_with("/resolve") => {
-            let code = url_str.split("?code=").nth(1).unwrap_or("").to_string();
+/// Responde com um corpo JSON e o status code dado — helper pra não repetir
+/// a montagem de headers (Content-Type + CORS) em cada rota.
+fn respond_json(request: tiny_http::Request, status: u16, body: &str) {
+    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let cors = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
+    let response = tiny_http::Response::from_string(body.to_string())
+        .with_status_code(tiny_http::StatusCode(status))
+        .with_header(content_type)
+        .with_header(cors);
+    let _ = request.respond(response);
+}
+
+/// Decodifica percent-encoding ("%XX" e "+") de um valor de query string —
+/// nomes de arquivo de mod frequentemente têm espaço/colchetes/etc (ex: "JEI
+/// [1.20.1].jar"), e o lado Go escapa esses valores (url.QueryEscape) antes
+/// de montar a URL de proxy (ver startHTTPServer no sidecar).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Extrai o valor de um parâmetro de query string de uma URL completa
+/// (ex: "/mods/file?code=ABC&name=Mod.jar").
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        if kv.next()? == key {
+            return Some(percent_decode(kv.next().unwrap_or("")));
+        }
+    }
+    None
+}
+
+/// Um nome de arquivo de mod "seguro" pra servir: sem separador de pasta nem
+/// ".." — é a única defesa entre a rota /mods/file e o resto do disco do
+/// host (reforçada de novo por canonicalização em handle_mods_file).
+fn is_safe_mod_filename(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+}
+
+/// Despacha uma conexão já aceita pelo servidor HTTP do registro pra rota
+/// certa. Só leitura, deliberadamente — ver o comentário do módulo acima.
+fn handle_registry_connection(
+    request: tiny_http::Request,
+    registry: &ServerRegistry,
+    active_short_code: &Mutex<Option<String>>,
+    active_server_dir: &Mutex<Option<String>>,
+) {
+    if *request.method() != tiny_http::Method::Get {
+        respond_json(request, 405, "{\"error\":\"method not allowed\"}");
+        return;
+    }
+
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or("");
+
+    match path {
+        "/registry/resolve" | "/resolve" => {
+            let code = query_param(&url, "code").unwrap_or_default();
             eprintln!("[Registry] Resolvendo código: '{}'", code);
-            let entries = registry.entries.lock().unwrap();
-            eprintln!("[Registry] Entradas no registro: {:?}", entries.keys().collect::<Vec<_>>());
-            match entries.get(&code) {
+            let found = registry.entries.lock().unwrap().get(&code).cloned();
+            match found {
                 Some(entry) => {
-                    eprintln!("[Registry] Servidor encontrado: {:?}", entry);
-                    let json = serde_json::to_string(entry).unwrap_or_default();
-                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", json)
+                    let json = serde_json::to_string(&entry).unwrap_or_default();
+                    respond_json(request, 200, &json);
                 }
                 None => {
                     eprintln!("[Registry] Código '{}' não encontrado no registro!", code);
-                    format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"Servidor não encontrado para o código: {}\"}}", code)
+                    respond_json(request, 404, &format!("{{\"error\":\"Servidor não encontrado para o código: {}\"}}", code));
                 }
             }
         }
-        // GET /status — health check
-        ("GET", "/status") => {
-            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"status\":\"ok\"}}")
-        }
+        "/registry/mods" | "/mods" => handle_mods_list(request, &url, active_short_code, active_server_dir),
+        "/registry/mods/file" | "/mods/file" => handle_mods_file(request, &url, active_short_code, active_server_dir),
+        "/status" => respond_json(request, 200, "{\"status\":\"ok\"}"),
         // Qualquer outro endpoint (inclui os antigos /list, /update, /remove —
         // removidos de propósito, não é falta de rota)
-        _ => {
-            format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{{\"error\":\"Endpoint não encontrado\"}}")
+        _ => respond_json(request, 404, "{\"error\":\"Endpoint não encontrado\"}"),
+    }
+}
+
+/// Confere se o `code` pedido pelo convidado é o mesmo short_code do
+/// servidor que este host está hospedando agora, e retorna a pasta dele.
+/// None quando não há servidor hospedado ou o código não confere — nos dois
+/// casos a resposta certa pro chamador é 404 (não revela se o código existe
+/// "em algum lugar", só se é o que ESTE host está servindo).
+fn hosted_server_dir_for_code(
+    code: &str,
+    active_short_code: &Mutex<Option<String>>,
+    active_server_dir: &Mutex<Option<String>>,
+) -> Option<String> {
+    if code.is_empty() {
+        return None;
+    }
+    let hosted_code = active_short_code.lock().unwrap().clone()?;
+    if hosted_code != code {
+        return None;
+    }
+    active_server_dir.lock().unwrap().clone()
+}
+
+/// GET /mods?code={shortCode} — lista os mods da pasta mods/ do servidor
+/// hospedado, cada um já com a origem resolvida (ver resolve_server_mods).
+fn handle_mods_list(
+    request: tiny_http::Request,
+    url: &str,
+    active_short_code: &Mutex<Option<String>>,
+    active_server_dir: &Mutex<Option<String>>,
+) {
+    let code = query_param(url, "code").unwrap_or_default();
+    let dir = match hosted_server_dir_for_code(&code, active_short_code, active_server_dir) {
+        Some(d) => d,
+        None => {
+            respond_json(request, 404, "{\"error\":\"server_not_hosted\"}");
+            return;
+        }
+    };
+
+    match resolve_server_mods(std::path::Path::new(&dir)) {
+        Ok(mods) => {
+            let json = serde_json::to_string(&mods).unwrap_or_else(|_| "[]".to_string());
+            respond_json(request, 200, &json);
+        }
+        Err(e) => {
+            eprintln!("[Registry] Falha ao resolver mods de {}: {}", dir, e);
+            respond_json(request, 500, &format!("{{\"error\":\"{}\"}}", e.replace('"', "'")));
         }
     }
+}
+
+/// GET /mods/file?code={shortCode}&name={arquivo} — bytes de um mod
+/// específico da pasta mods/ do servidor hospedado. Honra o header Range
+/// (download retomável); sem Range, devolve o arquivo inteiro em streaming
+/// (Response::from_file não carrega tudo em memória).
+fn handle_mods_file(
+    request: tiny_http::Request,
+    url: &str,
+    active_short_code: &Mutex<Option<String>>,
+    active_server_dir: &Mutex<Option<String>>,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let code = query_param(url, "code").unwrap_or_default();
+    let dir = match hosted_server_dir_for_code(&code, active_short_code, active_server_dir) {
+        Some(d) => d,
+        None => {
+            respond_json(request, 404, "{\"error\":\"server_not_hosted\"}");
+            return;
+        }
+    };
+
+    let name = query_param(url, "name").unwrap_or_default();
+    if !is_safe_mod_filename(&name) {
+        respond_json(request, 400, "{\"error\":\"invalid_filename\"}");
+        return;
+    }
+
+    let mods_dir = std::path::Path::new(&dir).join("mods");
+    let requested_path = mods_dir.join(&name);
+
+    // Defesa em profundidade contra path traversal: além de rejeitar ".."
+    // acima, confere que o caminho canonicalizado continua de fato dentro
+    // da pasta mods/ (protege contra links simbólicos/junções escapando
+    // dela, por exemplo).
+    let canon_mods = match mods_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            respond_json(request, 404, "{\"error\":\"mods_dir_not_found\"}");
+            return;
+        }
+    };
+    let canon_file = match requested_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            respond_json(request, 404, "{\"error\":\"mod_not_found\"}");
+            return;
+        }
+    };
+    if !canon_file.starts_with(&canon_mods) {
+        respond_json(request, 400, "{\"error\":\"invalid_filename\"}");
+        return;
+    }
+
+    let mut file = match File::open(&canon_file) {
+        Ok(f) => f,
+        Err(_) => {
+            respond_json(request, 404, "{\"error\":\"mod_not_found\"}");
+            return;
+        }
+    };
+    let total_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => {
+            respond_json(request, 500, "{\"error\":\"stat_failed\"}");
+            return;
+        }
+    };
+
+    let range_header = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| h.value.as_str().to_string());
+
+    if let Some(range_value) = range_header {
+        if let Some((start, end)) = parse_byte_range(&range_value, total_len) {
+            if file.seek(SeekFrom::Start(start)).is_ok() {
+                let len = end - start + 1;
+                let limited = file.take(len);
+                let content_range = tiny_http::Header::from_bytes(
+                    &b"Content-Range"[..],
+                    format!("bytes {}-{}/{}", start, end, total_len).as_bytes(),
+                )
+                .unwrap();
+                let accept_ranges = tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap();
+                let response = tiny_http::Response::new(
+                    tiny_http::StatusCode(206),
+                    vec![content_range, accept_ranges],
+                    limited,
+                    Some(len as usize),
+                    None,
+                );
+                let _ = request.respond(response);
+                return;
+            }
+        }
+        // Range inválido/não-satisfazível: cai pro arquivo inteiro abaixo
+        // em vez de falhar — o cliente ainda consegue baixar, só sem retomar.
+    }
+
+    let accept_ranges = tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap();
+    let response = tiny_http::Response::from_file(file).with_header(accept_ranges);
+    let _ = request.respond(response);
+}
+
+/// Parseia um único intervalo "bytes=START-" ou "bytes=START-END" (a única
+/// forma que o downloader do lado Rust gera — ver download_mod_file).
+fn parse_byte_range(value: &str, total_len: u64) -> Option<(u64, u64)> {
+    let spec = value.strip_prefix("bytes=")?;
+    let mut parts = spec.splitn(2, '-');
+    let start: u64 = parts.next()?.parse().ok()?;
+    let end_str = parts.next().unwrap_or("");
+    let end: u64 = if end_str.is_empty() {
+        total_len.checked_sub(1)?
+    } else {
+        end_str.parse().ok()?
+    };
+    if start > end || end >= total_len {
+        return None;
+    }
+    Some((start, end))
+}
+
+// ------------------------------------------------------------
+// Resolução de origem dos mods (registro -> hash no Modrinth -> desconhecido)
+// ------------------------------------------------------------
+
+/// Entrada resolvida de um mod, exposta ao convidado via GET /mods.
+#[derive(Serialize, Clone, Debug)]
+struct ModManifestEntry {
+    filename: String,
+    size_bytes: u64,
+    sha1: String,
+    source: String, // "modrinth" | "unknown"
+    url: Option<String>,
+}
+
+/// Resolução cacheada de um arquivo, persistida em
+/// "<server_dir>/cubeforge-mods-cache.json" — indexada por nome de arquivo,
+/// válida enquanto tamanho+data de modificação não mudarem. Evita recalcular
+/// hash e reconsultar o Modrinth a cada convidado que conecta.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct CachedModResolution {
+    size_bytes: u64,
+    mtime_secs: i64,
+    sha1: String,
+    source: String,
+    url: Option<String>,
+}
+
+fn mods_cache_path(server_dir: &std::path::Path) -> std::path::PathBuf {
+    server_dir.join("cubeforge-mods-cache.json")
+}
+
+fn read_mods_cache(server_dir: &std::path::Path) -> HashMap<String, CachedModResolution> {
+    std::fs::read_to_string(mods_cache_path(server_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_mods_cache(server_dir: &std::path::Path, cache: &HashMap<String, CachedModResolution>) {
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(mods_cache_path(server_dir), json);
+    }
+}
+
+/// Hash SHA1 de um arquivo em streaming (sem carregar tudo na memória —
+/// mods podem passar de 100MB). Só roda quando o cache não bate (arquivo
+/// novo ou modificado), não em todo pedido.
+fn sha1_of_file(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = sha1_smol::Sha1::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.digest().to_string())
+}
+
+#[derive(Deserialize)]
+struct ModrinthFileHashes {
+    #[allow(dead_code)]
+    sha1: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersionFileLookup {
+    url: String,
+    primary: bool,
+    #[allow(dead_code)]
+    hashes: ModrinthFileHashes,
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersionLookup {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    project_id: String,
+    files: Vec<ModrinthVersionFileLookup>,
+}
+
+/// Consulta em lote a API pública do Modrinth (sem API key) pra descobrir, a
+/// partir do SHA1 de arquivos quaisquer — mesmo que nunca tenham passado
+/// pelo instalador do próprio CubeForge — qual versão/projeto do Modrinth
+/// cada um corresponde. É assim que ferramentas como o Modrinth App
+/// reconhecem mods "soltos" numa pasta: um mod baixado manualmente de algum
+/// lugar e jogado na pasta mods/ do servidor é identificado pelo conteúdo,
+/// não por como chegou lá. Só funciona pra mods publicados no Modrinth; o
+/// que não bate fica "unknown" pro chamador (resolve_server_mods), que cai
+/// no fallback de baixar o arquivo direto deste host pela mesh.
+async fn modrinth_lookup_by_sha1(hashes: &[String]) -> Result<HashMap<String, ModrinthVersionLookup>, String> {
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("FelipoArts/CubeForge/1.0 (+https://cubeforge.dev; contato: suporte@cubeforge.dev)")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post("https://api.modrinth.com/v2/version_files")
+        .json(&serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao consultar o Modrinth: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Modrinth respondeu HTTP {}", resp.status()));
+    }
+
+    resp.json::<HashMap<String, ModrinthVersionLookup>>()
+        .await
+        .map_err(|e| format!("Resposta inesperada do Modrinth: {}", e))
+}
+
+/// Resolve a lista de mods atualmente na pasta mods/ de um servidor,
+/// identificando a origem de cada um — ver comentário de
+/// modrinth_lookup_by_sha1. Mods desabilitados (".jar.disabled") são
+/// ignorados: o convidado só precisa do que o servidor vai carregar de
+/// verdade. Bloqueante (hash de arquivo + 1 chamada de rede em lote) —
+/// chamado de dentro de uma thread dedicada por requisição, nunca do loop
+/// principal de accept.
+fn resolve_server_mods(server_dir: &std::path::Path) -> Result<Vec<ModManifestEntry>, String> {
+    let mods_dir = server_dir.join("mods");
+    if !mods_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut cache = read_mods_cache(server_dir);
+    let mut entries_out: Vec<ModManifestEntry> = Vec::new();
+    // (filename, size, mtime, sha1) dos que precisam de consulta nova ao Modrinth.
+    let mut pending: Vec<(String, u64, i64, String)> = Vec::new();
+
+    for entry in std::fs::read_dir(&mods_dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let filename = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if !filename.to_lowercase().ends_with(".jar") {
+            continue; // pula .jar.disabled e qualquer outra coisa na pasta
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size_bytes = metadata.len();
+        let mtime_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        if let Some(cached) = cache.get(&filename) {
+            if cached.size_bytes == size_bytes && cached.mtime_secs == mtime_secs {
+                entries_out.push(ModManifestEntry {
+                    filename: filename.clone(),
+                    size_bytes,
+                    sha1: cached.sha1.clone(),
+                    source: cached.source.clone(),
+                    url: cached.url.clone(),
+                });
+                continue;
+            }
+        }
+
+        match sha1_of_file(&path) {
+            Ok(sha1) => pending.push((filename, size_bytes, mtime_secs, sha1)),
+            Err(e) => eprintln!("[Registry] Falha ao calcular hash de {}: {}", filename, e),
+        }
+    }
+
+    if !pending.is_empty() {
+        let hashes: Vec<String> = pending.iter().map(|(_, _, _, h)| h.clone()).collect();
+        let lookup = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .map(|rt| rt.block_on(modrinth_lookup_by_sha1(&hashes)))
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+
+        for (filename, size_bytes, mtime_secs, sha1) in pending {
+            let (source, url) = match lookup.get(&sha1) {
+                Some(v) => {
+                    let file_url = v.files.iter().find(|f| f.primary).or_else(|| v.files.first()).map(|f| f.url.clone());
+                    ("modrinth".to_string(), file_url)
+                }
+                None => ("unknown".to_string(), None),
+            };
+
+            cache.insert(
+                filename.clone(),
+                CachedModResolution { size_bytes, mtime_secs, sha1: sha1.clone(), source: source.clone(), url: url.clone() },
+            );
+            entries_out.push(ModManifestEntry { filename, size_bytes, sha1, source, url });
+        }
+
+        write_mods_cache(server_dir, &cache);
+    }
+
+    Ok(entries_out)
 }
 
 /// Comando Tauri: atualiza o registro de servidores.
@@ -4010,13 +4709,20 @@ async fn sync_register_server(
     owner: Option<String>,
     forge_version: Option<String>,
     mod_loader_version: Option<String>,
+    server_dir: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_to_file(&app, &format!("[SYNC] sync_register_server: name={}, version={}", name, version));
 
     // Guarda o shortCode ativo para que o shutdown gracioso saiba qual servidor
     // notificar como offline caso o app seja fechado sem um heartbeat prévio.
+    // Junto com `server_dir`, é também o que a rota mesh "GET /mods" usa pra
+    // saber qual servidor (e qual pasta) ESTE host está servindo agora — ver
+    // AppState::active_server_dir e handle_mods_list.
     if let Some(ref sc) = short_code {
         *state.active_short_code.lock().unwrap() = Some(sc.clone());
+    }
+    if let Some(ref dir) = server_dir {
+        *state.active_server_dir.lock().unwrap() = Some(dir.clone());
     }
 
     let payload = serde_json::json!({
@@ -4126,6 +4832,7 @@ async fn sync_delete_server(
         let mut active = state.active_short_code.lock().unwrap();
         if active.as_deref() == Some(short_code.as_str()) {
             *active = None;
+            *state.active_server_dir.lock().unwrap() = None;
         }
     }
 
@@ -4151,6 +4858,299 @@ async fn sync_delete_server(
     } else {
         Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
     }
+}
+
+/// Regenera o shortCode de um servidor na API Central (ex.: código vazou
+/// publicamente). Diferente das demais operações de sincronização, NÃO passa
+/// pela fila de retry em segundo plano: quem decide o novo código é sempre o
+/// Worker (mesma checagem de colisão do cadastro inicial via genCode), então
+/// só faz sentido considerar a troca concluída depois de uma resposta
+/// síncrona bem-sucedida — enfileirar isso pra retry silencioso arriscaria
+/// gerar múltiplos códigos novos a cada tentativa sem o chamador saber qual
+/// "venceu". Em caso de falha, retorna Err para a UI decidir se tenta de novo,
+/// em vez de mudar qualquer estado local.
+#[tauri::command]
+async fn regenerate_server_code(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    short_code: String,
+) -> Result<serde_json::Value, String> {
+    log_to_file(&app, &format!("[SYNC] regenerate_server_code: short_code={}", short_code));
+
+    let url = format!("{}/api/v1/servers/{}/regenerate-code", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client.post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+
+    let new_short_code = body.get("data").and_then(|d| d.get("shortCode")).and_then(|v| v.as_str())
+        .ok_or("Resposta da API sem o novo shortCode")?
+        .to_string();
+
+    // Se este era o servidor ativo (hospedando agora), atualiza a referência em
+    // memória — sem isso, heartbeats e o shutdown gracioso continuariam
+    // reportando o código antigo, que a API acabou de invalidar.
+    {
+        let mut active = state.active_short_code.lock().unwrap();
+        if active.as_deref() == Some(short_code.as_str()) {
+            *active = Some(new_short_code.clone());
+        }
+    }
+
+    log_to_file(&app, &format!("[SYNC] Código regenerado: {} -> {}", short_code, new_short_code));
+    Ok(serde_json::json!({ "success": true, "shortCode": new_short_code }))
+}
+
+// ============================================================
+// WAKE-ON-DEMAND — modo de espera + auto-shutdown (Cubicase Plus)
+// ============================================================
+// Enquanto armado, este host manda uma heartbeat leve de "sleeping" pro
+// Worker a cada poucos segundos (send_sleep_heartbeat) SEM subir Java nem a
+// malha Tailscale — só quando a resposta trouxer wakeRequested:true (um
+// convidado pediu pra entrar, ver POST /servers/{sc}/wake no Worker) é que
+// wake_from_sleep sobe os dois de verdade. O auto-shutdown por inatividade
+// mora dentro do loop de heartbeat "online" já existente (ver mais abaixo,
+// perto de `sm.send_heartbeat`) — ele já lê a contagem de jogadores a cada
+// tick, então só precisava de um contador extra.
+//
+// Importante: instalação de JRE é só em TypeScript (src/lib/jre.ts) — uma
+// task em segundo plano no Rust não tem como instalar Java sozinha. Por
+// isso arm_wake_on_demand recusa armar se o `java_path` recebido não
+// existir no disco: o host precisa ter iniciado esse servidor manualmente
+// (e portanto já ter o Java instalado) pelo menos uma vez antes.
+
+/// Tudo que `wake_from_sleep` precisa pra registrar e subir o servidor de
+/// verdade, capturado uma vez no momento de armar — evita qualquer leitura
+/// de arquivo (cubicase-meta.json) a partir de uma task em segundo plano; o
+/// frontend já tem esses campos carregados quando o host liga o recurso.
+#[derive(Clone)]
+struct WakeOnDemandConfig {
+    short_code: String,
+    server_dir: String,
+    java_path: String,
+    ram_gb: u32,
+    local_port: u16,
+    server_jar_name: Option<String>,
+    launch_args_dir: Option<String>,
+    idle_timeout_minutes: u32,
+    name: String,
+    version: String,
+    server_type: String,
+    description: String,
+    forge_version: Option<String>,
+    mod_loader_version: Option<String>,
+}
+
+/// Heartbeat direta (fora da fila de retry — ver execute_heartbeat) contra
+/// POST /servers/{sc}/heartbeat, devolvendo o corpo parseado em vez de
+/// descartá-lo: é dali que vem `wakeRequested`, que o loop de espera precisa
+/// ler a cada tick.
+async fn send_sleep_heartbeat(short_code: &str, status: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.post(&url)
+        .json(&serde_json::json!({ "status": status, "currentPlayers": 0 }))
+        .send()
+        .await
+        .map_err(|e| format!("Falha de conexão: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body.get("data").cloned().unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// Sobe a rede e o Minecraft de verdade a partir do modo de espera. As duas
+/// coisas são independentes hoje (nenhuma espera a outra ficar pronta) e o
+/// boot do Java costuma ser mais lento que o handshake do Tailscale, então
+/// rodar em paralelo (tokio::join!) em vez de em série evita somar os dois
+/// tempos à toa. sync_register_server vai primeiro porque a criação da
+/// ConnectionSession no Worker dá 404 sem o servidor já registrado.
+async fn wake_from_sleep(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>) {
+    log_to_file(&app, &format!("[WakeOnDemand] Acordando servidor {}...", cfg.short_code));
+
+    let telemetry = app.state::<Arc<Mutex<SyncTelemetry>>>();
+    if let Err(e) = sync_register_server(
+        app.clone(),
+        app.state::<AppState>(),
+        telemetry,
+        cfg.name.clone(),
+        cfg.version.clone(),
+        cfg.server_type.clone(),
+        cfg.description.clone(),
+        Some(cfg.short_code.clone()),
+        None,
+        cfg.forge_version.clone(),
+        cfg.mod_loader_version.clone(),
+        Some(cfg.server_dir.clone()),
+    ).await {
+        log_to_file(&app, &format!("[WakeOnDemand] Falha ao registrar servidor ao acordar: {}", e));
+    }
+
+    let net_fut = start_network_node(
+        app.clone(),
+        app.state::<AppState>(),
+        "host".to_string(),
+        cfg.short_code.clone(),
+        None,
+        cfg.local_port,
+    );
+    let mc_fut = start_minecraft_server(
+        app.clone(),
+        app.state::<AppState>(),
+        cfg.server_dir.clone(),
+        cfg.java_path.clone(),
+        cfg.ram_gb,
+        cfg.local_port,
+        cfg.server_jar_name.clone(),
+        cfg.launch_args_dir.clone(),
+    );
+
+    let (net_res, mc_res) = tokio::join!(net_fut, mc_fut);
+    if let Err(e) = net_res { log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar rede: {}", e)); }
+    if let Err(e) = mc_res { log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar servidor: {}", e)); }
+}
+
+/// Task solta que manda a heartbeat de espera em loop até: (a) receber
+/// wakeRequested:true, ou (b) `generation` não bater mais com
+/// `wake_loop_generation` (foi desarmado, ou um novo ciclo de espera/wake
+/// começou depois deste) — o jeito já usado neste arquivo (ver
+/// `minecraft_stop_requested`/`network_stop_requested`) de sinalizar "pare"
+/// pra uma task sem guardar um JoinHandle em lugar nenhum.
+fn spawn_sleeping_loop(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if app.state::<AppState>().wake_loop_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            match send_sleep_heartbeat(&cfg.short_code, "sleeping").await {
+                Ok(data) => {
+                    if data.get("wakeRequested").and_then(|v| v.as_bool()) == Some(true) {
+                        log_to_file(&app, &format!("[WakeOnDemand] Pedido de despertar recebido para {}.", cfg.short_code));
+                        wake_from_sleep(app.clone(), cfg.clone()).await;
+                        return; // dali em diante quem cuida é o loop de heartbeat "online" já existente
+                    }
+                }
+                Err(e) => {
+                    log_to_file(&app, &format!("[WakeOnDemand] Heartbeat de espera falhou: {}", e));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        }
+    });
+}
+
+/// Arma o wake-on-demand pra um servidor: valida Java já instalado, desarma
+/// qualquer outro servidor armado (só um processo de rede/MC por vez nesta
+/// instalação), guarda a config e sobe o loop de espera.
+#[tauri::command]
+async fn arm_wake_on_demand(
+    app: tauri::AppHandle,
+    server_dir: String,
+    short_code: String,
+    java_path: String,
+    ram_gb: u32,
+    local_port: u16,
+    server_jar_name: Option<String>,
+    launch_args_dir: Option<String>,
+    idle_timeout_minutes: u32,
+    name: String,
+    version: String,
+    server_type: String,
+    description: String,
+    forge_version: Option<String>,
+    mod_loader_version: Option<String>,
+) -> Result<(), String> {
+    if !std::path::Path::new(&java_path).exists() {
+        return Err("Java ainda não instalado para este servidor — inicie-o manualmente pelo menos uma vez antes de ativar o modo de espera.".to_string());
+    }
+
+    disarm_wake_on_demand(app.clone()).await?;
+
+    let cfg = Arc::new(WakeOnDemandConfig {
+        short_code: short_code.clone(),
+        server_dir,
+        java_path,
+        ram_gb,
+        local_port,
+        server_jar_name,
+        launch_args_dir,
+        idle_timeout_minutes,
+        name,
+        version,
+        server_type,
+        description,
+        forge_version,
+        mod_loader_version,
+    });
+
+    let generation = {
+        let state = app.state::<AppState>();
+        *state.wake_on_demand.lock().unwrap() = Some(cfg.clone());
+        state.idle_ticks.store(0, Ordering::SeqCst);
+        state.wake_loop_generation.fetch_add(1, Ordering::SeqCst) + 1
+    };
+
+    log_to_file(&app, &format!("[WakeOnDemand] Armado para {} (timeout: {}min)", short_code, idle_timeout_minutes));
+
+    // Heartbeat imediata — o convidado não precisa esperar o primeiro tick pra ver "sleeping".
+    if let Err(e) = send_sleep_heartbeat(&short_code, "sleeping").await {
+        log_to_file(&app, &format!("[WakeOnDemand] Heartbeat inicial de espera falhou: {}", e));
+    }
+
+    spawn_sleeping_loop(app, cfg, generation);
+    Ok(())
+}
+
+/// Desarma o wake-on-demand. Nunca derruba uma sessão já hospedando de
+/// verdade (só impede reentrar em modo de espera depois que ela terminar) —
+/// é o que permite "assinatura venceu no meio de uma sessão" deixar essa
+/// sessão terminar normalmente em vez de expulsar todo mundo na hora.
+#[tauri::command]
+async fn disarm_wake_on_demand(app: tauri::AppHandle) -> Result<(), String> {
+    let (old_cfg, is_hosting_now) = {
+        let state = app.state::<AppState>();
+        state.wake_loop_generation.fetch_add(1, Ordering::SeqCst); // invalida qualquer loop de espera rodando
+        let old = state.wake_on_demand.lock().unwrap().take();
+        let hosting = state.active_network_mode.lock().unwrap().is_some();
+        (old, hosting)
+    };
+
+    // Só manda a heartbeat final "offline" se ainda estava na fase de espera —
+    // se já tinha acordado e está hospedando de verdade, as transições normais
+    // de status do MC (report_mc_status) já cobrem isso.
+    if let Some(cfg) = old_cfg {
+        if !is_hosting_now {
+            if let Err(e) = send_sleep_heartbeat(&cfg.short_code, "offline").await {
+                log_to_file(&app, &format!("[WakeOnDemand] Heartbeat final de desarme falhou: {}", e));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Chamado pelo botão "Manter ligado" do aviso de desligamento por
+/// inatividade — zera o contador no próximo tick do loop de heartbeat
+/// "online" (ver mais abaixo).
+#[tauri::command]
+fn cancel_idle_shutdown(app: tauri::AppHandle) {
+    app.state::<AppState>().idle_shutdown_reset_requested.store(true, Ordering::SeqCst);
 }
 
 // As antigas sync_create_session/sync_update_session/sync_delete_session/
@@ -4334,9 +5334,17 @@ pub fn run() {
   });
   
   let telemetry = Arc::new(Mutex::new(SyncTelemetry::default()));
-  
+
+  // Compartilhados entre AppState (escrito por sync_register_server, em
+  // processo) e a thread do servidor HTTP do registro (lida via mesh, por um
+  // convidado) — identificam qual servidor local este host está servindo
+  // agora. Criados aqui, antes do AppState, porque a thread HTTP é iniciada
+  // antes do app Tauri existir (não há AppHandle disponível ainda).
+  let active_short_code: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+  let active_server_dir: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
   // Iniciar servidor HTTP de registro em background
-  start_registry_http_server(registry.clone());
+  start_registry_http_server(registry.clone(), active_short_code.clone(), active_server_dir.clone());
   
   // Iniciar motor de sincronização periódico (a cada 30 segundos)
   let telemetry_clone = telemetry.clone();
@@ -4471,7 +5479,11 @@ pub fn run() {
 
       Ok(())
     })
-    .manage(AppState::default())
+    .manage(AppState {
+        active_short_code: active_short_code.clone(),
+        active_server_dir: active_server_dir.clone(),
+        ..Default::default()
+    })
     .manage(registry)
     .manage(telemetry)
     .invoke_handler(tauri::generate_handler![
@@ -4482,6 +5494,8 @@ pub fn run() {
        prepare_launcher_profile,
        open_minecraft_launcher,
        download_server_jar,
+       download_mod_file,
+       compute_file_sha1,
        start_minecraft_server,
        run_forge_installer,
        run_fabric_client_installer,
@@ -4529,6 +5543,10 @@ pub fn run() {
        sync_register_server,
        sync_update_server,
        sync_delete_server,
+       regenerate_server_code,
+       arm_wake_on_demand,
+       disarm_wake_on_demand,
+       cancel_idle_shutdown,
        get_sync_queue_status,
        force_sync_now,
        get_sync_telemetry,
