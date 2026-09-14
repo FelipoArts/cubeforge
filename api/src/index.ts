@@ -103,7 +103,10 @@ const REGEN_CODE_RATE_LIMIT = 5; // regenerar código: ação manual e rara, sem
 const SUB_CHECKOUT_RATE_LIMIT = 5;  // assinar: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
 const SUB_PORTAL_RATE_LIMIT = 10;   // gerenciar assinatura: pode ser reaberto ao focar o painel de configurações
 const WAKE_RATE_LIMIT = 10;         // por IP/min — mesmo raciocínio de JOIN_RATE_LIMIT
-const WAKE_COOLDOWN_SECONDS = 20;   // por shortCode, independente do IP — ver handleWakeServer
+// 60, não 20: é o TTL mínimo que o KV do Cloudflare aceita — um valor menor
+// falha com "Invalid expiration_ttl" (KV PUT 400), o que derrubava a rota
+// inteira com 500 antes de sequer chegar a gravar o pedido de despertar.
+const WAKE_COOLDOWN_SECONDS = 60;   // por shortCode, independente do IP — ver handleWakeServer
 
 function clientIp(req: Request): string {
   return req.headers.get('CF-Connecting-IP') || 'unknown';
