@@ -283,7 +283,16 @@ impl SessionManager {
             timing = state.timing.clone();
         }
 
-        // Notificar API
+        // Notificar API. Com retry curto: a ConnectionSession acabou de ser
+        // criada (POST /connection-sessions) segundos antes — se esse PATCH
+        // bater num edge do Cloudflare que ainda não replicou a escrita no KV
+        // (consistência eventual, não imediata), a API responde
+        // SESSION_NOT_FOUND mesmo a sessão existindo de verdade. Sem retry,
+        // isso deixava a sessão travada em DEGRADED pra sempre — nenhum
+        // heartbeat depois disso corrige o hostIp/status nunca reportados, e
+        // ela só some (expira) da API central, sem o convidado nunca ver
+        // "online" de verdade. Descoberto testando o wake-on-demand, mas o
+        // race já existia antes disso, em qualquer início de hospedagem.
         if let Some(sid) = session_id {
             let mut timing_map = HashMap::new();
             timing_map.insert("apiCallMs".into(), serde_json::json!(timing.api_call_ms));
@@ -291,14 +300,28 @@ impl SessionManager {
             timing_map.insert("providerWaitMs".into(), serde_json::json!(timing.provider_wait_ms));
             timing_map.insert("totalElapsedMs".into(), serde_json::json!(timing.total_elapsed_ms));
 
-            if let Err(e) = self.api.update_connection_session(
-                &sid, "online", Some(host_ip), revision,
-                None, Some(timing_map), None, None,
-            ).await {
-                // Se falhar ao notificar, entra em DEGRADED
+            const MAX_ATTEMPTS: u32 = 4;
+            let mut last_err = String::new();
+            let mut succeeded = false;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match self.api.update_connection_session(
+                    &sid, "online", Some(host_ip), revision,
+                    None, Some(timing_map.clone()), None, None,
+                ).await {
+                    Ok(_) => { succeeded = true; break; }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        if attempt < MAX_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                        }
+                    }
+                }
+            }
+            if !succeeded {
+                // Se falhar ao notificar mesmo após as tentativas, entra em DEGRADED
                 let mut state = self.state.lock().unwrap();
                 state.status = SessionStatus::Degraded;
-                return Err(format!("Sidecar online, mas API falhou: {}", e));
+                return Err(format!("Sidecar online, mas API falhou: {}", last_err));
             }
         }
 
