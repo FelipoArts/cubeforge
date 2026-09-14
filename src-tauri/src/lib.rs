@@ -343,6 +343,7 @@ async fn start_network_node(
     // ConnectionSession anterior, se houver)
     stop_network_node_internal(&app, &state).await?;
     *state.active_network_mode.lock().unwrap() = Some(mode.clone());
+    log_to_file(&app, "[start_network_node] Nó anterior encerrado, preparando novo nó...");
 
     // 2. Opt-in de desenvolvimento: se existir um `network_session.json` local
     // com "provider":"mock", usa o provedor simulado direto, sem tocar na API
@@ -395,11 +396,13 @@ async fn start_network_node(
 
     // 3. Caminho real: a API central decide o provedor e minta uma credencial
     // de curta duração específica desta sessão (ver session_manager.rs).
+    log_to_file(&app, "[start_network_node] Sem mock — preparando ApiClient/SessionManager...");
     let installation_id = get_or_create_installation_id(&app);
     let api = Arc::new(ApiClient::new(ApiConfig { installation_id, ..Default::default() }));
     let session_manager = Arc::new(SessionManager::new(api));
     *state.active_session_manager.lock().unwrap() = Some(session_manager.clone());
 
+    log_to_file(&app, "[start_network_node] Solicitando ConnectionSession à API central...");
     let session_resp = session_manager.start(&short_code, &mode, local_port).await.map_err(|e| {
         let err_msg = format!("Não foi possível obter credenciais de rede: {}", e);
         log_to_file(&app, &err_msg);
@@ -5053,7 +5056,20 @@ fn spawn_sleeping_loop(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>, gene
                 Ok(data) => {
                     if data.get("wakeRequested").and_then(|v| v.as_bool()) == Some(true) {
                         log_to_file(&app, &format!("[WakeOnDemand] Pedido de despertar recebido para {}.", cfg.short_code));
-                        wake_from_sleep(app.clone(), cfg.clone()).await;
+                        // Roda em uma task própria (com JoinHandle) em vez de só
+                        // `.await` direto: se `wake_from_sleep` (ou qualquer coisa
+                        // que ela chama, incluindo start_network_node/
+                        // start_minecraft_server) der panic — ex.: um
+                        // `.lock().unwrap()` em mutex poisoned — o panic dentro de
+                        // uma task solta comum vai para o stderr, que builds de
+                        // release sem console nenhum simplesmente descartam:
+                        // pareceria com esta task "travando" pra sempre, sem
+                        // log nenhum, exatamente o sintoma reportado em produção
+                        // (só um F5 no app, que roda tudo num contexto novo,
+                        // "destravava"). Assim, pelo menos o panic fica registrado.
+                        if let Err(join_err) = tauri::async_runtime::spawn(wake_from_sleep(app.clone(), cfg.clone())).await {
+                            log_to_file(&app, &format!("[WakeOnDemand] wake_from_sleep PANICOU: {:?}", join_err));
+                        }
                         return; // dali em diante quem cuida é o loop de heartbeat "online" já existente
                     }
                 }

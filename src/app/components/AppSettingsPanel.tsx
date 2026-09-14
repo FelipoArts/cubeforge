@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Settings, X, Archive, Palette, User as UserIcon, Sparkles } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { join } from "@tauri-apps/api/path";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
@@ -49,6 +50,11 @@ interface AppSettingsPanelProps {
 
 export function AppSettingsPanel({ isOpen, onClose }: AppSettingsPanelProps) {
   const [category, setCategory] = useState<SettingsCategory>("backups");
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
+  }, []);
 
   const autoBackupEnabled = useAppStore((s) => s.autoBackupEnabled);
   const setAutoBackupEnabled = useAppStore((s) => s.setAutoBackupEnabled);
@@ -287,23 +293,28 @@ export function AppSettingsPanel({ isOpen, onClose }: AppSettingsPanelProps) {
             </div>
 
             <div className="flex flex-1 min-h-0">
-              <nav className="w-44 flex-shrink-0 border-r border-theme-card p-3 space-y-1">
-                {CATEGORIES.map(({ id, label, icon: Icon }) => (
-                  <button
-                    key={id}
-                    type="button"
-                    onClick={() => setCategory(id)}
-                    className={cn(
-                      "w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-colors cursor-pointer",
-                      category === id
-                        ? "bg-indigo-600 text-white shadow-sm"
-                        : "text-theme-secondary hover:text-theme-primary hover:bg-theme-muted"
-                    )}
-                  >
-                    <Icon className="w-4 h-4" />
-                    {label}
-                  </button>
-                ))}
+              <nav className="w-44 flex-shrink-0 border-r border-theme-card p-3 flex flex-col justify-between">
+                <div className="space-y-1">
+                  {CATEGORIES.map(({ id, label, icon: Icon }) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => setCategory(id)}
+                      className={cn(
+                        "w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-colors cursor-pointer",
+                        category === id
+                          ? "bg-indigo-600 text-white shadow-sm"
+                          : "text-theme-secondary hover:text-theme-primary hover:bg-theme-muted"
+                      )}
+                    >
+                      <Icon className="w-4 h-4" />
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {appVersion && (
+                  <p className="text-[10px] text-theme-secondary text-center px-2">Cubicase v{appVersion}</p>
+                )}
               </nav>
 
               <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
