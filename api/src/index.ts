@@ -98,7 +98,6 @@ const SHORT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 // automatizado, não dar uma garantia forte contra um atacante distribuído
 // (isso já é papel de uma regra de rate-limit no dashboard da Cloudflare).
 const RATE_LIMIT_WINDOW_SECONDS = 60;
-const DISCOVER_RATE_LIMIT = 60;  // status/descoberta: guest legítimo faz polling frequente enquanto aguarda o servidor subir
 const JOIN_RATE_LIMIT = 10;      // connection-sessions: minta uma authKey Tailscale de verdade, mais sensível
 const REGEN_CODE_RATE_LIMIT = 5; // regenerar código: ação manual e rara, sem motivo legítimo pra repetir muitas vezes por minuto
 const SUB_CHECKOUT_RATE_LIMIT = 5;  // assinar: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
@@ -1051,19 +1050,25 @@ export default {
       if (m === 'POST' && p === '/api/v1/servers') return await handleCreateServer(req, env, cors);
 
       // GET /api/v1/servers/{sc}
+      // Sem checkRateLimit aqui de propósito: essa é a rota mais chamada de
+      // longe (cada convidado consulta a cada 30s por servidor conhecido, e
+      // o wake-on-demand faz polling rápido enquanto acorda) — checkRateLimit
+      // escreve no KV a cada chamada, e o KV do Cloudflare tem cota diária de
+      // escrita baixa (já estourou por causa disso, ver incidente de
+      // 2026-09-14). Proteção contra brute-force de shortCode aqui deve vir
+      // de uma regra de rate-limit no dashboard da Cloudflare (nível de
+      // borda, sem custo de escrita no Workers KV) em vez de KV.
       const m3 = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)$/);
       if (m === 'GET' && m3) {
-        if (!(await checkRateLimit(env, 'discover', clientIp(req), DISCOVER_RATE_LIMIT))) return rateLimitedResponse(cors);
         return await handleDiscoverServer(m3[1].toUpperCase(), env, cors);
       }
 
       // DELETE /api/v1/servers/{sc}
       if (m === 'DELETE' && m3) return await handleDeleteServer(m3[1].toUpperCase(), env, cors);
 
-      // LEGADO: GET /api/servers/{sc}
+      // LEGADO: GET /api/servers/{sc} — mesmo raciocínio acima, sem checkRateLimit.
       const m4 = p.match(/^\/api\/servers\/([A-Za-z0-9]+)$/);
       if (m === 'GET' && m4) {
-        if (!(await checkRateLimit(env, 'discover', clientIp(req), DISCOVER_RATE_LIMIT))) return rateLimitedResponse(cors);
         return await handleLegacyDiscover(m4[1].toUpperCase(), env, cors);
       }
       if (m === 'DELETE' && m4) return await handleDeleteServer(m4[1].toUpperCase(), env, cors);

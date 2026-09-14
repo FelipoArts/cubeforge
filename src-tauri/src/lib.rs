@@ -5033,6 +5033,16 @@ async fn wake_from_sleep(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>) {
 /// começou depois deste) — o jeito já usado neste arquivo (ver
 /// `minecraft_stop_requested`/`network_stop_requested`) de sinalizar "pare"
 /// pra uma task sem guardar um JoinHandle em lugar nenhum.
+// 20s (não 6s, como na primeira versão): cada tick é uma escrita no KV do
+// Worker (ver handleHeartbeat), e o KV do Cloudflare é feito pra pouca
+// escrita — um intervalo curto demais, multiplicado por vários servidores
+// armados o dia todo, estoura a cota diária de escrita da conta inteira
+// (já aconteceu: ver incidente de 2026-09-14, API inteira fora do ar por
+// KV put() limit exceeded). 20s ainda é rápido o bastante pra não atrasar
+// perceptivelmente o "acordar" (o boot do Java/malha já leva bem mais que
+// isso), mas reduz a escrita em ~3x.
+const SLEEPING_HEARTBEAT_INTERVAL_SECS: u64 = 20;
+
 fn spawn_sleeping_loop(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>, generation: u64) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -5051,7 +5061,7 @@ fn spawn_sleeping_loop(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>, gene
                     log_to_file(&app, &format!("[WakeOnDemand] Heartbeat de espera falhou: {}", e));
                 }
             }
-            tokio::time::sleep(Duration::from_secs(6)).await;
+            tokio::time::sleep(Duration::from_secs(SLEEPING_HEARTBEAT_INTERVAL_SECS)).await;
         }
     });
 }
