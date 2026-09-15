@@ -5006,28 +5006,64 @@ async fn wake_from_sleep(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>) {
         log_to_file(&app, &format!("[WakeOnDemand] Falha ao registrar servidor ao acordar: {}", e));
     }
 
-    let net_fut = start_network_node(
-        app.clone(),
-        app.state::<AppState>(),
-        "host".to_string(),
-        cfg.short_code.clone(),
-        None,
-        cfg.local_port,
-    );
-    let mc_fut = start_minecraft_server(
-        app.clone(),
-        app.state::<AppState>(),
-        cfg.server_dir.clone(),
-        cfg.java_path.clone(),
-        cfg.ram_gb,
-        cfg.local_port,
-        cfg.server_jar_name.clone(),
-        cfg.launch_args_dir.clone(),
-    );
+    // `spawn` (não só criar a future): ela é lazy, então sem rodar numa task
+    // própria agora, só começaria a executar quando alguém desse `.await`
+    // nela — o que só aconteceria depois de todo o retry de rede abaixo,
+    // atrasando o Minecraft à toa em vez de subir os dois de verdade em
+    // paralelo. `app`/`cfg` são movidos pra dentro do bloco (em vez de só
+    // `app.state::<AppState>()` direto no spawn) porque `State<'_, AppState>`
+    // pega emprestado de `app` — precisa de um `app` com dono dentro da
+    // própria task pra satisfazer o `'static` exigido por `spawn`.
+    let app_for_mc = app.clone();
+    let cfg_for_mc = cfg.clone();
+    let mc_handle = tauri::async_runtime::spawn(async move {
+        start_minecraft_server(
+            app_for_mc.clone(),
+            app_for_mc.state::<AppState>(),
+            cfg_for_mc.server_dir.clone(),
+            cfg_for_mc.java_path.clone(),
+            cfg_for_mc.ram_gb,
+            cfg_for_mc.local_port,
+            cfg_for_mc.server_jar_name.clone(),
+            cfg_for_mc.launch_args_dir.clone(),
+        ).await
+    });
 
-    let (net_res, mc_res) = tokio::join!(net_fut, mc_fut);
-    if let Err(e) = net_res { log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar rede: {}", e)); }
-    if let Err(e) = mc_res { log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar servidor: {}", e)); }
+    // Rede: um teste real mostrou session_manager.start() (dentro de
+    // start_network_node) travando por minutos sem nunca completar nem
+    // falhar — nenhum erro, nenhum timeout interno disparando, só um
+    // comando novo vindo do frontend (ex.: reabrir a UI) "destravando" e
+    // fazendo a MESMA chamada funcionar em segundos logo em seguida. Sem
+    // conseguir confirmar a causa exata remotamente, a defesa possível é:
+    // nunca deixar essa chamada travar pra sempre, e reaproveitar o padrão
+    // observado (tentar de novo já resolve) em vez de depender de alguém
+    // notar e mexer na interface manualmente.
+    const NETWORK_TIMEOUT: Duration = Duration::from_secs(45);
+    const NETWORK_MAX_ATTEMPTS: u32 = 3;
+    let mut net_res: Result<(), String> = Err("Nunca tentado".to_string());
+    for attempt in 1..=NETWORK_MAX_ATTEMPTS {
+        net_res = match tokio::time::timeout(
+            NETWORK_TIMEOUT,
+            start_network_node(app.clone(), app.state::<AppState>(), "host".to_string(), cfg.short_code.clone(), None, cfg.local_port),
+        ).await {
+            Ok(inner_result) => inner_result,
+            Err(_) => Err(format!("Timeout de {}s esperando a rede (tentativa {}/{})", NETWORK_TIMEOUT.as_secs(), attempt, NETWORK_MAX_ATTEMPTS)),
+        };
+        if net_res.is_ok() { break; }
+        log_to_file(&app, &format!("[WakeOnDemand] Tentativa {}/{} de iniciar a rede falhou: {:?}", attempt, NETWORK_MAX_ATTEMPTS, net_res));
+        if attempt < NETWORK_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    match mc_handle.await {
+        Ok(Err(e)) => log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar servidor: {}", e)),
+        Err(join_err) => log_to_file(&app, &format!("[WakeOnDemand] start_minecraft_server PANICOU: {:?}", join_err)),
+        Ok(Ok(())) => {}
+    }
+    if let Err(e) = net_res {
+        log_to_file(&app, &format!("[WakeOnDemand] Falha ao iniciar rede após {} tentativas: {}", NETWORK_MAX_ATTEMPTS, e));
+    }
 }
 
 /// Task solta que manda a heartbeat de espera em loop até: (a) receber
