@@ -25,6 +25,7 @@ import { fetch } from "@tauri-apps/plugin-http";
 import { join } from "@tauri-apps/api/path";
 import { useAppStore, type KnownServer, type ServerStatus } from "@/app/store";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { pushDiagnostic } from "@/app/diagnostics";
 import {
   installFabricClient,
   installForgeClient,
@@ -72,6 +73,8 @@ export function GuestView({
     localServers,
     guestConnectedShortCode: connectedShortCode,
     setGuestConnectedShortCode: setConnectedShortCode,
+    pendingJoinShortCode,
+    setPendingJoinShortCode,
   } = useAppStore();
 
   const [showAddModal, setShowAddModal] = useState(false);
@@ -82,7 +85,7 @@ export function GuestView({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastRefreshTime, setLastRefreshTime] = useState<Date | null>(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
   // Wake-on-demand: shortCode do servidor que estamos tentando acordar agora
   // (null = nenhum) + erro por shortCode, pra não confundir cards diferentes.
   const [wakingShortCode, setWakingShortCode] = useState<string | null>(null);
@@ -476,36 +479,22 @@ export function GuestView({
     }
   };
 
-  const handleAddServer = async () => {
-    const code = inviteCodeInput.replace("CF-", "").trim();
-    if (!code) {
-      setAddError("Insira um código de convite.");
-      return;
-    }
+  type AddServerResult =
+    | { ok: true; server: KnownServer }
+    | { ok: false; reason: "not_found" | "network_error" };
 
-    // Verificar se já existe
-    if (knownServers.find(s => s.shortCode === code)) {
-      setAddError("Este servidor já está na sua biblioteca.");
-      return;
-    }
-
-    setIsAdding(true);
-    setAddError(null);
-
+  /** Consulta a API Central por um shortCode e adiciona à biblioteca — usado tanto pelo formulário manual quanto pelo link de convite (deep link, ver efeito abaixo). Não checa duplicidade (quem chama já decide o que fazer se já existir). */
+  const addServerByCode = async (code: string): Promise<AddServerResult> => {
     try {
       const response = await fetch(`${API_BASE}/api/v1/servers/${code}`);
-      if (!response.ok) {
-        setAddError("Servidor não encontrado. Verifique o código e tente novamente.");
-        setIsAdding(false);
-        return;
-      }
+      if (!response.ok) return { ok: false, reason: "not_found" };
 
       // Envelope da API Central: metadados em data.server, status/jogadores em data.session.
       const envelope = await response.json();
       const server = envelope?.data?.server ?? {};
       const session = envelope?.data?.session ?? {};
       const networkStatus = session.networkStatus ?? session.status ?? "offline";
-      addKnownServer({
+      const known: KnownServer = {
         shortCode: server.shortCode,
         name: server.name,
         version: server.version,
@@ -524,15 +513,54 @@ export function GuestView({
         networkProvider: session.provider || "tailscale",
         forgeVersion: server.forgeVersion ?? null,
         modLoaderVersion: server.modLoaderVersion ?? null,
-      });
-
-      setShowAddModal(false);
-      setInviteCodeInput("");
+      };
+      addKnownServer(known);
+      return { ok: true, server: known };
     } catch {
-      setAddError("Não foi possível conectar à API Central. Verifique sua conexão com a internet.");
-    } finally {
-      setIsAdding(false);
+      return { ok: false, reason: "network_error" };
     }
+  };
+
+  const handleAddServer = async () => {
+    const code = inviteCodeInput.replace("CF-", "").trim().toUpperCase();
+    if (!code) {
+      setAddError("Insira um código de convite.");
+      return;
+    }
+
+    // Verificar se já existe
+    if (knownServers.find(s => s.shortCode === code)) {
+      setAddError("Este servidor já está na sua biblioteca.");
+      return;
+    }
+
+    setIsAdding(true);
+    setAddError(null);
+
+    const result = await addServerByCode(code);
+    setIsAdding(false);
+    if (!result.ok) {
+      setAddError(
+        result.reason === "not_found"
+          ? "Servidor não encontrado. Verifique o código e tente novamente."
+          : "Não foi possível conectar à API Central. Verifique sua conexão com a internet."
+      );
+      return;
+    }
+
+    setShowAddModal(false);
+    setInviteCodeInput("");
+  };
+
+  // Um servidor é considerado "obsoleto" se a última confirmação da API Central
+  // foi há mais tempo do que alguns ciclos de polling (30s cada). Sem isso, um
+  // status cacheado (ex: "online") continuaria sendo exibido como verdade mesmo
+  // que a API esteja fora do ar ou as requisições estejam falhando repetidamente —
+  // o que passaria informação falsa para o convidado.
+  const STALE_THRESHOLD_MS = 100_000; // ~3 ciclos de 30s
+  const isServerStale = (server: KnownServer, nowMs: number): boolean => {
+    if (!server.lastConfirmedAt) return true;
+    return nowMs - new Date(server.lastConfirmedAt).getTime() > STALE_THRESHOLD_MS;
   };
 
   const handleConnect = (server: KnownServer) => {
@@ -540,6 +568,46 @@ export function GuestView({
     setConnectedShortCode(server.shortCode);
     onConnect(`CF-${server.shortCode}`);
   };
+
+  // Convite recebido via link bonito (play.cubicase.net/<slug> -> deep link
+  // cubicase://join/<shortCode>, ver src/lib/joinDeepLink.ts). Reusa o mesmo
+  // modal de "Adicionar servidor" pra aproveitar o loading/erro já existentes
+  // — só entra no fluxo automaticamente em vez de esperar o usuário digitar.
+  // Se o servidor já estiver na biblioteca e online, conecta direto.
+  useEffect(() => {
+    if (!pendingJoinShortCode) return;
+    const code = pendingJoinShortCode;
+
+    void (async () => {
+      setPendingJoinShortCode(null);
+
+      const existing = knownServers.find(s => s.shortCode === code);
+      if (existing) {
+        handleConnect(existing);
+        return;
+      }
+
+      setInviteCodeInput(code);
+      setShowAddModal(true);
+      setIsAdding(true);
+      setAddError(null);
+      const result = await addServerByCode(code);
+      setIsAdding(false);
+      if (!result.ok) {
+        const message = result.reason === "not_found"
+          ? "Convite inválido ou expirado. Verifique o link e tente novamente."
+          : "Não foi possível conectar à API Central. Verifique sua conexão com a internet.";
+        setAddError(message);
+        pushDiagnostic({ level: "warning", source: "Convite", title: "Não foi possível entrar pelo convite", message, detail: `CF-${code}` });
+        return;
+      }
+      setShowAddModal(false);
+      setInviteCodeInput("");
+      pushDiagnostic({ level: "info", source: "Convite", title: "Servidor adicionado", message: `"${result.server.name}" foi adicionado à sua biblioteca pelo link de convite.` });
+      handleConnect(result.server);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingJoinShortCode]);
 
   const handleDisconnect = () => {
     setConnectedShortCode(null);
@@ -553,10 +621,14 @@ export function GuestView({
     removeKnownServer(shortCode);
   };
 
+  // Guarda o TEXTO copiado (não um booleano solto) pra só o botão que copiou
+  // aquele conteúdo específico mostrar o ícone de check — com um booleano
+  // único, copiar o código de um servidor "marcava" o botão de copiar de
+  // TODOS os outros servidores da lista, mesmo copiando códigos diferentes.
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopied(text);
+    setTimeout(() => setCopied((current) => (current === text ? null : current)), 2000);
   };
 
   const formatLastSeen = (iso: string | null, nowMs: number): string => {
@@ -583,16 +655,6 @@ export function GuestView({
     return `${hours}h${minutes.toString().padStart(2, "0")}min`;
   };
 
-  // Um servidor é considerado "obsoleto" se a última confirmação da API Central
-  // foi há mais tempo do que alguns ciclos de polling (30s cada). Sem isso, um
-  // status cacheado (ex: "online") continuaria sendo exibido como verdade mesmo
-  // que a API esteja fora do ar ou as requisições estejam falhando repetidamente —
-  // o que passaria informação falsa para o convidado.
-  const STALE_THRESHOLD_MS = 100_000; // ~3 ciclos de 30s
-  const isServerStale = (server: KnownServer, nowMs: number): boolean => {
-    if (!server.lastConfirmedAt) return true;
-    return nowMs - new Date(server.lastConfirmedAt).getTime() > STALE_THRESHOLD_MS;
-  };
 
   // Rede mesh (status) e Minecraft (minecraftStatus) são reportados de forma
   // independente pela API Central — um host pode ligar só um dos dois (ex: rodar
@@ -856,8 +918,8 @@ export function GuestView({
                       onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
                       className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer"
                     >
-                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                      {copied ? "Copiado!" : "Copiar endereço"}
+                      {copied === `localhost:${minecraftPort}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied === `localhost:${minecraftPort}` ? "Copiado!" : "Copiar endereço"}
                     </button>
                   </div>
                 ) : (
@@ -875,7 +937,7 @@ export function GuestView({
                       className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
                       title="Copiar endereço de conexão"
                     >
-                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied === `localhost:${minecraftPort}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
                 )}
@@ -990,7 +1052,7 @@ export function GuestView({
                   className="p-2.5 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer"
                   title="Copiar código do servidor"
                 >
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copied === `CF-${server.shortCode}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 </button>
 
                 {/* Botão remover */}

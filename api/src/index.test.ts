@@ -197,3 +197,47 @@ describe("rate limiting", () => {
     expect(sawRateLimited).toBe(true);
   });
 });
+
+describe("link de convite personalizado (slug)", () => {
+  it("definir sem autenticação dá 401", async () => {
+    const { shortCode } = await createTestServer();
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/${shortCode}/slug`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "meu-mundo" }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).success).toBe(false);
+  });
+
+  it("remover sem autenticação também dá 401", async () => {
+    const { shortCode } = await createTestServer();
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/${shortCode}/slug`, { method: "DELETE" });
+    expect(res.status).toBe(401);
+  });
+
+  it("definir num shortCode inexistente dá 401 (autenticação é checada antes de existir o servidor)", async () => {
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/ZZZZZZ/slug`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "meu-mundo" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("resolver um slug inexistente (GET by-slug, usado pela página estática) dá 404", async () => {
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/by-slug/slug-que-nao-existe`);
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.code).toBe("NOT_FOUND");
+  });
+
+  it("todo servidor já resolve de graça pelo próprio shortCode em minúsculas, sem precisar assinar nada", async () => {
+    const { shortCode } = await createTestServer("MundoGratis");
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/by-slug/${shortCode.toLowerCase()}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.shortCode).toBe(shortCode);
+    expect(body.data.name).toBe("MundoGratis");
+  });
+});

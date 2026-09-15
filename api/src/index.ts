@@ -49,7 +49,7 @@ type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed' |
 type SessionStatus = 'creating' | 'starting_provider' | 'waiting_provider' | 'online' | 'degraded' | 'stopping' | 'stopped' | 'failed' | 'cancelled';
 type TerminationReason = 'user_stopped' | 'application_closed' | 'provider_error' | 'api_error' | 'crash' | 'timeout' | 'lease_expired';
 
-interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; forgeVersion?: string | null; modLoaderVersion?: string | null; }
+interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; forgeVersion?: string | null; modLoaderVersion?: string | null; slug?: string | null; }
 
 interface SessionEntity { shortCode: string; provider: string; hostIp: string; port: number; status: ServerStatus; currentPlayers: number; maxPlayers: number; lastHeartbeat: string; createdAt: string; expiresAt: string; }
 
@@ -79,9 +79,29 @@ const ResponseCodes = {
   BAD_REQUEST: 'BAD_REQUEST', NOT_FOUND: 'NOT_FOUND', SERVER_NOT_FOUND: 'SERVER_NOT_FOUND', SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   CONFLICT: 'CONFLICT', INTERNAL_ERROR: 'INTERNAL_ERROR', VALIDATION_ERROR: 'VALIDATION_ERROR',
   STALE_WRITE: 'STALE_WRITE', OPERATION_IN_PROGRESS: 'OPERATION_IN_PROGRESS', RATE_LIMITED: 'RATE_LIMITED',
+  SUBSCRIPTION_REQUIRED: 'SUBSCRIPTION_REQUIRED',
 } as const;
 
 const SHORT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// ============================================================
+// LINK DE CONVITE PERSONALIZADO (slug) — Cubicase Plus
+// ============================================================
+// "play.cubicase.net/<slug>" no lugar do código CF-XXXXXX cru. O slug é só
+// um alias público pro shortCode (que continua sendo a credencial real —
+// mesmo modelo de confiança do resto da API, ver comentário do rate
+// limiting acima): guardado em `slug:<slug>` -> shortCode, pra resolução
+// rápida sem varrer todo o registro.
+const SLUG_REGEX = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/; // 3-32 chars, minúsculas/números/hífen, sem hífen nas pontas
+const RESERVED_SLUGS = new Set([
+  'api', 'app', 'www', 'play', 'download', 'downloads', 'admin', 'assets',
+  'entrar', 'login', 'logout', 'obrigado', 'assinatura', 'health', 'join',
+  'servers', 'server', 'about', 'sobre', 'termos', 'privacidade', 'null', 'undefined',
+]);
+
+function isValidSlug(slug: unknown): slug is string {
+  return typeof slug === 'string' && SLUG_REGEX.test(slug) && !RESERVED_SLUGS.has(slug);
+}
 
 // ============================================================
 // RATE LIMITING — proteção básica contra brute-force de shortCode
@@ -107,6 +127,8 @@ const WAKE_RATE_LIMIT = 10;         // por IP/min — mesmo raciocínio de JOIN_
 // falha com "Invalid expiration_ttl" (KV PUT 400), o que derrubava a rota
 // inteira com 500 antes de sequer chegar a gravar o pedido de despertar.
 const WAKE_COOLDOWN_SECONDS = 60;   // por shortCode, independente do IP — ver handleWakeServer
+const SLUG_RATE_LIMIT = 5;          // definir/trocar link de convite: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
+const SLUG_RESOLVE_RATE_LIMIT = 20; // resolver slug->shortCode: chamado pela página de convite (uma vez por visita) — folgado o bastante pra não incomodar visitas legítimas, apertado o bastante pra desanimar varredura de slugs
 
 function clientIp(req: Request): string {
   return req.headers.get('CF-Connecting-IP') || 'unknown';
@@ -361,7 +383,12 @@ async function terminateActiveSessionsForShortCode(env: Env, shortCode: string):
 
 async function handleDeleteServer(shortCode: string, env: Env, cors: Record<string, string>): Promise<Response> {
   const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
-  if (sj) { const sv: ServerEntity = JSON.parse(sj); await env.CUBEFORGE_REGISTRY.delete(`server:${shortCode}`); await env.CUBEFORGE_REGISTRY.delete(`shortCode:${sv.uuid}`); }
+  if (sj) {
+    const sv: ServerEntity = JSON.parse(sj);
+    await env.CUBEFORGE_REGISTRY.delete(`server:${shortCode}`);
+    await env.CUBEFORGE_REGISTRY.delete(`shortCode:${sv.uuid}`);
+    if (sv.slug) await env.CUBEFORGE_REGISTRY.delete(`slug:${sv.slug}`);
+  }
   await terminateActiveSessionsForShortCode(env, shortCode);
   await env.CUBEFORGE_REGISTRY.delete(`session:${shortCode}`);
   return json(ok(ResponseCodes.SERVER_DELETED, 'Servidor removido.'), 200, cors);
@@ -393,6 +420,10 @@ async function handleRegenerateCode(oldShortCode: string, env: Env, cfg: { short
   await env.CUBEFORGE_REGISTRY.put(`server:${newShortCode}`, JSON.stringify(updated));
   await env.CUBEFORGE_REGISTRY.put(`shortCode:${sv.uuid}`, newShortCode);
   await env.CUBEFORGE_REGISTRY.delete(`server:${oldShortCode}`);
+  // O link de convite personalizado (se houver) sobrevive à troca de código —
+  // reapontar a reverse-lookup pro shortCode novo, senão o link ficava
+  // resolvendo pro código antigo (que acabou de deixar de existir).
+  if (sv.slug) await env.CUBEFORGE_REGISTRY.put(`slug:${sv.slug}`, newShortCode);
 
   // Sessão legada de heartbeat (ver handleHeartbeat) e qualquer ConnectionSession
   // ativa ficam órfãs/inválidas presas ao código antigo — melhor derrubar tudo
@@ -782,6 +813,23 @@ async function supabaseRestGetCustomerId(env: Env, userId: string): Promise<stri
   }
 }
 
+/** true se o usuário tem Cubicase Plus ativo agora — mesmos status aceitos de isSubscriptionActive no app (src/lib/subscription.ts). */
+async function userHasActiveSubscription(env: Env, userId: string): Promise<boolean> {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return false;
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${encodeURIComponent(userId)}&select=status`,
+      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+    );
+    if (!resp.ok) return false;
+    const rows: any = await resp.json().catch(() => []);
+    const status = rows?.[0]?.status;
+    return status === 'active' || status === 'trialing';
+  } catch {
+    return false;
+  }
+}
+
 /** Upsert (por user_id) da linha de assinatura — chamado a partir do webhook, nunca do fluxo síncrono de checkout. */
 async function supabaseRestUpsertSubscription(env: Env, row: {
   user_id: string;
@@ -1004,6 +1052,100 @@ async function handleStripeWebhook(req: Request, env: Env, cors: Record<string, 
 }
 
 // ============================================================
+// LINK DE CONVITE PERSONALIZADO (slug) — handlers
+// ============================================================
+
+const INVITE_LINK_DOMAIN = 'play.cubicase.net';
+
+/** PUT /api/v1/servers/{sc}/slug — define/troca o link de convite (login + Cubicase Plus). */
+async function handleSetServerSlug(shortCode: string, req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+  if (!(await userHasActiveSubscription(env, userId))) {
+    return json(fail(ResponseCodes.SUBSCRIPTION_REQUIRED, 'Assine o Cubicase Plus para usar um link de convite personalizado.'), 403, cors);
+  }
+
+  let body: any; try { body = await req.json(); } catch { return json(fail(ResponseCodes.BAD_REQUEST, 'JSON inválido.'), 400, cors); }
+  const slug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+  if (!isValidSlug(slug)) {
+    return json(fail(ResponseCodes.VALIDATION_ERROR, 'Link inválido — use 3 a 32 letras minúsculas, números ou hífen, sem hífen nas pontas.'), 400, cors);
+  }
+
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+  const sv: ServerEntity = JSON.parse(sj);
+
+  const existingOwner = await env.CUBEFORGE_REGISTRY.get(`slug:${slug}`);
+  if (existingOwner && existingOwner !== shortCode) {
+    return json(fail(ResponseCodes.CONFLICT, 'Esse link já está em uso. Escolha outro.'), 409, cors);
+  }
+  // Todo servidor já responde de graça em play.cubicase.net/<próprio shortCode
+  // em minúsculas> (ver handleResolveSlug) — sem isso, alguém poderia "roubar"
+  // esse link padrão de outro servidor definindo um slug customizado igual ao
+  // shortCode de outro (ex.: slug "a3f9k2" enquanto existe um servidor real
+  // com shortCode "A3F9K2"). Só bloqueia se for o shortCode de OUTRO servidor
+  // — definir de volta o próprio é redundante, mas inofensivo.
+  if (slug.toUpperCase() !== shortCode) {
+    const clashingServer = await env.CUBEFORGE_REGISTRY.get(`server:${slug.toUpperCase()}`);
+    if (clashingServer) return json(fail(ResponseCodes.CONFLICT, 'Esse link já está em uso. Escolha outro.'), 409, cors);
+  }
+
+  if (sv.slug && sv.slug !== slug) await env.CUBEFORGE_REGISTRY.delete(`slug:${sv.slug}`);
+  await env.CUBEFORGE_REGISTRY.put(`slug:${slug}`, shortCode);
+  const updated: ServerEntity = { ...sv, slug, updatedAt: new Date().toISOString() };
+  await env.CUBEFORGE_REGISTRY.put(`server:${shortCode}`, JSON.stringify(updated));
+
+  return json(ok(ResponseCodes.SERVER_UPDATED, 'Link de convite atualizado.', { slug, url: `https://${INVITE_LINK_DOMAIN}/${slug}` }), 200, cors);
+}
+
+/** DELETE /api/v1/servers/{sc}/slug — remove o link personalizado (só precisa de login, não exige assinatura ativa). */
+async function handleDeleteServerSlug(shortCode: string, req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+  const sv: ServerEntity = JSON.parse(sj);
+
+  if (sv.slug) {
+    await env.CUBEFORGE_REGISTRY.delete(`slug:${sv.slug}`);
+    const updated: ServerEntity = { ...sv, slug: null, updatedAt: new Date().toISOString() };
+    await env.CUBEFORGE_REGISTRY.put(`server:${shortCode}`, JSON.stringify(updated));
+  }
+  return json(ok(ResponseCodes.SERVER_UPDATED, 'Link de convite removido.'), 200, cors);
+}
+
+// A página de convite em si (play.cubicase.net/<slug>) NÃO mora neste Worker —
+// mora num site estático no GitHub Pages (mesmo esquema de docs/entrar/),
+// porque a zona DNS de cubicase.net está no HostGator (e-mail e outras coisas
+// dependem dela), não no Cloudflare — não dá pra usar "Custom Domain" do
+// Workers sem a zona estar aqui. Essa rota é só o que o JS daquela página
+// chama pra resolver slug -> shortCode antes de tentar o deep link
+// (cubicase://join/<shortCode>) — ver play-site/index.html no repo.
+
+/**
+ * GET /api/v1/servers/by-slug/{slug} — resolve um link de convite (público, sem auth).
+ *
+ * Todo servidor tem um link de graça: o próprio shortCode em minúsculas (ex.:
+ * shortCode "A3F9K2" -> play.cubicase.net/a3f9k2), sem precisar de nenhuma
+ * escrita extra no KV — só quem assina o Cubicase Plus grava um slug
+ * customizado de verdade (ver handleSetServerSlug), então a busca cai aqui
+ * primeiro e só tenta o shortCode cru como fallback.
+ */
+async function handleResolveSlug(slug: string, env: Env, cors: Record<string, string>): Promise<Response> {
+  let shortCode = await env.CUBEFORGE_REGISTRY.get(`slug:${slug}`);
+  if (!shortCode) {
+    const asShortCode = slug.toUpperCase();
+    if (await env.CUBEFORGE_REGISTRY.get(`server:${asShortCode}`)) shortCode = asShortCode;
+  }
+  if (!shortCode) return json(fail(ResponseCodes.NOT_FOUND, 'Link de convite não encontrado.'), 404, cors);
+
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  const name = sj ? (JSON.parse(sj) as ServerEntity).name : null;
+  return json(ok(ResponseCodes.SUCCESS, 'Link resolvido.', { shortCode, name }), 200, cors);
+}
+
+// ============================================================
 // MAIN ROUTER
 // ============================================================
 
@@ -1034,6 +1176,21 @@ export default {
       if (m === 'POST' && m1w) {
         if (!(await checkRateLimit(env, 'wake', clientIp(req), WAKE_RATE_LIMIT))) return rateLimitedResponse(cors);
         return await handleWakeServer(m1w[1].toUpperCase(), env, cors);
+      }
+
+      // PUT/DELETE /api/v1/servers/{sc}/slug — link de convite personalizado (Cubicase Plus)
+      const m1s = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/slug$/);
+      if (m === 'PUT' && m1s) {
+        if (!(await checkRateLimit(env, 'slug', clientIp(req), SLUG_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleSetServerSlug(m1s[1].toUpperCase(), req, env, cors);
+      }
+      if (m === 'DELETE' && m1s) return await handleDeleteServerSlug(m1s[1].toUpperCase(), req, env, cors);
+
+      // GET /api/v1/servers/by-slug/{slug} — resolve o link de convite (chamado pela página estática, ver play-site/index.html)
+      const mBySlug = p.match(/^\/api\/v1\/servers\/by-slug\/([a-z0-9-]{3,32})$/);
+      if (m === 'GET' && mBySlug) {
+        if (!(await checkRateLimit(env, 'slug-resolve', clientIp(req), SLUG_RESOLVE_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleResolveSlug(mBySlug[1], env, cors);
       }
 
       // PATCH/DELETE /api/v1/connection-sessions/{id}

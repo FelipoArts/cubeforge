@@ -5390,6 +5390,29 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
   app.exit(0);
 }
 
+/// Invocado pelo frontend quando o usuário escolhe "Fechar tudo" no modal
+/// exibido ao clicar no X da janela (ver on_window_event mais abaixo e o
+/// evento "close-requested"). Mesmo caminho de shutdown gracioso do "Sair"
+/// no menu do tray.
+#[tauri::command]
+async fn quit_app_fully(app: tauri::AppHandle) {
+  let already_shutting_down = {
+    let state_ref = app.state::<AppState>();
+    state_ref.is_shutting_down.swap(true, Ordering::SeqCst)
+  };
+  if !already_shutting_down {
+    graceful_shutdown_and_exit(app).await;
+  }
+}
+
+/// Invocado pelo frontend quando o usuário escolhe "Manter em segundo plano"
+/// no modal de fechamento: só esconde a janela para o tray, sem tocar no
+/// servidor Minecraft nem na rede mesh.
+#[tauri::command]
+fn hide_window_to_tray(window: tauri::WebviewWindow) {
+  let _ = window.hide();
+}
+
 pub fn run() {
   let registry = Arc::new(ServerRegistry {
       entries: Mutex::new(BTreeMap::new()),
@@ -5493,8 +5516,9 @@ pub fn run() {
       });
 
       // --- System tray ---
-      // Fechar a janela (X) esconde o app em vez de encerrá-lo (ver on_window_event);
-      // o tray é o que fica visível para o usuário voltar ao app ou realmente sair.
+      // Fechar a janela (X) pergunta ao usuário (via modal no frontend, ver
+      // on_window_event) se quer fechar tudo ou só minimizar; o tray é o que
+      // fica visível pra voltar ao app ou sair de vez quando ele minimiza.
       let tray_menu = MenuBuilder::new(app)
         .text("show", "Abrir Cubicase")
         .separator()
@@ -5612,16 +5636,18 @@ pub fn run() {
        get_sync_queue_status,
        force_sync_now,
        get_sync_telemetry,
+       quit_app_fully,
+       hide_window_to_tray,
     ])
     .on_window_event(|window, event| {
-      // Fechar a janela (X) não encerra mais o app: só esconde para o system tray.
-      // Servidor Minecraft e rede mesh continuam rodando em segundo plano — só param
-      // de verdade pelo "Sair" do menu do tray (ver setup() para o tray) ou se o
-      // processo for finalizado à força (o job_object garante que os filhos também
-      // morrem nesse caso, ver job_object.rs).
+      // Fechar a janela (X) não decide mais sozinho: a decisão (fechar tudo
+      // ou minimizar pro tray) fica com o usuário. Sempre prevenimos o close
+      // padrão e pedimos pro frontend mostrar um modal perguntando o que
+      // fazer; a escolha chega de volta via os comandos quit_app_fully /
+      // hide_window_to_tray acima (ver CloseAppModal no frontend).
       if let tauri::WindowEvent::CloseRequested { api, .. } = event {
         api.prevent_close();
-        let _ = window.hide();
+        let _ = window.emit("close-requested", ());
       }
     })
     .run(tauri::generate_context!())

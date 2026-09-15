@@ -71,3 +71,8 @@ next-env.d.ts
 
 # Planos de arquitetura (documentos internos)
 plans/
+
+# play-site/ é um projeto à parte (repo próprio, github.com/FelipoArts/cubicase-play,
+# publicado via GitHub Pages em play.cubicase.net) — mora aqui só de rascunho/staging,
+# nunca deve ser commitado neste repositório (tem seu próprio .git).
+play-site/

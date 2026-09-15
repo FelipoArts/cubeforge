@@ -21,6 +21,7 @@ import {
 } from "@/lib/server";
 import { useTheme } from "next-themes";
 import { AppSettingsPanel } from "@/app/components/AppSettingsPanel";
+import { CloseAppModal } from "@/app/components/CloseAppModal";
 import { DiagnosticsToasts, DiagnosticsBell } from "@/app/components/DiagnosticsCenter";
 import { pushDiagnostic } from "@/app/diagnostics";
 import { UpdateBanner } from "@/app/components/UpdateBanner";
@@ -90,7 +91,6 @@ export default function Home() {
   const [netMode, setNetMode] = useState<"host" | "guest" | null>(null);
   const [netIp, setNetIp] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
-  const [copied, setCopied] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   // O console do Minecraft (mcLogsByServer) vive no store (persistido por servidor);
@@ -160,6 +160,7 @@ export default function Home() {
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
+  const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [configServerDir, setConfigServerDir] = useState<string | null>(null);
   const [serverInstallProgress, setServerInstallProgress] = useState<ServerInstallProgress | null>(null);
@@ -683,6 +684,52 @@ export default function Home() {
     };
   }, []);
 
+  // Link de convite (cubicase://join/<shortCode>, ver play.cubicase.net/<slug>)
+  // — mesmo padrão do listener de login acima, ver src/lib/joinDeepLink.ts.
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      const { initJoinDeepLinkListener } = await import("@/lib/joinDeepLink");
+      const unlisten = await initJoinDeepLinkListener();
+      if (cancelled) unlisten();
+      else cleanup = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, []);
+
+  // Fechar a janela (X) não fecha o app direto: o Rust intercepta o close e
+  // emite "close-requested" pra perguntarmos ao usuário se quer fechar tudo
+  // ou só minimizar pro tray (ver on_window_event em src-tauri/src/lib.rs).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const fn = await listen("close-requested", () => {
+        setShowCloseConfirm(true);
+      });
+      if (cancelled) fn();
+      else unlisten = fn;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const handleQuitFully = async () => {
+    await invoke("quit_app_fully");
+  };
+
+  const handleMinimizeToTray = async () => {
+    await invoke("hide_window_to_tray");
+    setShowCloseConfirm(false);
+  };
+
   // --- Guest Handlers ---
   const handleGuestConnect = async (inviteCode: string) => {
     setLogs([]);
@@ -852,6 +899,12 @@ export default function Home() {
       </header>
 
       <AppSettingsPanel isOpen={showAppSettings} onClose={() => setShowAppSettings(false)} />
+      <CloseAppModal
+        isOpen={showCloseConfirm}
+        onClose={() => setShowCloseConfirm(false)}
+        onQuitFully={handleQuitFully}
+        onMinimizeToTray={handleMinimizeToTray}
+      />
 
       {/* Conteúdo Principal */}
       <main className="max-w-7xl mx-auto px-6 py-8">
@@ -874,7 +927,6 @@ export default function Home() {
             deleteConfirmServer={deleteConfirmServer}
             totalSystemRamGb={totalSystemRamGb}
             serverConfigPort={serverConfigPort}
-            copied={copied}
             shortCode={shortCode}
             resourceSample={resourceSample}
             onSetNetStatus={setNetStatus}
@@ -894,7 +946,6 @@ export default function Home() {
             onSetDeleteConfirmServer={setDeleteConfirmServer}
             onSetTotalSystemRamGb={setTotalSystemRamGb}
             onSetServerConfigPort={setServerConfigPort}
-            onSetCopied={setCopied}
             onSetShortCode={setShortCode}
             onRegisterServer={registerServerWithCentral}
           />

@@ -4,13 +4,26 @@ import { invoke } from '@tauri-apps/api/core';
 import { join } from '@tauri-apps/api/path';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Check, X, AlertTriangle, Image as ImageIcon } from 'lucide-react';
+import { Check, X, AlertTriangle, Image as ImageIcon, Link as LinkIcon, Copy } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLockBodyScroll } from '@/lib/useLockBodyScroll';
+import { useAppStore } from '@/app/store';
+import { getSubscriptionStatus, isSubscriptionActive } from '@/lib/subscription';
+import {
+  getServerSlug,
+  setServerSlug,
+  removeServerSlug,
+  isValidSlugFormat,
+  inviteLinkUrl,
+  defaultSlugFor,
+  SLUG_FORMAT_HINT,
+} from '@/lib/inviteLink';
 
 interface ServerConfigModalProps {
   /** Full filesystem path to the server directory */
   serverDir: string;
+  /** Código de convite (CF-XXXXXX) deste servidor — null se ele nunca chegou a ser registrado na API Central. */
+  shortCode: string | null;
   isOpen: boolean;
   onClose: () => void;
   onSaved: () => void; // refresh parent data after save
@@ -18,7 +31,7 @@ interface ServerConfigModalProps {
   serverStatus?: string;
 }
 
-export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverStatus }: ServerConfigModalProps) {
+export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSaved, serverStatus }: ServerConfigModalProps) {
   const [motd, setMotd] = useState('');
   const [gamemode, setGamemode] = useState('survival');
   const [difficulty, setDifficulty] = useState('easy');
@@ -47,6 +60,83 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
   const [iconDataUrl, setIconDataUrl] = useState<string | null>(null);
   const [iconSaving, setIconSaving] = useState(false);
   const [iconError, setIconError] = useState('');
+
+  // ------------------------------------------------------------
+  // Link de convite (play.cubicase.net/<slug>)
+  // ------------------------------------------------------------
+  // Todo servidor já tem um link de graça (o próprio shortCode em minúsculas,
+  // ver defaultSlugFor) — não exige login nem assinatura. Só quem tem o
+  // Cubicase Plus pode TROCAR isso por um slug escolhido (checado de verdade
+  // no Worker; `subscriptionActive` aqui só controla a UI, não é a fonte da
+  // verdade). Fica neste modal (não nas configurações gerais) porque é uma
+  // propriedade deste servidor, não da conta.
+  const user = useAppStore((s) => s.user);
+  const [subscriptionActive, setSubscriptionActive] = useState(false);
+  const [customSlug, setCustomSlug] = useState<string | null>(null);
+  const [slugLoading, setSlugLoading] = useState(false);
+  const [slugInput, setSlugInput] = useState('');
+  const [slugSubmitting, setSlugSubmitting] = useState(false);
+  const [slugError, setSlugError] = useState<string | null>(null);
+  const [slugCopied, setSlugCopied] = useState(false);
+
+  const defaultSlug = shortCode ? defaultSlugFor(shortCode) : null;
+
+  useEffect(() => {
+    if (!isOpen || !shortCode) return;
+    setSlugError(null);
+    setSlugLoading(true);
+    Promise.all([
+      user ? getSubscriptionStatus().catch(() => null) : Promise.resolve(null),
+      getServerSlug(shortCode).catch(() => null),
+    ]).then(([sub, slug]) => {
+      setSubscriptionActive(isSubscriptionActive(sub));
+      setCustomSlug(slug);
+      setSlugInput(slug ?? defaultSlugFor(shortCode));
+    }).finally(() => setSlugLoading(false));
+  }, [isOpen, shortCode, user]);
+
+  const handleSaveSlug = async () => {
+    if (!shortCode) return;
+    const slug = slugInput.trim().toLowerCase();
+    if (!isValidSlugFormat(slug)) {
+      setSlugError(`Link inválido — ${SLUG_FORMAT_HINT}`);
+      return;
+    }
+    setSlugSubmitting(true);
+    setSlugError(null);
+    try {
+      const saved = await setServerSlug(shortCode, slug);
+      setCustomSlug(saved);
+      setSlugInput(saved);
+    } catch (err: any) {
+      setSlugError(err?.message || 'Não foi possível salvar o link.');
+    } finally {
+      setSlugSubmitting(false);
+    }
+  };
+
+  const handleRemoveSlug = async () => {
+    if (!shortCode) return;
+    setSlugSubmitting(true);
+    setSlugError(null);
+    try {
+      await removeServerSlug(shortCode);
+      setCustomSlug(null);
+      setSlugInput(defaultSlugFor(shortCode));
+    } catch (err: any) {
+      setSlugError(err?.message || 'Não foi possível remover o link.');
+    } finally {
+      setSlugSubmitting(false);
+    }
+  };
+
+  const handleCopyInviteLink = () => {
+    const slug = customSlug ?? defaultSlug;
+    if (!slug) return;
+    navigator.clipboard.writeText(inviteLinkUrl(slug));
+    setSlugCopied(true);
+    setTimeout(() => setSlugCopied(false), 1500);
+  };
 
   useLockBodyScroll(isOpen);
 
@@ -271,6 +361,73 @@ export function ServerConfigModal({ serverDir, isOpen, onClose, onSaved, serverS
                   <div>
                     <span className="font-bold">Servidor em execução.</span> As configurações só podem ser alteradas com o servidor Minecraft parado. Pare o servidor antes de modificar as propriedades.
                   </div>
+                </div>
+              )}
+
+              {/* Link de convite — não faz parte do <form> de server.properties: é
+                  salvo na hora, direto na API Central, sem precisar do botão "Salvar". */}
+              {shortCode && (
+                <div className="mb-4 p-4 bg-theme-muted border border-theme-card rounded-2xl space-y-2.5">
+                  <label className="flex items-center gap-1.5 text-sm font-medium text-theme-primary">
+                    <LinkIcon className="w-4 h-4" /> Link de convite
+                  </label>
+                  {slugLoading ? (
+                    <p className="text-[10px] text-theme-secondary">Carregando...</p>
+                  ) : (
+                    <>
+                      <div className="flex gap-2">
+                        <div className="flex-1 flex items-center h-11 px-3 rounded-xl border border-theme-card bg-theme-card overflow-hidden">
+                          <span className="text-[11px] text-theme-secondary whitespace-nowrap">play.cubicase.net/</span>
+                          <input
+                            type="text"
+                            value={slugInput}
+                            disabled={!subscriptionActive || slugSubmitting}
+                            onChange={(e) => setSlugInput(e.target.value.toLowerCase())}
+                            className="flex-1 min-w-0 bg-transparent focus:outline-none text-sm text-theme-primary font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+                          />
+                        </div>
+                        {subscriptionActive && (
+                          <button
+                            type="button"
+                            onClick={handleSaveSlug}
+                            disabled={slugSubmitting || !slugInput.trim() || slugInput.trim() === (customSlug ?? defaultSlug)}
+                            className="h-11 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer flex-shrink-0"
+                          >
+                            {slugSubmitting ? "Salvando..." : "Salvar"}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleCopyInviteLink}
+                          className="h-11 px-3 bg-theme-card border border-theme-card hover:bg-theme-muted text-theme-primary rounded-xl transition-colors cursor-pointer flex-shrink-0 flex items-center gap-1.5 text-xs font-semibold"
+                          title="Copiar link"
+                        >
+                          {slugCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                      </div>
+
+                      {!subscriptionActive ? (
+                        <p className="text-[10px] text-theme-secondary">
+                          Esse é o link grátis do seu servidor (baseado no código de convite). Assine o
+                          Cubicase Plus (Configurações → Assinatura) pra trocar por um endereço à sua escolha.
+                        </p>
+                      ) : customSlug ? (
+                        <button
+                          type="button"
+                          onClick={handleRemoveSlug}
+                          disabled={slugSubmitting}
+                          className="text-xs font-semibold text-rose-500 hover:text-rose-600 disabled:opacity-50 transition-colors cursor-pointer"
+                        >
+                          Remover personalização (volta pro link baseado no código)
+                        </button>
+                      ) : (
+                        <p className="text-[10px] text-theme-secondary">
+                          Esse é o link grátis do seu servidor. Escolha um endereço personalizado e clique em Salvar.
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {slugError && <p className="text-[10px] text-rose-500">{slugError}</p>}
                 </div>
               )}
 

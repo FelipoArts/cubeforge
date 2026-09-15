@@ -102,6 +102,11 @@ interface AppSettings {
   // AuthUser acima. Não persistido.
   user: AuthUser | null;
 
+  // shortCode de um convite recebido via deep link (cubicase://join/<shortCode>,
+  // ver src/lib/joinDeepLink.ts) que a GuestView ainda não processou — runtime
+  // apenas, nunca persistido. GuestView zera pra null assim que consome.
+  pendingJoinShortCode: string | null;
+
   // Biblioteca de servidores conhecidos (persistida)
   knownServers: KnownServer[];
 
@@ -140,6 +145,7 @@ interface AppSettings {
   removeOnlinePlayer: (name: string) => void;
   setLastCrashInfo: (info: CrashInfo | null) => void;
   setUser: (user: AuthUser | null) => void;
+  setPendingJoinShortCode: (shortCode: string | null) => void;
   setLocalServers: (servers: ServerInfo[]) => void;
   setGuestConnectedShortCode: (shortCode: string | null) => void;
   setKnownServers: (servers: KnownServer[]) => void;
@@ -169,6 +175,7 @@ export const useAppStore = create<AppSettings>()(
       onlinePlayers: [],
       lastCrashInfo: null,
       user: null,
+      pendingJoinShortCode: null,
       knownServers: [],
       localServers: [],
       guestConnectedShortCode: null,
@@ -199,6 +206,7 @@ export const useAppStore = create<AppSettings>()(
       })),
       setLastCrashInfo: (info) => set({ lastCrashInfo: info }),
       setUser: (user) => set({ user }),
+      setPendingJoinShortCode: (shortCode) => set({ pendingJoinShortCode: shortCode }),
       setLocalServers: (servers) => set({ localServers: servers }),
       setGuestConnectedShortCode: (shortCode) => set({ guestConnectedShortCode: shortCode }),
       setKnownServers: (servers) => set({ knownServers: servers }),

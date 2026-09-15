@@ -41,6 +41,7 @@ import {
   type ServerInstallProgress,
 } from "@/lib/server";
 import type { ResourceSnapshot } from "@/lib/resourceDiagnostics";
+import { getServerSlug, defaultSlugFor, inviteLinkUrl } from "@/lib/inviteLink";
 import { installModpack, type ParsedModpack } from "@/lib/modpackImport";
 import { DonationModal } from "./DonationModal";
 import { ServerConfigModal } from "@/app/ServerConfigModal";
@@ -84,7 +85,6 @@ interface HostViewProps {
   deleteConfirmServer: string | null;
   totalSystemRamGb: number;
   serverConfigPort: number;
-  copied: boolean;
   shortCode: string;
   resourceSample: ResourceSnapshot | null;
 
@@ -106,7 +106,6 @@ interface HostViewProps {
   onSetDeleteConfirmServer: (v: string | null) => void;
   onSetTotalSystemRamGb: (v: number) => void;
   onSetServerConfigPort: (v: number) => void;
-  onSetCopied: (v: boolean) => void;
   onSetShortCode: (v: string) => void;
   onRegisterServer: (serverInfo: ServerInfo) => Promise<void>;
 }
@@ -129,7 +128,6 @@ export function HostView({
   deleteConfirmServer,
   totalSystemRamGb,
   serverConfigPort,
-  copied,
   shortCode,
   resourceSample,
 
@@ -150,7 +148,6 @@ export function HostView({
   onSetDeleteConfirmServer,
   onSetTotalSystemRamGb,
   onSetServerConfigPort,
-  onSetCopied,
   onSetShortCode,
   onRegisterServer,
 }: HostViewProps) {
@@ -539,10 +536,15 @@ export function HostView({
     if (selected) setServerDir(selected as string);
   };
 
+  // Guarda o TEXTO copiado (não um booleano solto) pra só o botão que copiou
+  // aquele conteúdo específico mostrar o ícone de check — com um booleano
+  // único, clicar em "Copiar link" também "marcava" o botão de copiar o
+  // código CF-XXXXXX (e vice-versa), mesmo os dois copiando coisas diferentes.
+  const [copiedText, setCopiedText] = useState<string | null>(null);
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    onSetCopied(true);
-    setTimeout(() => onSetCopied(false), 2000);
+    setCopiedText(text);
+    setTimeout(() => setCopiedText((current) => (current === text ? null : current)), 2000);
   };
 
   const handleCreateServer = async (name: string, version: string, ram: number, serverType?: "vanilla" | "forge" | "neoforge" | "fabric" | "paper", extraVersion?: string, seed?: string) => {
@@ -718,6 +720,27 @@ export function HostView({
   const serverInfo = selectedServer ? localServers.find(s => s.name === selectedServer) : null;
   const displayShortCode = serverInfo?.shortCode || serverShortCodeRef.current || shortCode;
 
+  // Link de convite (play.cubicase.net/<slug>) — todo servidor já tem um de
+  // graça (o próprio código em minúsculas, ver defaultSlugFor); só busca na
+  // API Central se existe um personalizado (Cubicase Plus, editável no modal
+  // de configuração do servidor — ver ServerConfigModal). Enquanto a busca
+  // não volta, mostra o padrão direto: nunca precisa de tela de carregando.
+  //
+  // Também refaz a busca quando showConfigModal muda (abre OU fecha) — é
+  // assim que um slug salvo/removido dentro do ServerConfigModal aparece
+  // aqui na hora, sem precisar de F5: o modal não avisa este componente
+  // diretamente, então reagir ao fechamento é o gatilho mais simples pra
+  // buscar de novo o valor que acabou de ser salvo na API Central.
+  const [customInviteSlug, setCustomInviteSlug] = useState<string | null>(null);
+  useEffect(() => {
+    setCustomInviteSlug(null);
+    if (!displayShortCode) return;
+    let cancelled = false;
+    getServerSlug(displayShortCode).then((slug) => { if (!cancelled) setCustomInviteSlug(slug); });
+    return () => { cancelled = true; };
+  }, [displayShortCode, showConfigModal]);
+  const inviteSlug = customInviteSlug ?? (displayShortCode ? defaultSlugFor(displayShortCode) : null);
+
   const serverTypeLabels: Record<string, string> = {
     vanilla: "Vanilla",
     forge: "Forge",
@@ -778,7 +801,7 @@ export function HostView({
                       className="p-1.5 bg-indigo-100 dark:bg-indigo-800/40 text-indigo-600 dark:text-indigo-300 rounded-lg hover:bg-indigo-200 dark:hover:bg-indigo-700/50 transition-all active:scale-95 cursor-pointer"
                       title="Copiar Código do Servidor"
                     >
-                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copiedText === `CF-${displayShortCode}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                     <button
                       type="button"
@@ -788,6 +811,24 @@ export function HostView({
                       title={serverStatus !== "offline" ? "Pare o servidor para gerar um novo código" : "Gerar novo código (invalida o atual)"}
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                {/* Link de convite (play.cubicase.net/<slug>) — grátis com o código como
+                    padrão, personalizável com Cubicase Plus no modal de configuração. */}
+                {selectedServer && inviteSlug && (
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <span className="text-xs text-theme-secondary font-mono truncate">
+                      play.cubicase.net/{inviteSlug}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(inviteLinkUrl(inviteSlug))}
+                      className="p-1 text-theme-secondary hover:text-indigo-600 transition-all active:scale-95 cursor-pointer flex-shrink-0"
+                      title="Copiar link de convite"
+                    >
+                      {copiedText === inviteLinkUrl(inviteSlug) ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                     </button>
                   </div>
                 )}
@@ -1035,7 +1076,7 @@ export function HostView({
                     className="p-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all shadow-theme-shadow active:scale-95 cursor-pointer"
                     title="Copiar Código"
                   >
-                    {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                    {copiedText === `CF-${displayShortCode}` ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                   </button>
                 </div>
               </motion.div>
@@ -1205,6 +1246,7 @@ export function HostView({
         {showConfigModal && configServerDir && (
           <ServerConfigModal
             serverDir={configServerDir}
+            shortCode={localServers.find((s) => s.path === configServerDir)?.shortCode ?? null}
             isOpen={showConfigModal}
             onClose={() => {
               onSetShowConfigModal(false);

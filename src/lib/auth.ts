@@ -19,7 +19,7 @@
 // ============================================================
 
 import { open } from "@tauri-apps/plugin-shell";
-import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { onOpenUrl, getCurrent } from "@tauri-apps/plugin-deep-link";
 import { supabase } from "@/lib/supabaseClient";
 import { useAppStore, type AuthUser } from "@/app/store";
 
@@ -66,6 +66,18 @@ export async function initAuthListener(): Promise<() => void> {
   const { data: authSub } = supabase.auth.onAuthStateChange((_event, newSession) => {
     setUser(newSession?.user ? toAuthUser(newSession.user) : null);
   });
+
+  // Cold start: se o app acabou de ser aberto pelo próprio deep link de login
+  // (raro pra login — normalmente o app já está aberto quando se clica em
+  // "Entrar" — mas o mesmo mecanismo vale), getCurrent() pega a URL dos
+  // argumentos de linha de comando do processo. onOpenUrl sozinho só cobre o
+  // app já rodando (ver comentário equivalente em src/lib/joinDeepLink.ts).
+  try {
+    const initialUrls = await getCurrent();
+    if (initialUrls) for (const url of initialUrls) void handleAuthCallbackUrl(url);
+  } catch (err) {
+    console.error("[auth] Falha ao checar getCurrent():", err);
+  }
 
   const unlistenOpenUrl = await onOpenUrl((urls) => {
     for (const url of urls) void handleAuthCallbackUrl(url);

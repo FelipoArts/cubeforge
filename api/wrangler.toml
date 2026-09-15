@@ -15,6 +15,14 @@ HEARTBEAT_EXPIRE_SECONDS = "600"
 SHORT_CODE_LENGTH = "6"
 API_BASE_URL = "https://api.cubeforge.dev"
 
+# Link de convite personalizado (Cubicase Plus) — play.cubicase.net/<slug>.
+# A zona DNS de cubicase.net está no HostGator (e-mail e outras coisas
+# dependem dela), não no Cloudflare, então não dá pra usar "Custom Domain" do
+# Workers aqui. A página em si é um site estático no GitHub Pages (mesmo
+# esquema de docs/entrar/, ver play-site/ na raiz do repo) — este Worker só
+# expõe GET /api/v1/servers/by-slug/{slug} pra ela resolver o slug antes de
+# tentar o deep link. Nenhuma config de domínio extra precisa deste Worker.
+
 # CORS configuration
 [env.production]
 vars = { ENVIRONMENT = "production" }
