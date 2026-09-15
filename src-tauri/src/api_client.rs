@@ -271,6 +271,14 @@ impl ApiClient {
         }
     }
 
+    /// Injeta um transporte próprio (ex.: um fake em testes) em vez do
+    /// `HttpTransport` real — é o que permite testar a lógica de retry/
+    /// estado do `SessionManager` sem rede de verdade. Ver `ApiTransport`.
+    #[cfg(test)]
+    pub fn with_transport(transport: Box<dyn ApiTransport>, config: ApiConfig) -> Self {
+        Self { transport, config }
+    }
+
     fn generate_ids(&self) -> (String, String) {
         (generate_uuid(), generate_uuid())
     }

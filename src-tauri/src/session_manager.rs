@@ -459,3 +459,139 @@ impl SessionManager {
         self.state.lock().unwrap().heartbeat_count
     }
 }
+
+// ============================================================
+// Testes automatizados — lógica de retry/estado, sem rede real
+// ============================================================
+// `ApiTransport` já é um trait (pensado pra HTTP/WebSocket/gRPC — ver
+// api_client.rs), então dá pra injetar um transporte roteirizado aqui e
+// testar exatamente o comportamento de retry do SessionManager sem
+// depender de rede/Tailscale/Worker de verdade. O que NÃO dá (e não deveria
+// tentar) pra testar assim: subir o processo Java de verdade ou o sidecar
+// do Tailscale de verdade — isso continua sendo teste manual com duas
+// máquinas.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_client::{ApiClient, ApiConfig, ApiError, ApiRequest, ApiResponse, ApiTransport};
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    /// Transporte falso que devolve, em ordem, uma lista pré-definida de
+    /// respostas — uma por chamada a `send`, independente do endpoint.
+    struct ScriptedTransport {
+        responses: StdMutex<VecDeque<Result<ApiResponse, ApiError>>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(responses: Vec<Result<ApiResponse, ApiError>>) -> Self {
+            Self { responses: StdMutex::new(responses.into_iter().collect()) }
+        }
+    }
+
+    #[async_trait]
+    impl ApiTransport for ScriptedTransport {
+        async fn send(&self, _request: ApiRequest) -> Result<ApiResponse, ApiError> {
+            self.responses.lock().unwrap().pop_front().unwrap_or_else(|| {
+                fake_err("EXHAUSTED", "ScriptedTransport sem mais respostas roteirizadas")
+            })
+        }
+    }
+
+    fn fake_err(code: &str, message: &str) -> Result<ApiResponse, ApiError> {
+        Err(ApiError { code: code.into(), message: message.into(), technical_id: "test".into(), status_code: 500 })
+    }
+
+    fn fake_ok(data: serde_json::Value) -> Result<ApiResponse, ApiError> {
+        Ok(ApiResponse {
+            success: true,
+            code: "SUCCESS".into(),
+            message: "ok".into(),
+            data: Some(data),
+            details: None,
+            technical_id: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            request_id: None,
+        })
+    }
+
+    fn connection_session_json(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "launcher": "tsnet-v1",
+            "launcherVersion": 1,
+            "protocolVersion": 1,
+            "credentials": {},
+            "leaseDurationMs": 90000,
+            "expiresAt": "2026-01-01T00:01:30Z",
+        })
+    }
+
+    fn session_manager_with(responses: Vec<Result<ApiResponse, ApiError>>) -> SessionManager {
+        let client = ApiClient::with_transport(Box::new(ScriptedTransport::new(responses)), ApiConfig::default());
+        SessionManager::new(Arc::new(client))
+    }
+
+    #[tokio::test]
+    async fn set_online_retries_past_a_transient_session_not_found() {
+        // Regressão do incidente de 2026-09-14/15: a ConnectionSession
+        // tinha acabado de ser criada quando o PATCH pra "online" batia num
+        // edge do Cloudflare que ainda não via a escrita (KV é eventualmente
+        // consistente, não imediato) — sem retry, isso travava a sessão em
+        // DEGRADED pra sempre, sem o convidado nunca ver a rede "online".
+        // Simula exatamente essa falha transitória: as duas primeiras
+        // tentativas do PATCH falham, a terceira funciona.
+        let sm = session_manager_with(vec![
+            fake_ok(connection_session_json("sess-1")), // create_connection_session
+            fake_err("SESSION_NOT_FOUND", "not found"), // update_connection_session, tentativa 1
+            fake_err("SESSION_NOT_FOUND", "not found"), // tentativa 2
+            fake_ok(serde_json::json!({})),             // tentativa 3 — sucesso
+        ]);
+
+        sm.start("ABCDEF", "host", 25565).await.expect("start deveria funcionar");
+        sm.set_waiting_provider().expect("set_waiting_provider deveria funcionar");
+        let result = sm.set_online("100.64.0.1").await;
+
+        assert!(result.is_ok(), "set_online deveria ter se recuperado após retries: {:?}", result);
+        assert_eq!(sm.get_status(), SessionStatus::Online);
+    }
+
+    #[tokio::test]
+    async fn set_online_degrades_after_exhausting_retries() {
+        // O mesmo cenário, mas a falha não é transitória (persiste em todas
+        // as tentativas) — precisa continuar caindo em DEGRADED de verdade,
+        // não travar num loop nem reportar sucesso falso.
+        let sm = session_manager_with(vec![
+            fake_ok(connection_session_json("sess-2")),
+            fake_err("SESSION_NOT_FOUND", "not found"),
+            fake_err("SESSION_NOT_FOUND", "not found"),
+            fake_err("SESSION_NOT_FOUND", "not found"),
+            fake_err("SESSION_NOT_FOUND", "not found"),
+        ]);
+
+        sm.start("ABCDEF", "host", 25565).await.expect("start deveria funcionar");
+        sm.set_waiting_provider().expect("set_waiting_provider deveria funcionar");
+        let result = sm.set_online("100.64.0.1").await;
+
+        assert!(result.is_err());
+        assert_eq!(sm.get_status(), SessionStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn start_then_set_online_succeeds_on_first_try() {
+        // Caminho feliz, sem nenhuma falha — garante que o retry novo não
+        // atrapalha (nem atrasa) o caso comum.
+        let sm = session_manager_with(vec![
+            fake_ok(connection_session_json("sess-3")),
+            fake_ok(serde_json::json!({})),
+        ]);
+
+        sm.start("ABCDEF", "host", 25565).await.expect("start deveria funcionar");
+        sm.set_waiting_provider().expect("set_waiting_provider deveria funcionar");
+        sm.set_online("100.64.0.1").await.expect("set_online deveria funcionar de primeira");
+
+        assert_eq!(sm.get_status(), SessionStatus::Online);
+        assert_eq!(sm.get_session_id(), Some("sess-3".to_string()));
+    }
+}
