@@ -41,6 +41,10 @@ export interface KnownServer {
   // nenhum heartbeat dele (host nunca iniciou o servidor, ou registro expirou).
   minecraftStatus: ServerStatus | null;
   port: number;
+  // Endereço de conexão personalizado (Cubicase Plus) — null se o host nunca
+  // configurou um, e aí o endereço exibido cai pro padrão grátis derivado do
+  // shortCode (ver defaultConnectNameFor em src/lib/connectAddress.ts).
+  connectName: string | null;
   maxPlayers: number;
   currentPlayers: number;
   lastSeenOnline: string | null; // ISO timestamp

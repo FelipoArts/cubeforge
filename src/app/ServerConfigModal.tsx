@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { join } from '@tauri-apps/api/path';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Check, X, AlertTriangle, Image as ImageIcon, Link as LinkIcon, Copy } from 'lucide-react';
+import { Check, X, AlertTriangle, Image as ImageIcon, Link as LinkIcon, Gamepad2, Copy } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useLockBodyScroll } from '@/lib/useLockBodyScroll';
 import { useAppStore } from '@/app/store';
@@ -18,6 +18,16 @@ import {
   defaultSlugFor,
   SLUG_FORMAT_HINT,
 } from '@/lib/inviteLink';
+import {
+  getServerConnectName,
+  setConnectName,
+  removeConnectName,
+  isValidConnectNameFormat,
+  connectAddressFor,
+  defaultConnectNameFor,
+  CONNECT_NAME_DOMAIN,
+  CONNECT_NAME_FORMAT_HINT,
+} from '@/lib/connectAddress';
 
 interface ServerConfigModalProps {
   /** Full filesystem path to the server directory */
@@ -81,18 +91,43 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
 
   const defaultSlug = shortCode ? defaultSlugFor(shortCode) : null;
 
+  // ------------------------------------------------------------
+  // Endereço de conexão (<nome>.link.cubicase.net) — mesmo padrão do link de
+  // convite acima, mas um campo INDEPENDENTE: o host pode ter um nome
+  // diferente pro link de convite e pro endereço usado dentro do Minecraft.
+  // Só vale pra convidados conectando pela mesh do próprio Cubicase (ver
+  // comentário em src/lib/connectAddress.ts).
+  // ------------------------------------------------------------
+  const [customConnectName, setCustomConnectName] = useState<string | null>(null);
+  const [connectNameLoading, setConnectNameLoading] = useState(false);
+  const [connectNameInput, setConnectNameInput] = useState('');
+  const [connectNameSubmitting, setConnectNameSubmitting] = useState(false);
+  const [connectNameError, setConnectNameError] = useState<string | null>(null);
+  const [connectNameCopied, setConnectNameCopied] = useState(false);
+
+  const defaultConnectName = shortCode ? defaultConnectNameFor(shortCode) : null;
+
   useEffect(() => {
     if (!isOpen || !shortCode) return;
     setSlugError(null);
     setSlugLoading(true);
+    setConnectNameError(null);
+    setConnectNameLoading(true);
     Promise.all([
       user ? getSubscriptionStatus().catch(() => null) : Promise.resolve(null),
       getServerSlug(shortCode).catch(() => null),
-    ]).then(([sub, slug]) => {
-      setSubscriptionActive(isSubscriptionActive(sub));
+      getServerConnectName(shortCode).catch(() => null),
+    ]).then(([sub, slug, connectName]) => {
+      const active = isSubscriptionActive(sub);
+      setSubscriptionActive(active);
       setCustomSlug(slug);
       setSlugInput(slug ?? defaultSlugFor(shortCode));
-    }).finally(() => setSlugLoading(false));
+      setCustomConnectName(connectName);
+      setConnectNameInput(connectName ?? defaultConnectNameFor(shortCode));
+    }).finally(() => {
+      setSlugLoading(false);
+      setConnectNameLoading(false);
+    });
   }, [isOpen, shortCode, user]);
 
   const handleSaveSlug = async () => {
@@ -136,6 +171,48 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
     navigator.clipboard.writeText(inviteLinkUrl(slug));
     setSlugCopied(true);
     setTimeout(() => setSlugCopied(false), 1500);
+  };
+
+  const handleSaveConnectName = async () => {
+    if (!shortCode) return;
+    const name = connectNameInput.trim().toLowerCase();
+    if (!isValidConnectNameFormat(name)) {
+      setConnectNameError(`Endereço inválido — ${CONNECT_NAME_FORMAT_HINT}`);
+      return;
+    }
+    setConnectNameSubmitting(true);
+    setConnectNameError(null);
+    try {
+      const saved = await setConnectName(shortCode, name);
+      setCustomConnectName(saved);
+      setConnectNameInput(saved);
+    } catch (err: any) {
+      setConnectNameError(err?.message || 'Não foi possível salvar o endereço.');
+    } finally {
+      setConnectNameSubmitting(false);
+    }
+  };
+
+  const handleRemoveConnectName = async () => {
+    if (!shortCode) return;
+    setConnectNameSubmitting(true);
+    setConnectNameError(null);
+    try {
+      await removeConnectName(shortCode);
+      setCustomConnectName(null);
+      setConnectNameInput(defaultConnectNameFor(shortCode));
+    } catch (err: any) {
+      setConnectNameError(err?.message || 'Não foi possível remover o endereço.');
+    } finally {
+      setConnectNameSubmitting(false);
+    }
+  };
+
+  const handleCopyConnectAddress = () => {
+    if (!shortCode) return;
+    navigator.clipboard.writeText(connectAddressFor({ shortCode, connectName: customConnectName ?? defaultConnectName }, 25565));
+    setConnectNameCopied(true);
+    setTimeout(() => setConnectNameCopied(false), 1500);
   };
 
   useLockBodyScroll(isOpen);
@@ -428,6 +505,76 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                     </>
                   )}
                   {slugError && <p className="text-[10px] text-rose-500">{slugError}</p>}
+                </div>
+              )}
+
+              {/* Endereço de conexão — mesmo esquema do link de convite acima (salvo
+                  na hora, fora do <form>), mas um campo independente: o nome aqui não
+                  precisa ser igual ao do link de convite. Só vale pra convidados
+                  conectando pela mesh do próprio Cubicase. */}
+              {shortCode && (
+                <div className="mb-4 p-4 bg-theme-muted border border-theme-card rounded-2xl space-y-2.5">
+                  <label className="flex items-center gap-1.5 text-sm font-medium text-theme-primary">
+                    <Gamepad2 className="w-4 h-4" /> Endereço no Minecraft
+                  </label>
+                  {connectNameLoading ? (
+                    <p className="text-[10px] text-theme-secondary">Carregando...</p>
+                  ) : (
+                    <>
+                      <div className="flex gap-2">
+                        <div className="flex-1 flex items-center h-11 px-3 rounded-xl border border-theme-card bg-theme-card overflow-hidden">
+                          <input
+                            type="text"
+                            value={connectNameInput}
+                            disabled={!subscriptionActive || connectNameSubmitting}
+                            onChange={(e) => setConnectNameInput(e.target.value.toLowerCase())}
+                            className="flex-1 min-w-0 bg-transparent focus:outline-none text-sm text-theme-primary font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+                          />
+                          <span className="text-[11px] text-theme-secondary whitespace-nowrap">.{CONNECT_NAME_DOMAIN}</span>
+                        </div>
+                        {subscriptionActive && (
+                          <button
+                            type="button"
+                            onClick={handleSaveConnectName}
+                            disabled={connectNameSubmitting || !connectNameInput.trim() || connectNameInput.trim() === (customConnectName ?? defaultConnectName)}
+                            className="h-11 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer flex-shrink-0"
+                          >
+                            {connectNameSubmitting ? "Salvando..." : "Salvar"}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleCopyConnectAddress}
+                          className="h-11 px-3 bg-theme-card border border-theme-card hover:bg-theme-muted text-theme-primary rounded-xl transition-colors cursor-pointer flex-shrink-0 flex items-center gap-1.5 text-xs font-semibold"
+                          title="Copiar endereço"
+                        >
+                          {connectNameCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                      </div>
+
+                      {!subscriptionActive ? (
+                        <p className="text-[10px] text-theme-secondary">
+                          Esse é o endereço grátis do seu servidor (baseado no código de convite) — só funciona
+                          enquanto o convidado está conectado pelo app. Assine o Cubicase Plus (Configurações →
+                          Assinatura) pra trocar por um endereço à sua escolha.
+                        </p>
+                      ) : customConnectName ? (
+                        <button
+                          type="button"
+                          onClick={handleRemoveConnectName}
+                          disabled={connectNameSubmitting}
+                          className="text-xs font-semibold text-rose-500 hover:text-rose-600 disabled:opacity-50 transition-colors cursor-pointer"
+                        >
+                          Remover personalização (volta pro endereço baseado no código)
+                        </button>
+                      ) : (
+                        <p className="text-[10px] text-theme-secondary">
+                          Esse é o endereço grátis do seu servidor. Escolha um nome personalizado e clique em Salvar.
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {connectNameError && <p className="text-[10px] text-rose-500">{connectNameError}</p>}
                 </div>
               )}
 

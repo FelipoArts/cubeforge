@@ -34,6 +34,7 @@ import {
   findInstalledForgeVersion,
 } from "@/lib/clientSetup";
 import { planModSync, runModSync, INITIAL_PREP_STATE, type PrepState } from "@/lib/modSync";
+import { connectAddressFor } from "@/lib/connectAddress";
 import { ModSyncModal } from "./ModSyncModal";
 
 /** Tipos de servidor cobertos pelo fluxo "Jogar" (abrir o launcher já pronto). */
@@ -133,7 +134,7 @@ export function GuestView({
     if ((server.serverType === "forge" || server.serverType === "neoforge") && !server.forgeVersion) {
       patchPrepState(server.shortCode, {
         phase: "error",
-        errorMessage: `Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em localhost:${minecraftPort}.`,
+        errorMessage: `Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em ${connectAddressFor(server, minecraftPort)}.`,
       });
       return;
     }
@@ -189,7 +190,7 @@ export function GuestView({
       if (prepResult === "not_found") {
         patchPrepState(server.shortCode, {
           phase: "error",
-          errorMessage: `Não encontramos sua instalação do Minecraft — abra o jogo e conecte em localhost:${minecraftPort} manualmente.`,
+          errorMessage: `Não encontramos sua instalação do Minecraft — abra o jogo e conecte em ${connectAddressFor(server, minecraftPort)} manualmente.`,
         });
         return;
       }
@@ -329,6 +330,7 @@ export function GuestView({
           networkProvider: "tailscale",
           forgeVersion: server.forgeVersion ?? null,
           modLoaderVersion: server.modLoaderVersion ?? null,
+          connectName: null,
         });
       }
     }
@@ -513,6 +515,7 @@ export function GuestView({
         networkProvider: session.provider || "tailscale",
         forgeVersion: server.forgeVersion ?? null,
         modLoaderVersion: server.modLoaderVersion ?? null,
+        connectName: server.connectName ?? null,
       };
       addKnownServer(known);
       return { ok: true, server: known };
@@ -893,7 +896,13 @@ export function GuestView({
                   </span>
                 </div>
 
-                {isThisConnected ? (
+                {(() => {
+                  // Endereço de conexão: o app tuneliza a porta local para o servidor
+                  // via mesh, então isso resolve pro loopback (127.0.0.1) do próprio
+                  // convidado — só passa a rotear de fato depois de clicar em
+                  // "Conectar" (ver connectAddressFor em src/lib/connectAddress.ts).
+                  const connectAddress = connectAddressFor(server, minecraftPort);
+                  return isThisConnected ? (
                   // Conectado: em vez de uma div separada abaixo da lista, as informações
                   // de conexão ficam centralizadas dentro do próprio card (que já mudou
                   // de cor para indicar o estado). Preparar o launcher (loader + mods +
@@ -909,38 +918,36 @@ export function GuestView({
                       </h4>
                       <p className="text-[11px] text-theme-secondary mt-0.5 leading-relaxed">
                         Conecte-se em{" "}
-                        <strong className="text-theme-primary font-mono">localhost:{minecraftPort}</strong>{" "}
+                        <strong className="text-theme-primary font-mono">{connectAddress}</strong>{" "}
                         no seu Minecraft
                       </p>
                     </div>
                     <button
                       type="button"
-                      onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
+                      onClick={() => copyToClipboard(connectAddress)}
                       className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer"
                     >
-                      {copied === `localhost:${minecraftPort}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                      {copied === `localhost:${minecraftPort}` ? "Copiado!" : "Copiar endereço"}
+                      {copied === connectAddress ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied === connectAddress ? "Copiado!" : "Copiar endereço"}
                     </button>
                   </div>
-                ) : (
-                  // Endereço de conexão: o app tuneliza a porta local para o servidor via
-                  // mesh, então o endereço que o convidado usa no Minecraft é sempre este
-                  // localhost — só passa a rotear de fato depois de clicar em "Conectar".
+                  ) : (
                   <div className="flex items-center gap-2 bg-theme-muted rounded-xl px-3 py-2 border border-theme-card">
                     <Globe className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
                     <span className="font-mono font-bold text-theme-primary text-xs flex-1 truncate">
-                      localhost:{minecraftPort}
+                      {connectAddress}
                     </span>
                     <button
                       type="button"
-                      onClick={() => copyToClipboard(`localhost:${minecraftPort}`)}
+                      onClick={() => copyToClipboard(connectAddress)}
                       className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
                       title="Copiar endereço de conexão"
                     >
-                      {copied === `localhost:${minecraftPort}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copied === connectAddress ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
-                )}
+                  );
+                })()}
               </div>
 
               {/* Ações do card */}

@@ -23,6 +23,14 @@ API_BASE_URL = "https://api.cubeforge.dev"
 # expõe GET /api/v1/servers/by-slug/{slug} pra ela resolver o slug antes de
 # tentar o deep link. Nenhuma config de domínio extra precisa deste Worker.
 
+# Endereço de conexão personalizado (Cubicase Plus) — <nome>.link.cubicase.net
+# no lugar de "localhost:<porta>" dentro do Minecraft. Também na zona
+# HostGator: um único registro DNS estático, mantido manualmente fora deste
+# Worker, `*.link.cubicase.net -> A 127.0.0.1` — resolve qualquer nome sob
+# esse domínio pro loopback onde o tsnet-node do convidado escuta depois de
+# conectar (ver handleSetConnectName/handleRemoveConnectName em src/index.ts).
+# Este Worker nunca fala com DNS nenhum, só guarda o alias no KV, igual o slug.
+
 # CORS configuration
 [env.production]
 vars = { ENVIRONMENT = "production" }

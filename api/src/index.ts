@@ -49,7 +49,7 @@ type ServerStatus = 'offline' | 'starting' | 'online' | 'stopping' | 'crashed' |
 type SessionStatus = 'creating' | 'starting_provider' | 'waiting_provider' | 'online' | 'degraded' | 'stopping' | 'stopped' | 'failed' | 'cancelled';
 type TerminationReason = 'user_stopped' | 'application_closed' | 'provider_error' | 'api_error' | 'crash' | 'timeout' | 'lease_expired';
 
-interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; forgeVersion?: string | null; modLoaderVersion?: string | null; slug?: string | null; }
+interface ServerEntity { shortCode: string; uuid: string; name: string; version: string; serverType: string; description: string; owner: string; createdAt: string; updatedAt: string; forgeVersion?: string | null; modLoaderVersion?: string | null; slug?: string | null; connectName?: string | null; }
 
 interface SessionEntity { shortCode: string; provider: string; hostIp: string; port: number; status: ServerStatus; currentPlayers: number; maxPlayers: number; lastHeartbeat: string; createdAt: string; expiresAt: string; }
 
@@ -104,6 +104,23 @@ function isValidSlug(slug: unknown): slug is string {
 }
 
 // ============================================================
+// ENDEREÇO DE CONEXÃO PERSONALIZADO (connectName) — Cubicase Plus
+// ============================================================
+// "<nome>.link.cubicase.net" no lugar de "localhost:<porta>" dentro do
+// Minecraft. Campo independente do slug do link de convite (o host pode
+// ter nomes diferentes pra cada um) — mesmas regras de formato/reserva
+// (isValidSlug) e mesmo modelo de armazenamento (`connect:<nome>` ->
+// shortCode), só que num namespace de KV separado.
+//
+// Só funciona pra convidados na mesh do próprio Cubicase: um registro DNS
+// wildcard `*.link.cubicase.net -> A 127.0.0.1`, mantido fora deste Worker
+// (painel DNS da HostGator — mesma zona de cubicase.net, ver comentário em
+// wrangler.toml), resolve qualquer nome sob esse domínio para o loopback
+// onde o tsnet-node do convidado já escuta depois de conectar. Este Worker
+// nunca fala com DNS nenhum — só guarda o alias, igual ao slug.
+const CONNECT_NAME_DOMAIN = 'link.cubicase.net';
+
+// ============================================================
 // RATE LIMITING — proteção básica contra brute-force de shortCode
 // ============================================================
 // shortCode é a única credencial (6 chars, alfabeto de 32 → ~1.07 bilhão de
@@ -128,6 +145,7 @@ const WAKE_RATE_LIMIT = 10;         // por IP/min — mesmo raciocínio de JOIN_
 // inteira com 500 antes de sequer chegar a gravar o pedido de despertar.
 const WAKE_COOLDOWN_SECONDS = 60;   // por shortCode, independente do IP — ver handleWakeServer
 const SLUG_RATE_LIMIT = 5;          // definir/trocar link de convite: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
+const CONNECT_NAME_RATE_LIMIT = 5;  // definir/trocar endereço de conexão: mesmo raciocínio de SLUG_RATE_LIMIT
 const SLUG_RESOLVE_RATE_LIMIT = 20; // resolver slug->shortCode: chamado pela página de convite (uma vez por visita) — folgado o bastante pra não incomodar visitas legítimas, apertado o bastante pra desanimar varredura de slugs
 
 function clientIp(req: Request): string {
@@ -388,6 +406,7 @@ async function handleDeleteServer(shortCode: string, env: Env, cors: Record<stri
     await env.CUBEFORGE_REGISTRY.delete(`server:${shortCode}`);
     await env.CUBEFORGE_REGISTRY.delete(`shortCode:${sv.uuid}`);
     if (sv.slug) await env.CUBEFORGE_REGISTRY.delete(`slug:${sv.slug}`);
+    if (sv.connectName) await env.CUBEFORGE_REGISTRY.delete(`connect:${sv.connectName}`);
   }
   await terminateActiveSessionsForShortCode(env, shortCode);
   await env.CUBEFORGE_REGISTRY.delete(`session:${shortCode}`);
@@ -420,10 +439,12 @@ async function handleRegenerateCode(oldShortCode: string, env: Env, cfg: { short
   await env.CUBEFORGE_REGISTRY.put(`server:${newShortCode}`, JSON.stringify(updated));
   await env.CUBEFORGE_REGISTRY.put(`shortCode:${sv.uuid}`, newShortCode);
   await env.CUBEFORGE_REGISTRY.delete(`server:${oldShortCode}`);
-  // O link de convite personalizado (se houver) sobrevive à troca de código —
-  // reapontar a reverse-lookup pro shortCode novo, senão o link ficava
-  // resolvendo pro código antigo (que acabou de deixar de existir).
+  // O link de convite e o endereço de conexão personalizados (se houver)
+  // sobrevivem à troca de código — reapontar as reverse-lookups pro
+  // shortCode novo, senão ficavam resolvendo pro código antigo (que acabou
+  // de deixar de existir).
   if (sv.slug) await env.CUBEFORGE_REGISTRY.put(`slug:${sv.slug}`, newShortCode);
+  if (sv.connectName) await env.CUBEFORGE_REGISTRY.put(`connect:${sv.connectName}`, newShortCode);
 
   // Sessão legada de heartbeat (ver handleHeartbeat) e qualquer ConnectionSession
   // ativa ficam órfãs/inválidas presas ao código antigo — melhor derrubar tudo
@@ -1115,6 +1136,65 @@ async function handleDeleteServerSlug(shortCode: string, req: Request, env: Env,
   return json(ok(ResponseCodes.SERVER_UPDATED, 'Link de convite removido.'), 200, cors);
 }
 
+// ============================================================
+// ENDEREÇO DE CONEXÃO PERSONALIZADO (connectName) — handlers
+// ============================================================
+
+/** PUT /api/v1/servers/{sc}/connect-name — define/troca o endereço usado no Minecraft (login + Cubicase Plus). */
+async function handleSetConnectName(shortCode: string, req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+  if (!(await userHasActiveSubscription(env, userId))) {
+    return json(fail(ResponseCodes.SUBSCRIPTION_REQUIRED, 'Assine o Cubicase Plus para usar um endereço de conexão personalizado.'), 403, cors);
+  }
+
+  let body: any; try { body = await req.json(); } catch { return json(fail(ResponseCodes.BAD_REQUEST, 'JSON inválido.'), 400, cors); }
+  const name = typeof body.connectName === 'string' ? body.connectName.trim().toLowerCase() : '';
+  if (!isValidSlug(name)) {
+    return json(fail(ResponseCodes.VALIDATION_ERROR, 'Endereço inválido — use 3 a 32 letras minúsculas, números ou hífen, sem hífen nas pontas.'), 400, cors);
+  }
+
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+  const sv: ServerEntity = JSON.parse(sj);
+
+  const existingOwner = await env.CUBEFORGE_REGISTRY.get(`connect:${name}`);
+  if (existingOwner && existingOwner !== shortCode) {
+    return json(fail(ResponseCodes.CONFLICT, 'Esse endereço já está em uso. Escolha outro.'), 409, cors);
+  }
+  // Mesma proteção anti-sequestro do slug (ver handleSetServerSlug): não
+  // deixa ninguém escolher um nome igual ao shortCode em minúsculas de OUTRO
+  // servidor, já que esse é o nome padrão grátis dele.
+  if (name.toUpperCase() !== shortCode) {
+    const clashingServer = await env.CUBEFORGE_REGISTRY.get(`server:${name.toUpperCase()}`);
+    if (clashingServer) return json(fail(ResponseCodes.CONFLICT, 'Esse endereço já está em uso. Escolha outro.'), 409, cors);
+  }
+
+  if (sv.connectName && sv.connectName !== name) await env.CUBEFORGE_REGISTRY.delete(`connect:${sv.connectName}`);
+  await env.CUBEFORGE_REGISTRY.put(`connect:${name}`, shortCode);
+  const updated: ServerEntity = { ...sv, connectName: name, updatedAt: new Date().toISOString() };
+  await env.CUBEFORGE_REGISTRY.put(`server:${shortCode}`, JSON.stringify(updated));
+
+  return json(ok(ResponseCodes.SERVER_UPDATED, 'Endereço de conexão atualizado.', { connectName: name, address: `${name}.${CONNECT_NAME_DOMAIN}` }), 200, cors);
+}
+
+/** DELETE /api/v1/servers/{sc}/connect-name — remove o endereço personalizado (só precisa de login, não exige assinatura ativa). */
+async function handleRemoveConnectName(shortCode: string, req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Não autenticado.'), 401, cors);
+
+  const sj = await env.CUBEFORGE_REGISTRY.get(`server:${shortCode}`);
+  if (!sj) return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Servidor não encontrado.'), 404, cors);
+  const sv: ServerEntity = JSON.parse(sj);
+
+  if (sv.connectName) {
+    await env.CUBEFORGE_REGISTRY.delete(`connect:${sv.connectName}`);
+    const updated: ServerEntity = { ...sv, connectName: null, updatedAt: new Date().toISOString() };
+    await env.CUBEFORGE_REGISTRY.put(`server:${shortCode}`, JSON.stringify(updated));
+  }
+  return json(ok(ResponseCodes.SERVER_UPDATED, 'Endereço de conexão removido.'), 200, cors);
+}
+
 // A página de convite em si (play.cubicase.net/<slug>) NÃO mora neste Worker —
 // mora num site estático no GitHub Pages (mesmo esquema de docs/entrar/),
 // porque a zona DNS de cubicase.net está no HostGator (e-mail e outras coisas
@@ -1185,6 +1265,14 @@ export default {
         return await handleSetServerSlug(m1s[1].toUpperCase(), req, env, cors);
       }
       if (m === 'DELETE' && m1s) return await handleDeleteServerSlug(m1s[1].toUpperCase(), req, env, cors);
+
+      // PUT/DELETE /api/v1/servers/{sc}/connect-name — endereço de conexão personalizado (Cubicase Plus)
+      const m1cn = p.match(/^\/api\/v1\/servers\/([A-Za-z0-9]+)\/connect-name$/);
+      if (m === 'PUT' && m1cn) {
+        if (!(await checkRateLimit(env, 'connect-name', clientIp(req), CONNECT_NAME_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handleSetConnectName(m1cn[1].toUpperCase(), req, env, cors);
+      }
+      if (m === 'DELETE' && m1cn) return await handleRemoveConnectName(m1cn[1].toUpperCase(), req, env, cors);
 
       // GET /api/v1/servers/by-slug/{slug} — resolve o link de convite (chamado pela página estática, ver play-site/index.html)
       const mBySlug = p.match(/^\/api\/v1\/servers\/by-slug\/([a-z0-9-]{3,32})$/);

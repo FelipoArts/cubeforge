@@ -241,3 +241,38 @@ describe("link de convite personalizado (slug)", () => {
     expect(body.data.name).toBe("MundoGratis");
   });
 });
+
+describe("endereço de conexão personalizado (connect-name)", () => {
+  it("definir sem autenticação dá 401", async () => {
+    const { shortCode } = await createTestServer();
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/${shortCode}/connect-name`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectName: "meu-mundo" }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).success).toBe(false);
+  });
+
+  it("remover sem autenticação também dá 401", async () => {
+    const { shortCode } = await createTestServer();
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/${shortCode}/connect-name`, { method: "DELETE" });
+    expect(res.status).toBe(401);
+  });
+
+  it("definir num shortCode inexistente dá 401 (autenticação é checada antes de existir o servidor)", async () => {
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/ZZZZZZ/connect-name`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectName: "meu-mundo" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("é um campo independente do slug do link de convite — não aparece no discover até ser definido", async () => {
+    const { shortCode } = await createTestServer("MundoIndependente");
+    const res = await SELF.fetch(`${BASE}/api/v1/servers/${shortCode}`);
+    const body = await res.json();
+    expect(body.data.server.connectName ?? null).toBeNull();
+  });
+});

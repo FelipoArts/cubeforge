@@ -30,6 +30,7 @@ import { analyzeCrashText } from "@/lib/crashAnalyzer";
 import { createLagMonitor } from "@/lib/lagDetector";
 import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
 import { maybeBackupWorld } from "@/lib/autoBackup";
+import { connectAddressFor } from "@/lib/connectAddress";
 
 // Componentes extraídos
 import { HostView } from "@/app/components/host/HostView";
@@ -745,6 +746,10 @@ export default function Home() {
     // host (session.hostIp) — sem isso não tem pra onde discar. O código de
     // convite sozinho (CF-XXXXXX) só carrega o shortCode, nunca um IP.
     let hostIp: string | null = null;
+    // Endereço de conexão personalizado (Cubicase Plus) — null se o host
+    // nunca configurou um, e aí connectAddressFor cai pro padrão grátis
+    // derivado do próprio shortCode.
+    let connectName: string | null = null;
     try {
       const response = await fetch(`https://cubeforge-api.cubeforge.workers.dev/api/v1/servers/${shortCodeClean}`);
       if (response.ok) {
@@ -761,6 +766,7 @@ export default function Home() {
         });
         discoveredName = server.name ?? null;
         hostIp = session.hostIp ?? null;
+        connectName = server.connectName ?? null;
       }
     } catch {
       // tratado abaixo pelo `!hostIp`
@@ -789,26 +795,27 @@ export default function Home() {
       });
       setNetStatus("online");
       setNetMode("guest");
-      setLogs(prev => [...prev, `[INFO] ✅ Túnel estabelecido! Conecte-se em localhost:${minecraftPort}`]);
+      const connectAddress = connectAddressFor({ shortCode: shortCodeClean, connectName }, minecraftPort);
+      setLogs(prev => [...prev, `[INFO] ✅ Túnel estabelecido! Conecte-se em ${connectAddress}`]);
 
       // Adiciona (ou atualiza) automaticamente o servidor na lista "Multiplayer"
       // do cliente Minecraft do convidado, editando o servers.dat diretamente —
-      // evita que o jogador precise digitar "localhost:<porta>" na mão. Melhor
-      // esforço: se não achar a instalação do launcher, o app continua
-      // funcionando normalmente (o convidado só digita o endereço manualmente).
+      // evita que o jogador precise digitar o endereço na mão. Melhor esforço:
+      // se não achar a instalação do launcher, o app continua funcionando
+      // normalmente (o convidado só digita o endereço manualmente).
       try {
         const result = await invoke<string>("add_minecraft_server_entry", {
           name: discoveredName ?? "Servidor CubeForge",
-          address: `localhost:${minecraftPort}`,
+          address: connectAddress,
         });
         if (result === "added") {
           setLogs(prev => [...prev, `[INFO] ✅ Servidor adicionado automaticamente à sua lista de Multiplayer do Minecraft.`]);
         } else {
-          setLogs(prev => [...prev, `[INFO] Não encontramos sua instalação do Minecraft — adicione "localhost:${minecraftPort}" manualmente na lista de Multiplayer.`]);
+          setLogs(prev => [...prev, `[INFO] Não encontramos sua instalação do Minecraft — adicione "${connectAddress}" manualmente na lista de Multiplayer.`]);
         }
       } catch (err) {
         console.warn("[Guest] Falha ao adicionar servidor ao cliente Minecraft:", err);
-        setLogs(prev => [...prev, `[INFO] Não foi possível adicionar o servidor automaticamente — adicione "localhost:${minecraftPort}" manualmente na lista de Multiplayer.`]);
+        setLogs(prev => [...prev, `[INFO] Não foi possível adicionar o servidor automaticamente — adicione "${connectAddress}" manualmente na lista de Multiplayer.`]);
       }
     } catch (err) {
       console.error(err);
