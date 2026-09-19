@@ -42,8 +42,8 @@ export type ModSyncEntryStatus = "pending" | "downloading" | "ok" | "failed";
 export interface ModSyncEntry {
   filename: string;
   sizeBytes: number;
-  /** De onde este mod específico vai ser baixado — só informativo pra UI (mostrar a origem no progresso). */
-  source: "modrinth" | "mesh";
+  /** De onde este mod específico vai ser baixado — só informativo pra UI (mostrar a origem no progresso). "local" = cópia direta da pasta do próprio servidor no disco, sem rede (ver planLocalModSync). */
+  source: "modrinth" | "mesh" | "local";
   status: ModSyncEntryStatus;
   error?: string;
 }
@@ -94,23 +94,23 @@ async function listLocalModHashes(instanceModsDir: string): Promise<Map<string, 
 }
 
 /**
- * Monta o plano de sincronização: busca a lista do host, compara com o que
- * já existe localmente (por hash, não só nome — um arquivo com nome certo
- * mas conteúdo errado NÃO conta como já instalado) e retorna só o que falta
- * baixar, já com a origem de cada um. Não baixa nada — isso é runModSync,
- * chamado só depois que o usuário confirmar no modal.
+ * Monta o plano a partir de uma lista de mods já resolvida (remota ou
+ * local) — compartilhado por planModSync/planLocalModSync. Para o modo
+ * local, `preferModrinth` é false: o arquivo já está no disco do próprio
+ * host, então copiar direto é sempre melhor do que baixar de novo do
+ * Modrinth (mesmo que a origem tenha sido identificada).
  */
-export async function planModSync(shortCode: string, instanceModsDir: string): Promise<ModSyncPlan> {
-  const [remoteMods, localHashes] = await Promise.all([
-    fetchRemoteModsList(shortCode),
-    listLocalModHashes(instanceModsDir),
-  ]);
-
+function buildSyncPlan(
+  mods: RemoteModEntry[],
+  localHashes: Map<string, string>,
+  fallbackSource: "mesh" | "local",
+  preferModrinth: boolean
+): ModSyncPlan {
   const entries: ModSyncEntry[] = [];
   let alreadyInstalledCount = 0;
   let totalBytesToDownload = 0;
 
-  for (const mod of remoteMods) {
+  for (const mod of mods) {
     const localSha1 = localHashes.get(mod.filename);
     if (localSha1 && localSha1.toLowerCase() === mod.sha1.toLowerCase()) {
       alreadyInstalledCount++;
@@ -119,13 +119,42 @@ export async function planModSync(shortCode: string, instanceModsDir: string): P
     entries.push({
       filename: mod.filename,
       sizeBytes: mod.size_bytes,
-      source: mod.source === "modrinth" && mod.url ? "modrinth" : "mesh",
+      source: preferModrinth && mod.source === "modrinth" && mod.url ? "modrinth" : fallbackSource,
       status: "pending",
     });
     totalBytesToDownload += mod.size_bytes;
   }
 
-  return { entries, alreadyInstalledCount, totalBytesToDownload, remoteMods };
+  return { entries, alreadyInstalledCount, totalBytesToDownload, remoteMods: mods };
+}
+
+/**
+ * Monta o plano de sincronização: busca a lista do host pela mesh, compara
+ * com o que já existe localmente (por hash, não só nome — um arquivo com
+ * nome certo mas conteúdo errado NÃO conta como já instalado) e retorna só
+ * o que falta baixar, já com a origem de cada um. Não baixa nada — isso é
+ * runModSync, chamado só depois que o usuário confirmar no modal.
+ */
+export async function planModSync(shortCode: string, instanceModsDir: string): Promise<ModSyncPlan> {
+  const [remoteMods, localHashes] = await Promise.all([
+    fetchRemoteModsList(shortCode),
+    listLocalModHashes(instanceModsDir),
+  ]);
+  return buildSyncPlan(remoteMods, localHashes, "mesh", true);
+}
+
+/** Busca, direto no disco (sem mesh), a lista de mods da pasta mods/ de um servidor local — usado quando o próprio host quer jogar no seu servidor. */
+export async function fetchLocalServerMods(serverDir: string): Promise<RemoteModEntry[]> {
+  return await invoke<RemoteModEntry[]>("list_local_server_mods", { serverDir });
+}
+
+/** Mesmo papel de planModSync, mas para o servidor do próprio host: lê a lista de mods direto da pasta do servidor no disco, sem passar pela mesh. */
+export async function planLocalModSync(serverDir: string, instanceModsDir: string): Promise<ModSyncPlan> {
+  const [localMods, localHashes] = await Promise.all([
+    fetchLocalServerMods(serverDir),
+    listLocalModHashes(instanceModsDir),
+  ]);
+  return buildSyncPlan(localMods, localHashes, "local", false);
 }
 
 export interface RunModSyncOptions {
@@ -168,6 +197,50 @@ export async function runModSync(opts: RunModSyncOptions): Promise<void> {
 
     try {
       await invoke("download_mod_file", { url, destPath, expectedSha1: mod.sha1 });
+      entry.status = "ok";
+    } catch (err) {
+      entry.status = "failed";
+      entry.error = String(err);
+    }
+    onProgress([...entries]);
+  }
+}
+
+export interface RunLocalModSyncOptions {
+  /** Pasta raiz do servidor local (contém a pasta mods/) — ver ServerInfo.path em src/lib/server.ts. */
+  serverDir: string;
+  instanceModsDir: string;
+  remoteMods: RemoteModEntry[];
+  entries: ModSyncEntry[];
+  onProgress: (entries: ModSyncEntry[]) => void;
+}
+
+/**
+ * Mesmo papel de runModSync, mas para o servidor do próprio host: copia os
+ * arquivos direto da pasta mods/ do servidor no disco (sem download por
+ * rede) — usado pelo fluxo "Jogar" na aba Convidado, para "Meus Servidores".
+ */
+export async function runLocalModSync(opts: RunLocalModSyncOptions): Promise<void> {
+  const { serverDir, instanceModsDir, remoteMods, entries, onProgress } = opts;
+  const byFilename = new Map(remoteMods.map((m) => [m.filename, m]));
+
+  for (const entry of entries) {
+    const mod = byFilename.get(entry.filename);
+    if (!mod) {
+      entry.status = "failed";
+      entry.error = "Mod não está mais na pasta do servidor (pode ter sido removido durante a sincronização).";
+      onProgress([...entries]);
+      continue;
+    }
+
+    entry.status = "downloading";
+    onProgress([...entries]);
+
+    const fromPath = await join(serverDir, "mods", entry.filename);
+    const toPath = await join(instanceModsDir, entry.filename);
+
+    try {
+      await invoke("copy_local_mod_file", { fromPath, toPath });
       entry.status = "ok";
     } catch (err) {
       entry.status = "failed";

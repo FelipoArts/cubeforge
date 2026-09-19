@@ -1,4 +1,4 @@
-import { Command } from "@tauri-apps/plugin-shell";
+import { invoke } from "@tauri-apps/api/core";
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { exists, mkdir, remove } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
@@ -64,60 +64,49 @@ async function installJREOnce(
   const attemptSuffix = maxAttempts > 1 ? ` (tentativa ${attempt}/${maxAttempts})` : "";
   onProgress({ status: `Consultando API Adoptium...${attemptSuffix}`, percent: 10 });
 
-  // 1. Get Download URL from Adoptium
-  const response = await fetch(
-    `https://api.adoptium.net/v3/binary/latest/${version}/ga/windows/x64/jdk/hotspot/normal/eclipse?project=jdk`
+  // 1. Resolve a URL de download e o checksum SHA256 esperado via API JSON da
+  // Adoptium (em vez de só seguir o redirect do endpoint /binary/latest, que não
+  // dá nenhum jeito de verificar integridade depois).
+  const assetsResponse = await fetch(
+    `https://api.adoptium.net/v3/assets/latest/${version}/hotspot?vendor=eclipse&os=windows&architecture=x64&image_type=jdk`
   );
-  
-  if (!response.ok) throw new Error("Falha ao consultar a API da Adoptium");
-  
-  const downloadUrl = response.url;
+
+  if (!assetsResponse.ok) throw new Error("Falha ao consultar a API da Adoptium");
+
+  const assets = (await assetsResponse.json()) as Array<{
+    binary: { package: { link: string; checksum: string } };
+  }>;
+  const asset = assets[0];
+  if (!asset) throw new Error("Nenhum build de JRE disponível na API da Adoptium para esta versão.");
+
+  const downloadUrl = asset.binary.package.link;
+  const expectedSha256 = asset.binary.package.checksum;
   const tempZip = await join(runtimeDir, `jre-${version}.zip`);
 
   onProgress({ status: "Baixando Java (isso pode demorar)...", percent: 30 });
 
-  // 2. Download and Extract using PowerShell (efficient and native)
-  // We use PowerShell to avoid bringing big zip libraries to the frontend
-  const psScript = `
-    # Forçar codificação UTF-8 para evitar erros de decodificação no Tauri
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    $OutputEncoding = [System.Text.Encoding]::UTF8
-    $ProgressPreference = 'SilentlyContinue'
+  try {
+    // 2. Download via Rust (reqwest), com verificação de SHA256 — mesmo comando
+    // já usado para o server.jar, sem depender de PowerShell nem interpolar a
+    // URL da resposta da API diretamente em um script.
+    await invoke("download_server_jar", {
+      url: downloadUrl,
+      destPath: tempZip,
+      expectedSha1: null,
+      expectedSha256,
+    });
 
-    $url = "${downloadUrl}"
-    $dest = "${tempZip}"
-    $extractPath = "${jrePath}"
-    
-    if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
-    New-Item -ItemType Directory -Path $extractPath | Out-Null
-    
-    Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-    Expand-Archive -Path $dest -DestinationPath $extractPath -Force
-    
-    # Move files up if they are inside a subfolder in the zip
-    $subfolder = Get-ChildItem -Path $extractPath | Where-Object { $_.PSIsContainer } | Select-Object -First 1
-    if ($subfolder) {
-      Move-Item -Path "$($subfolder.FullName)\\*" -Destination $extractPath -Force
-      Remove-Item -Path $subfolder.FullName -Recurse -Force
-    }
-    
-    Remove-Item -Path $dest -Force
-    Write-Output "JRE instalado com sucesso."
-  `;
+    onProgress({ status: "Instalando e extraindo...", percent: 70 });
 
-  const command = Command.create("powershell", ["-Command", psScript]);
-  
-  onProgress({ status: "Instalando e extraindo...", percent: 70 });
-  
-  const output = await command.execute();
-
-  if (output.code !== 0) {
-    console.error(output.stderr);
+    // 3. Extração em Rust com proteção contra zip-slip (enclosed_name), e já
+    // achata a pasta-raiz do JDK para dentro de jrePath.
+    await invoke("extract_jre_zip", { zipPath: tempZip, extractPath: jrePath });
+  } catch (err) {
     // Não deixar um zip parcial ou uma pasta de JRE pela metade entre tentativas —
     // sem isso, a tentativa seguinte podia herdar lixo do download interrompido.
     await remove(tempZip, { recursive: false }).catch(() => {});
     await remove(jrePath, { recursive: true }).catch(() => {});
-    throw new Error(`Erro na instalação do JRE: ${output.stderr}`);
+    throw new Error(`Erro na instalação do JRE: ${err}`);
   }
 
   onProgress({ status: "Java instalado com sucesso!", percent: 100 });

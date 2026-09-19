@@ -145,7 +145,7 @@ impl HttpTransport {
     }
 
     pub fn get_metrics(&self) -> ApiClientMetrics {
-        self.metrics.lock().unwrap().clone()
+        self.metrics.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -161,7 +161,7 @@ impl ApiTransport for HttpTransport {
         
         // Atualizar métricas
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
             metrics.requests_total += 1;
         }
 
@@ -193,7 +193,7 @@ impl ApiTransport for HttpTransport {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                let mut metrics = self.metrics.lock().unwrap();
+                let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
                 if e.is_timeout() {
                     metrics.timeout_total += 1;
                 } else {
@@ -214,7 +214,7 @@ impl ApiTransport for HttpTransport {
         let body: ApiResponse = match resp.json().await {
             Ok(b) => b,
             Err(e) => {
-                let mut metrics = self.metrics.lock().unwrap();
+                let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
                 metrics.failure_total += 1;
                 return Err(ApiError {
                     code: "PARSE_ERROR".into(),
@@ -227,7 +227,7 @@ impl ApiTransport for HttpTransport {
 
         // Atualizar métricas
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
             if body.success {
                 metrics.success_total += 1;
             } else {

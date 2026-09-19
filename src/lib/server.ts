@@ -830,9 +830,21 @@ export async function installForgeServer(
     // 3. Executar instalador headless via Rust (não bloqueia IPC do Tauri)
     onProgress({ status: "Executando instalador do Forge (pode levar alguns minutos)...", percent: 50 });
 
-    // Determinar versão do Java (Forge 1.17+ = Java 17, 1.16- = Java 8)
+    // Determinar versão do Java (Forge 1.17+ = Java 17, 1.16- = Java 8) e garantir
+    // que ela já está instalada — diferente do fluxo de "iniciar servidor", a
+    // criação nunca passava por essa checagem, então a primeira vez que alguém
+    // criava um servidor Forge/NeoForge pedindo uma versão de Java ainda não
+    // baixada nesta máquina falhava com "O sistema não pode encontrar o caminho
+    // especificado" ao tentar rodar o instalador.
     const javaVer = getJavaVersion(mcVersion);
-    const jrePath = await (await import("@/lib/jre")).getJREPath(javaVer);
+    const { getJREPath, isJREInstalled, installJRE } = await import("@/lib/jre");
+    if (!(await isJREInstalled(javaVer))) {
+      onProgress({ status: `Baixando Java ${javaVer} (necessário para este Forge)...`, percent: 35 });
+      await installJRE(javaVer, (p) => {
+        onProgress({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: 35 + Math.round((p.percent / 100) * 10) });
+      });
+    }
+    const jrePath = await getJREPath(javaVer);
     const javaExe = await join(jrePath, "bin", "java.exe");
 
     // Executa: java -jar installer.jar --installServer no Rust (comando dedicado)

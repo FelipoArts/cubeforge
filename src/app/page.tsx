@@ -20,8 +20,9 @@ import {
   type ServerInstallProgress,
 } from "@/lib/server";
 import { useTheme } from "next-themes";
-import { AppSettingsPanel } from "@/app/components/AppSettingsPanel";
+import { AppSettingsPanel, type SettingsCategory } from "@/app/components/AppSettingsPanel";
 import { CloseAppModal } from "@/app/components/CloseAppModal";
+import { OnboardingScreen } from "@/app/components/OnboardingScreen";
 import { DiagnosticsToasts, DiagnosticsBell } from "@/app/components/DiagnosticsCenter";
 import { pushDiagnostic } from "@/app/diagnostics";
 import { UpdateBanner } from "@/app/components/UpdateBanner";
@@ -77,6 +78,8 @@ export default function Home() {
     setSelectedServer,
     mode,
     setMode,
+    defaultTab,
+    setDefaultTab,
     serverStatus,
     setServerStatus,
     setLastCrashInfo,
@@ -161,6 +164,7 @@ export default function Home() {
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
+  const [appSettingsCategory, setAppSettingsCategory] = useState<SettingsCategory | undefined>(undefined);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [configServerDir, setConfigServerDir] = useState<string | null>(null);
@@ -846,6 +850,10 @@ export default function Home() {
     }
   };
 
+  if (defaultTab === null) {
+    return <OnboardingScreen mounted={mounted} onChoose={setDefaultTab} />;
+  }
+
   return (
     <div className="min-h-screen bg-theme-bg transition-colors duration-300">
       <DiagnosticsToasts />
@@ -895,7 +903,10 @@ export default function Home() {
             <DiagnosticsBell />
             <button
               type="button"
-              onClick={() => setShowAppSettings(true)}
+              onClick={() => {
+                setAppSettingsCategory(undefined);
+                setShowAppSettings(true);
+              }}
               title="Configurações"
               className="w-9 h-9 flex items-center justify-center rounded-xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors cursor-pointer"
             >
@@ -905,7 +916,11 @@ export default function Home() {
         </div>
       </header>
 
-      <AppSettingsPanel isOpen={showAppSettings} onClose={() => setShowAppSettings(false)} />
+      <AppSettingsPanel
+        isOpen={showAppSettings}
+        onClose={() => setShowAppSettings(false)}
+        initialCategory={appSettingsCategory}
+      />
       <CloseAppModal
         isOpen={showCloseConfirm}
         onClose={() => setShowCloseConfirm(false)}
@@ -955,6 +970,10 @@ export default function Home() {
             onSetServerConfigPort={setServerConfigPort}
             onSetShortCode={setShortCode}
             onRegisterServer={registerServerWithCentral}
+            onOpenSubscribe={() => {
+              setAppSettingsCategory("assinatura");
+              setShowAppSettings(true);
+            }}
           />
         ) : (
           <GuestView

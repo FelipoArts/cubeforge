@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Settings, X, Archive, Palette, User as UserIcon, Sparkles } from "lucide-react";
+import { Settings, X, Archive, Palette, User as UserIcon, Sparkles, Home, Monitor, Globe } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { join } from "@tauri-apps/api/path";
@@ -34,9 +34,10 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 15;
 // direto na store a cada mudança (sem botão "Salvar").
 // ============================================================
 
-type SettingsCategory = "backups" | "tema" | "conta" | "assinatura";
+export type SettingsCategory = "inicio" | "backups" | "tema" | "conta" | "assinatura";
 
 const CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Archive }[] = [
+  { id: "inicio", label: "Início", icon: Home },
   { id: "backups", label: "Backups", icon: Archive },
   { id: "tema", label: "Tema", icon: Palette },
   { id: "conta", label: "Conta", icon: UserIcon },
@@ -46,15 +47,27 @@ const CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Archive }[
 interface AppSettingsPanelProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Categoria exibida ao abrir o painel (ex: card "Cubicase Plus" no HostView pulando direto pra aba de assinatura). Padrão "backups". */
+  initialCategory?: SettingsCategory;
 }
 
-export function AppSettingsPanel({ isOpen, onClose }: AppSettingsPanelProps) {
-  const [category, setCategory] = useState<SettingsCategory>("backups");
+export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettingsPanelProps) {
+  const [category, setCategory] = useState<SettingsCategory>(initialCategory ?? "backups");
   const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  // Reabrir o painel sempre parte da categoria pedida (ex: link direto pra "assinatura"),
+  // sem carregar a última aba visitada de uma abertura anterior.
+  useEffect(() => {
+    if (isOpen) setCategory(initialCategory ?? "backups");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => setAppVersion(null));
   }, []);
+
+  const defaultTab = useAppStore((s) => s.defaultTab);
+  const setDefaultTab = useAppStore((s) => s.setDefaultTab);
 
   const autoBackupEnabled = useAppStore((s) => s.autoBackupEnabled);
   const setAutoBackupEnabled = useAppStore((s) => s.setAutoBackupEnabled);
@@ -318,6 +331,45 @@ export function AppSettingsPanel({ isOpen, onClose }: AppSettingsPanelProps) {
               </nav>
 
               <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
+                {category === "inicio" && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Aba ao abrir o app</label>
+                    <p className="text-[10px] text-theme-secondary pb-1">
+                      Qual tela aparece assim que o Cubicase é iniciado.
+                    </p>
+                    <div className="grid grid-cols-2 gap-3 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setDefaultTab("host")}
+                        className={cn(
+                          "text-left p-4 rounded-2xl border transition-colors cursor-pointer",
+                          defaultTab === "host"
+                            ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-900/20"
+                            : "border-theme-card hover:bg-theme-muted"
+                        )}
+                      >
+                        <Monitor className="w-4.5 h-4.5 text-indigo-600 mb-2" />
+                        <div className="text-sm font-bold text-theme-primary">Host</div>
+                        <div className="text-[10px] text-theme-secondary">Hospedar um servidor</div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDefaultTab("guest")}
+                        className={cn(
+                          "text-left p-4 rounded-2xl border transition-colors cursor-pointer",
+                          defaultTab === "guest"
+                            ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-900/20"
+                            : "border-theme-card hover:bg-theme-muted"
+                        )}
+                      >
+                        <Globe className="w-4.5 h-4.5 text-indigo-600 mb-2" />
+                        <div className="text-sm font-bold text-theme-primary">Convidado</div>
+                        <div className="text-[10px] text-theme-secondary">Conectar a um servidor</div>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {category === "backups" && (
                   <div className="space-y-5">
                     <div className="space-y-1.5">

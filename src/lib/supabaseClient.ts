@@ -3,7 +3,7 @@
 // ============================================================
 // URL e publishable key são públicas por design (o Supabase protege os
 // dados via RLS no banco, não escondendo essas credenciais) — mesmo nível
-// de confiança que DONATIONS_API_BASE em src/lib/donations.ts, por isso
+// de confiança que SUBSCRIPTIONS_API_BASE em src/lib/subscription.ts, por isso
 // hardcoded aqui, sem variável de ambiente (padrão já usado no resto do
 // app, que é distribuído como binário compilado).
 //

@@ -9,11 +9,6 @@
       "identifier": "shell:allow-execute",
       "allow": [
         {
-          "name": "powershell",
-          "cmd": "powershell",
-          "args": ["-Command", {"validator":"[\\s\\S]*"}]
-        },
-        {
           "name": "tsnet-node",
           "sidecar": true,
           "args": ["--config", {"validator":"[\\s\\S]*"}]

@@ -326,7 +326,7 @@ async fn start_network_node(
     // este guard, start_network_node simplesmente encerrava o nó anterior
     // (linha abaixo) sem avisar, e a aba Host continuava mostrando "Parar
     // Rede Mesh" como se sua própria rede ainda estivesse de pé.
-    if let Some(active_mode) = state.active_network_mode.lock().unwrap().clone() {
+    if let Some(active_mode) = state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if active_mode != mode {
             let msg = format!(
                 "Esta instalação já está com a rede mesh ativa como \"{}\". Pare-a antes de conectar como \"{}\". Se quiser jogar no seu próprio servidor a partir deste mesmo computador, conecte direto em localhost:{} — não precisa (e não é suportado) usar o modo Convidado para isso.",
@@ -342,7 +342,7 @@ async fn start_network_node(
     // 1. Parar qualquer nó que já esteja rodando (e encerrar/revogar a
     // ConnectionSession anterior, se houver)
     stop_network_node_internal(&app, &state).await?;
-    *state.active_network_mode.lock().unwrap() = Some(mode.clone());
+    *state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()) = Some(mode.clone());
     log_to_file(&app, "[start_network_node] Nó anterior encerrado, preparando novo nó...");
 
     // 2. Opt-in de desenvolvimento: se existir um `network_session.json` local
@@ -355,7 +355,7 @@ async fn start_network_node(
 
     if let Some(session) = mock_override {
         log_to_file(&app, "[MOCK] network_session.json local com provider=mock encontrado — usando provedor simulado.");
-        *state.is_mock_active.lock().unwrap() = true;
+        *state.is_mock_active.lock().unwrap_or_else(|e| e.into_inner()) = true;
 
         let app_clone = app.clone();
         let fake_ip = session.credentials.get("fakeIp")
@@ -400,7 +400,7 @@ async fn start_network_node(
     let installation_id = get_or_create_installation_id(&app);
     let api = Arc::new(ApiClient::new(ApiConfig { installation_id, ..Default::default() }));
     let session_manager = Arc::new(SessionManager::new(api));
-    *state.active_session_manager.lock().unwrap() = Some(session_manager.clone());
+    *state.active_session_manager.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_manager.clone());
 
     log_to_file(&app, "[start_network_node] Solicitando ConnectionSession à API central...");
     let session_resp = session_manager.start(&short_code, &mode, local_port).await.map_err(|e| {
@@ -428,7 +428,7 @@ async fn start_network_node(
     job_object::track_process(child.pid());
 
     // Guardar o processo filho no estado global
-    *state.sidecar_process.lock().unwrap() = Some(child);
+    *state.sidecar_process.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
 
     {
         // Escutar eventos do sidecar
@@ -479,14 +479,14 @@ async fn start_network_node(
                                                         break;
                                                     }
                                                     let player_count = app_for_hb.state::<AppState>()
-                                                        .minecraft_online_players.lock().unwrap().len() as u32;
+                                                        .minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
                                                     let _ = sm.send_heartbeat(player_count).await;
 
                                                     // Wake-on-demand: auto-shutdown por inatividade. Só ativa
                                                     // quando o recurso está armado (wake_on_demand = Some) —
                                                     // hospedagem comum, sem isso ligado, fica exatamente igual.
                                                     let wake_cfg = app_for_hb.state::<AppState>()
-                                                        .wake_on_demand.lock().unwrap().clone();
+                                                        .wake_on_demand.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                                     if let Some(cfg) = wake_cfg {
                                                         let state_now = app_for_hb.state::<AppState>();
                                                         if state_now.idle_shutdown_reset_requested.swap(false, Ordering::SeqCst) {
@@ -506,7 +506,7 @@ async fn start_network_node(
                                                                 stop_minecraft_server_internal(&app_for_hb, &state_ref).await;
                                                                 let _ = stop_network_node_internal(&app_for_hb, &state_ref).await;
                                                                 state_ref.idle_ticks.store(0, Ordering::SeqCst);
-                                                                let still_armed = state_ref.wake_on_demand.lock().unwrap().clone();
+                                                                let still_armed = state_ref.wake_on_demand.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                                                 drop(state_ref);
                                                                 if let Some(cfg2) = still_armed {
                                                                     let new_gen = app_for_hb.state::<AppState>()
@@ -534,7 +534,7 @@ async fn start_network_node(
                                     let detail = err_val.get("detail").and_then(|v| v.as_str()).unwrap_or("");
                                     let (title, message) = map_sidecar_error_code(code, detail);
                                     log_to_file(&app_clone, &format!("[Sidecar] Erro estruturado: código={}, detail={}", code, detail));
-                                    *app_clone.state::<AppState>().network_last_error.lock().unwrap() =
+                                    *app_clone.state::<AppState>().network_last_error.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some((title.clone(), message.clone()));
                                     let _ = app_clone.emit("network-diagnostic", DiagnosticPayload {
                                         level: "critical".to_string(),
@@ -624,7 +624,7 @@ async fn start_network_node(
                         let app_state = app_clone.state::<AppState>();
                         // Limpar o handle guardado no estado global — sem isso, get_system_status
                         // continua reportando a rede como "online" para sempre após o sidecar morrer.
-                        *app_state.sidecar_process.lock().unwrap() = None;
+                        *app_state.sidecar_process.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         // Diferenciar "usuário pediu para desconectar" (network_stop_requested)
                         // de "o sidecar morreu sozinho" (crash real) para não marcar uma
                         // desconexão manual como erro na Central de Diagnósticos.
@@ -641,7 +641,7 @@ async fn start_network_node(
                         // Causa específica já reportada via "network-diagnostic" enquanto o
                         // sidecar ainda rodava (ver parsing do stdout acima)? Se sim, evitar
                         // duplicar um segundo aviso genérico sobre o mesmo evento.
-                        let known_cause = app_state.network_last_error.lock().unwrap().take();
+                        let known_cause = app_state.network_last_error.lock().unwrap_or_else(|e| e.into_inner()).take();
                         let _ = app_clone.emit("network-status", NetworkStatusPayload {
                             status: "offline".to_string(),
                             ip: None,
@@ -733,14 +733,14 @@ async fn stop_network_node_internal(
     state: &tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     log_to_file(app, "=== PARANDO NÓ DE REDE ===");
-    *state.active_network_mode.lock().unwrap() = None;
+    *state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     // 1. Tratar limpeza do provedor simulado Mock
     // IMPORTANTE: O MutexGuard não é `Send` e não pode ser mantido vivo
     // durante um `.await`. Por isso, extraímos o valor e liberamos o lock
     // dentro de um bloco de escopo `{ }` antes de qualquer ponto de suspensão.
     let was_mock_active = {
-        let mut mock_active = state.is_mock_active.lock().unwrap();
+        let mut mock_active = state.is_mock_active.lock().unwrap_or_else(|e| e.into_inner());
         let was_active = *mock_active;
         *mock_active = false; // Desativa o mock e libera o guard ao sair do bloco
         was_active
@@ -766,7 +766,7 @@ async fn stop_network_node_internal(
     // este caminho também roda no início de todo novo `start_network_node` —
     // pode encontrar a sessão em qualquer estado, inclusive ainda conectando.
     let session_id_ended = {
-        let sm_opt = state.active_session_manager.lock().unwrap().take();
+        let sm_opt = state.active_session_manager.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(sm) = sm_opt {
             let sid = sm.get_session_id();
             sm.cleanup().await;
@@ -787,7 +787,7 @@ async fn stop_network_node_internal(
     // 3. Tratar limpeza do processo do provedor Tailscale
     // Mesmo padrão: extrair e liberar o guard antes de qualquer operação assíncrona
     let child_to_kill = {
-        let mut process = state.sidecar_process.lock().unwrap();
+        let mut process = state.sidecar_process.lock().unwrap_or_else(|e| e.into_inner());
         process.take() // Remove o processo do estado e libera o guard
     };
     let had_child = child_to_kill.is_some();
@@ -1058,11 +1058,35 @@ fn prepare_launcher_profile(
 #[tauri::command]
 fn open_minecraft_launcher() -> Result<(), String> {
     if cfg!(target_os = "windows") {
-        // Ativa o app via seu Package Family Name (mecanismo padrão do Windows
-        // para abrir apps MSIX/Microsoft Store por linha de comando) — mais
-        // robusto do que um caminho de .exe, que muda a cada atualização do launcher.
+        // Instalação "clássica" (instalador baixado em minecraft.net, fora da
+        // Store): um .exe comum num caminho previsível, checável em disco.
+        // Preferimos isso a "shell:AppsFolder" abaixo porque explorer.exe NÃO
+        // retorna erro quando o App ID informado não existe — ele simplesmente
+        // abre uma janela qualquer do Explorer (tipicamente a pasta Documentos),
+        // dando a falsa impressão de que o launcher abriu quando na verdade
+        // só existe a instalação clássica, sem o pacote MSIX/Store.
+        let classic_launcher = ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"]
+            .iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .map(|base| PathBuf::from(base).join("Minecraft Launcher").join("MinecraftLauncher.exe"))
+            .find(|path| path.is_file());
+
+        if let Some(exe) = classic_launcher {
+            std::process::Command::new(&exe)
+                .spawn()
+                .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+            return Ok(());
+        }
+
+        // Sem instalação clássica encontrada: ativa o app via seu Package Family
+        // Name + App ID (mecanismo padrão do Windows para abrir apps MSIX/
+        // Microsoft Store por linha de comando — "shell:AppsFolder\<PFN>!<AppId>").
+        // O App ID é "!Minecraft", não "!App" (confirmado via `Get-StartApps`;
+        // "!App" é um ID genérico que não existe nesse pacote, e por isso
+        // explorer.exe caía no comportamento de abrir uma pasta qualquer em vez
+        // de sinalizar erro).
         std::process::Command::new("explorer.exe")
-            .arg("shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!App")
+            .arg("shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!Minecraft")
             .spawn()
             .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
     } else if cfg!(target_os = "macos") {
@@ -1153,6 +1177,72 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
     Err(format!("Falha ao baixar após {} tentativas: {}", MAX_ATTEMPTS, last_err))
 }
 
+/// Extrai o zip da JRE (baixado via `download_server_jar`, já com verificação de
+/// SHA256) para `extract_path`, usando `enclosed_name()` para bloquear zip-slip
+/// — mesma defesa já usada em `extract_modpack_overrides` — e substitui o antigo
+/// fluxo em PowerShell (Expand-Archive + Move-Item), que não validava os caminhos
+/// dentro do zip. Depois achata a estrutura: os pacotes da Adoptium sempre
+/// empacotam o JDK dentro de uma única pasta-raiz (ex.: "jdk-21.0.12+9/"), e o
+/// resto do app espera `bin/java.exe` direto em `extract_path`.
+#[tauri::command]
+async fn extract_jre_zip(zip_path: String, extract_path: String) -> Result<(), String> {
+    let extract_root = PathBuf::from(&extract_path);
+    if extract_root.exists() {
+        std::fs::remove_dir_all(&extract_root).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&extract_root).map_err(|e| e.to_string())?;
+
+    let result: Result<(), String> = (|| {
+        let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let enclosed = match entry.enclosed_name() {
+                Some(p) => p,
+                None => continue,
+            };
+            let out_path = extract_root.join(&enclosed);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Achata a pasta-raiz única do zip (ex.: "jdk-21.0.12+9/") movendo seu
+        // conteúdo para extract_root, replicando o que o script PowerShell antigo fazia.
+        let entries: Vec<_> = std::fs::read_dir(&extract_root)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .collect();
+        if entries.len() == 1 && entries[0].path().is_dir() {
+            let subfolder = entries[0].path();
+            for child in std::fs::read_dir(&subfolder).map_err(|e| e.to_string())? {
+                let child = child.map_err(|e| e.to_string())?;
+                let dest = extract_root.join(child.file_name());
+                std::fs::rename(child.path(), dest).map_err(|e| e.to_string())?;
+            }
+            std::fs::remove_dir_all(&subfolder).map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_file(&zip_path);
+
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&extract_root);
+    }
+
+    result
+}
+
 /// Calcula o SHA1 de um arquivo local qualquer — usado pelo front-end na
 /// sincronização de mods do convidado, pra comparar o que já existe na
 /// instância isolada local contra o que o host diz que o servidor precisa
@@ -1161,6 +1251,36 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
 #[tauri::command]
 async fn compute_file_sha1(path: String) -> Result<String, String> {
     sha1_of_file(std::path::Path::new(&path))
+}
+
+/// Equivalente local de "GET /mods" (ver handle_mods_list) — usado quando o
+/// próprio host quer jogar no seu servidor (fluxo "Jogar" na aba Convidado
+/// para "Meus Servidores"): resolve a lista de mods direto da pasta do
+/// servidor no disco, sem passar pela mesh (o host não conecta na própria
+/// rede). `resolve_server_mods` faz IO bloqueante + uma chamada de rede
+/// síncrona (via runtime Tokio próprio) — roda numa thread dedicada do pool
+/// de blocking pra não travar o runtime async dos outros comandos Tauri.
+#[tauri::command]
+async fn list_local_server_mods(server_dir: String) -> Result<Vec<ModManifestEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || resolve_server_mods(std::path::Path::new(&server_dir)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Copia um mod direto da pasta mods/ do servidor local pra instância
+/// isolada do cliente (mesmo papel de `download_mod_file`, mas sem rede —
+/// usado pelo fluxo "Jogar" do próprio host, ver `list_local_server_mods`).
+#[tauri::command]
+async fn copy_local_mod_file(from_path: String, to_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if let Some(parent) = std::path::Path::new(&to_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::copy(&from_path, &to_path).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Baixa um mod (do CDN do Modrinth ou direto do host pela mesh, via a rota
@@ -1373,9 +1493,9 @@ fn read_log_tail(server_dir: &str, max_lines: usize) -> Option<String> {
 /// Sem shortCode ativo (servidor nunca foi registrado na API Central), não há o
 /// que reportar.
 fn report_mc_status(app: &tauri::AppHandle, state: &AppState, status: &str) {
-    let short_code = state.active_short_code.lock().unwrap().clone();
+    let short_code = state.active_short_code.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(sc) = short_code {
-        let current_players = state.minecraft_online_players.lock().unwrap().len() as u32;
+        let current_players = state.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
         enqueue_operation(app, SyncOperationType::Heartbeat, serde_json::json!({
             "shortCode": sc,
             "status": status,
@@ -1510,10 +1630,10 @@ async fn start_minecraft_server(
         // do Fabric: a instalação inicial mantém o processo vivo por minutos
         // sem abrir a porta nem imprimir "Done (").
         state.minecraft_was_online.store(false, Ordering::SeqCst);
-        state.minecraft_online_players.lock().unwrap().clear();
-        *state.minecraft_stdin.lock().unwrap() = stdin;
-        *state.minecraft_process.lock().unwrap() = Some(child);
-        *state.minecraft_last_error.lock().unwrap() = None;
+        state.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner()) = stdin;
+        *state.minecraft_process.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+        *state.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     // --- Nomes dos crash-reports ANTES de o servidor iniciar ---
@@ -1561,7 +1681,7 @@ async fn start_minecraft_server(
                         // Guardar a causa raiz do crash (primeiro padrão reconhecido vence —
                         // erros em cascata depois costumam ser só consequência do primeiro).
                         if let Some(cause) = detect_known_mc_error(&l) {
-                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap();
+                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner());
                             if last_error.is_none() {
                                 *last_error = Some(cause);
                             }
@@ -1570,7 +1690,7 @@ async fn start_minecraft_server(
                         // minecraft_online_players) em sincronia com o mesmo log que o
                         // frontend já usa para o painel de Jogadores.
                         if let Some((name, joined)) = parse_player_event(&l) {
-                            let mut players = state_ref.minecraft_online_players.lock().unwrap();
+                            let mut players = state_ref.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner());
                             if joined {
                                 players.insert(name);
                             } else {
@@ -1597,7 +1717,7 @@ async fn start_minecraft_server(
                         let _ = app_stderr.emit("minecraft-log", &l);
                         if let Some(cause) = detect_known_mc_error(&l) {
                             let state_ref = unsafe { &*(state_stderr_handle as *const AppState) };
-                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap();
+                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner());
                             if last_error.is_none() {
                                 *last_error = Some(cause);
                             }
@@ -1619,7 +1739,7 @@ async fn start_minecraft_server(
             let process_alive = {
                 // SAFETY: o ponteiro é válido enquanto o AppState existir (vive todo o app)
                 let state_ref = unsafe { &*(state_tcp_handle as *const AppState) };
-                let mut guard = state_ref.minecraft_process.lock().unwrap();
+                let mut guard = state_ref.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref mut child) = *guard {
                     matches!(child.try_wait(), Ok(None))
                 } else {
@@ -1669,7 +1789,7 @@ async fn start_minecraft_server(
         loop {
             let state_ref = unsafe { &*(state_resources_handle as *const AppState) };
             let process_alive = {
-                let mut guard = state_ref.minecraft_process.lock().unwrap();
+                let mut guard = state_ref.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref mut child) = *guard {
                     matches!(child.try_wait(), Ok(None))
                 } else {
@@ -1706,7 +1826,7 @@ async fn start_minecraft_server(
                 process_cpu_percent,
             };
 
-            *state_ref.minecraft_last_resource_sample.lock().unwrap() = Some(sample.clone());
+            *state_ref.minecraft_last_resource_sample.lock().unwrap_or_else(|e| e.into_inner()) = Some(sample.clone());
             let _ = app_resources.emit("mc-resource-sample", sample);
 
             std::thread::sleep(Duration::from_secs(15));
@@ -1738,26 +1858,48 @@ async fn start_minecraft_server(
     std::thread::spawn(move || {
         log_to_file(&app_monitor, &format!("[MC-DEBUG] Thread de monitoramento iniciada. crash_reports_before={}", crash_reports_before.len()));
         
-        // Aguarda o processo terminar (bloqueante)
-        log_to_file(&app_monitor, "[MC-DEBUG] Aguardando child.wait()...");
-        let exit_code = {
+        // Aguarda o processo terminar via polling não-bloqueante (try_wait), soltando
+        // o lock entre uma tentativa e outra — mesmo padrão já usado pelas threads de
+        // TCP-poll e de amostragem de recursos logo abaixo.
+        //
+        // ANTES isso era um child.wait() (bloqueante) chamado SEGURANDO o lock de
+        // `minecraft_process` — como wait() só retorna quando o processo termina
+        // (minutos/horas depois), o Mutex ficava preso pelo tempo de vida INTEIRO do
+        // servidor. Toda outra thread que precisasse dele (a de polling TCP, e
+        // principalmente a de amostragem de recursos, que reafirma "online" pra API
+        // Central a cada ~45s pra não deixar o registro — TTL de 90s no Worker —
+        // expirar) ficava bloqueada pra sempre tentando adquiri-lo. Resultado: a
+        // reafirmação periódica travava assim que essa thread pegava o lock (early
+        // demais pra qualquer outra conseguir a vez), o status na API Central expirava
+        // sozinho ~90s depois e nunca mais era renovado — mesmo com o servidor 100%
+        // saudável — até alguém reiniciar o processo Java e sortear uma nova corrida
+        // pelo lock.
+        log_to_file(&app_monitor, "[MC-DEBUG] Aguardando saída do processo (polling não-bloqueante)...");
+        let exit_code = loop {
             let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
-            let mut guard = state_ref.minecraft_process.lock().unwrap();
-            log_to_file(&app_monitor, "[MC-DEBUG] Lock minecraft_process adquirido. Chamando child.wait()...");
-            if let Some(ref mut child) = *guard {
-                let result = child.wait();
-                log_to_file(&app_monitor, &format!("[MC-DEBUG] child.wait() retornou. Resultado: {:?}", result));
-                result.ok().and_then(|s| {
-                    let code = s.code();
-                    log_to_file(&app_monitor, &format!("[MC-DEBUG] ExitStatus.code() = {:?}", code));
-                    code
-                })
-            } else {
-                log_to_file(&app_monitor, "[MC-DEBUG] minecraft_process = None! Nenhum child para aguardar.");
-                None
+            let mut guard = state_ref.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let code = status.code();
+                        log_to_file(&app_monitor, &format!("[MC-DEBUG] try_wait() detectou saída. ExitStatus.code() = {:?}", code));
+                        break code;
+                    }
+                    Ok(None) => {
+                        drop(guard);
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Err(e) => {
+                        log_to_file(&app_monitor, &format!("[MC-DEBUG] Erro em try_wait(): {}", e));
+                        break None;
+                    }
+                },
+                None => {
+                    log_to_file(&app_monitor, "[MC-DEBUG] minecraft_process = None! Nenhum child para aguardar.");
+                    break None;
+                }
             }
         };
-        log_to_file(&app_monitor, &format!("[MC-DEBUG] Lock minecraft_process liberado após child.wait()."));
 
         log_to_file(&app_monitor, &format!("[MC] Processo Java encerrado. Código de saída: {:?}", exit_code));
 
@@ -1825,7 +1967,7 @@ async fn start_minecraft_server(
         // Causa específica capturada pelas threads de stdout/stderr (se alguma).
         let known_cause = {
             let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
-            state_ref.minecraft_last_error.lock().unwrap().take()
+            state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner()).take()
         };
 
         if is_normal_shutdown && !is_crash_by_report {
@@ -1853,7 +1995,7 @@ async fn start_minecraft_server(
             // diferenciar "aumente a RAM alocada" de "o computador não tem RAM suficiente".
             let resource_snapshot = {
                 let state_ref = unsafe { &*(state_monitor_handle as *const AppState) };
-                state_ref.minecraft_last_resource_sample.lock().unwrap().clone()
+                state_ref.minecraft_last_resource_sample.lock().unwrap_or_else(|e| e.into_inner()).clone()
             };
 
             let (code, title, message) = known_cause.unwrap_or_else(|| (
@@ -2301,7 +2443,7 @@ async fn stop_minecraft_server_internal(
 
     // Enviar comando `stop` para o stdin do servidor
     let has_stdin = {
-        let mut stdin_guard = state.minecraft_stdin.lock().unwrap();
+        let mut stdin_guard = state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut stdin) = *stdin_guard {
             let _ = stdin.write_all(b"stop\n");
             let _ = stdin.flush();
@@ -2324,7 +2466,7 @@ async fn stop_minecraft_server_internal(
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let still_running = {
-            let mut guard = state.minecraft_process.lock().unwrap();
+            let mut guard = state.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut child) = *guard {
                 matches!(child.try_wait(), Ok(None))
             } else {
@@ -2336,7 +2478,7 @@ async fn stop_minecraft_server_internal(
 
     // Forçar finalização se ainda estiver rodando
     {
-        let mut guard = state.minecraft_process.lock().unwrap();
+        let mut guard = state.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut child) = *guard {
             if matches!(child.try_wait(), Ok(None)) {
                 log_to_file(app, "[MC] Forçando encerramento do processo Java.");
@@ -2346,7 +2488,7 @@ async fn stop_minecraft_server_internal(
         // Limpar o processo do estado
         *guard = None;
     }
-    *state.minecraft_stdin.lock().unwrap() = None;
+    *state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Envia um comando de texto para o stdin do servidor Minecraft.
@@ -2363,7 +2505,7 @@ async fn send_minecraft_command(
         state.minecraft_stop_requested.store(true, Ordering::SeqCst);
     }
     
-    let mut stdin_guard = state.minecraft_stdin.lock().unwrap();
+    let mut stdin_guard = state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref mut stdin) = *stdin_guard {
         let line = format!("{}\n", trimmed);
         stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
@@ -2430,11 +2572,11 @@ async fn get_system_status(
 
     // Verificar se o sidecar de rede ainda está rodando
     let net_status = {
-        let process = state.sidecar_process.lock().unwrap();
+        let process = state.sidecar_process.lock().unwrap_or_else(|e| e.into_inner());
         if process.is_some() {
             "online"
         } else {
-            let mock_active = state.is_mock_active.lock().unwrap();
+            let mock_active = state.is_mock_active.lock().unwrap_or_else(|e| e.into_inner());
             if *mock_active { "online" } else { "offline" }
         }
     };
@@ -2443,7 +2585,7 @@ async fn get_system_status(
     // DE QUEM é a conexão que está de pé (ver active_network_mode em AppState).
     // Sem isso, ao recarregar com uma conexão de guest ativa, a aba Host não
     // tinha como saber que "Parar Rede Mesh" não é sobre a rede dela.
-    let net_mode = state.active_network_mode.lock().unwrap().clone();
+    let net_mode = state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     log_to_file(&app, &format!("[get_system_status] MC={}, Net={}, NetMode={:?}", mc_status, net_status, net_mode));
 
@@ -3310,6 +3452,22 @@ fn zip_has_prefix(archive: &mut zip::ZipArchive<File>, prefix: &str) -> bool {
     false
 }
 
+/// Extrai só o nome do arquivo final de um `path` vindo do `modrinth.index.json`
+/// de um modpack importado, descartando qualquer estrutura de diretório —
+/// o frontend (parseModpack em modpackImport.ts) sempre instala mods direto em
+/// "mods/<filename>", nunca preservando subpastas, então isso não muda o
+/// comportamento para modpacks legítimos. Sem isso, um `path` malicioso como
+/// "..\\..\\..\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\x.jar"
+/// (o JS só removia segmentos separados por "/", não por "\\") permitia escrever
+/// fora da pasta do servidor via `download_server_jar`.
+fn safe_mod_filename(raw: &str) -> String {
+    raw.split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .last()
+        .unwrap_or("mod.jar")
+        .to_string()
+}
+
 /// Lê o manifest de um modpack (.zip da CurseForge ou .mrpack do Modrinth)
 /// sem extrair nada — usado para a tela de confirmação antes do import real.
 #[tauri::command]
@@ -3395,7 +3553,7 @@ async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummar
             .filter_map(|f| {
                 let url = f.downloads.first().cloned()?;
                 Some(ModrinthManifestFile {
-                    path: f.path,
+                    path: safe_mod_filename(&f.path),
                     url,
                     sha1: f.hashes.and_then(|h| h.sha1),
                     file_size: f.file_size,
@@ -3671,7 +3829,7 @@ fn handle_registry_connection(
         "/registry/resolve" | "/resolve" => {
             let code = query_param(&url, "code").unwrap_or_default();
             eprintln!("[Registry] Resolvendo código: '{}'", code);
-            let found = registry.entries.lock().unwrap().get(&code).cloned();
+            let found = registry.entries.lock().unwrap_or_else(|e| e.into_inner()).get(&code).cloned();
             match found {
                 Some(entry) => {
                     let json = serde_json::to_string(&entry).unwrap_or_default();
@@ -3705,11 +3863,11 @@ fn hosted_server_dir_for_code(
     if code.is_empty() {
         return None;
     }
-    let hosted_code = active_short_code.lock().unwrap().clone()?;
+    let hosted_code = active_short_code.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     if hosted_code != code {
         return None;
     }
-    active_server_dir.lock().unwrap().clone()
+    active_server_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// GET /mods?code={shortCode} — lista os mods da pasta mods/ do servidor
@@ -4102,7 +4260,7 @@ async fn update_server_registry(
         status,
         port,
     };
-    let mut entries = registry.entries.lock().unwrap();
+    let mut entries = registry.entries.lock().unwrap_or_else(|e| e.into_inner());
     entries.insert(short_code, entry);
     Ok(())
 }
@@ -4114,7 +4272,7 @@ async fn remove_server_registry(
     short_code: String,
 ) -> Result<(), String> {
     let registry = app.state::<Arc<ServerRegistry>>();
-    let mut entries = registry.entries.lock().unwrap();
+    let mut entries = registry.entries.lock().unwrap_or_else(|e| e.into_inner());
     entries.remove(&short_code);
     Ok(())
 }
@@ -4409,7 +4567,7 @@ async fn execute_sync_operation(
     
     // Atualizar telemetria
     {
-        let mut t = telemetry.lock().unwrap();
+        let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
         t.total_sync_attempts += 1;
         t.last_sync_time = Some(chrono::Utc::now().to_rfc3339());
         
@@ -4651,7 +4809,7 @@ async fn process_sync_queue(
         if op.retry_count >= 5 {
             log_to_file(&app, &format!("[SYNC] Operação {} excedeu 5 tentativas. Removendo da fila.", op.id));
             {
-                let mut t = telemetry.lock().unwrap();
+                let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
                 t.failed_operations += 1;
             }
             continue;
@@ -4670,7 +4828,7 @@ async fn process_sync_queue(
                 updated_op.last_attempt = Some(chrono::Utc::now().to_rfc3339());
                 
                 {
-                    let mut t = telemetry.lock().unwrap();
+                    let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
                     t.total_retries += 1;
                 }
                 
@@ -4685,7 +4843,7 @@ async fn process_sync_queue(
     
     // Atualizar telemetria
     {
-        let mut t = telemetry.lock().unwrap();
+        let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
         t.pending_operations = new_queue.operations.len();
     }
     
@@ -4722,10 +4880,10 @@ async fn sync_register_server(
     // saber qual servidor (e qual pasta) ESTE host está servindo agora — ver
     // AppState::active_server_dir e handle_mods_list.
     if let Some(ref sc) = short_code {
-        *state.active_short_code.lock().unwrap() = Some(sc.clone());
+        *state.active_short_code.lock().unwrap_or_else(|e| e.into_inner()) = Some(sc.clone());
     }
     if let Some(ref dir) = server_dir {
-        *state.active_server_dir.lock().unwrap() = Some(dir.clone());
+        *state.active_server_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
     }
 
     let payload = serde_json::json!({
@@ -4832,10 +4990,10 @@ async fn sync_delete_server(
     log_to_file(&app, &format!("[SYNC] sync_delete_server: short_code={}", short_code));
 
     {
-        let mut active = state.active_short_code.lock().unwrap();
+        let mut active = state.active_short_code.lock().unwrap_or_else(|e| e.into_inner());
         if active.as_deref() == Some(short_code.as_str()) {
             *active = None;
-            *state.active_server_dir.lock().unwrap() = None;
+            *state.active_server_dir.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
@@ -4905,7 +5063,7 @@ async fn regenerate_server_code(
     // memória — sem isso, heartbeats e o shutdown gracioso continuariam
     // reportando o código antigo, que a API acabou de invalidar.
     {
-        let mut active = state.active_short_code.lock().unwrap();
+        let mut active = state.active_short_code.lock().unwrap_or_else(|e| e.into_inner());
         if active.as_deref() == Some(short_code.as_str()) {
             *active = Some(new_short_code.clone());
         }
@@ -5096,7 +5254,7 @@ fn spawn_sleeping_loop(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>, gene
                         // `.await` direto: se `wake_from_sleep` (ou qualquer coisa
                         // que ela chama, incluindo start_network_node/
                         // start_minecraft_server) der panic — ex.: um
-                        // `.lock().unwrap()` em mutex poisoned — o panic dentro de
+                        // `.lock().unwrap_or_else(|e| e.into_inner())` em mutex poisoned — o panic dentro de
                         // uma task solta comum vai para o stderr, que builds de
                         // release sem console nenhum simplesmente descartam:
                         // pareceria com esta task "travando" pra sempre, sem
@@ -5164,7 +5322,7 @@ async fn arm_wake_on_demand(
 
     let generation = {
         let state = app.state::<AppState>();
-        *state.wake_on_demand.lock().unwrap() = Some(cfg.clone());
+        *state.wake_on_demand.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
         state.idle_ticks.store(0, Ordering::SeqCst);
         state.wake_loop_generation.fetch_add(1, Ordering::SeqCst) + 1
     };
@@ -5189,8 +5347,8 @@ async fn disarm_wake_on_demand(app: tauri::AppHandle) -> Result<(), String> {
     let (old_cfg, is_hosting_now) = {
         let state = app.state::<AppState>();
         state.wake_loop_generation.fetch_add(1, Ordering::SeqCst); // invalida qualquer loop de espera rodando
-        let old = state.wake_on_demand.lock().unwrap().take();
-        let hosting = state.active_network_mode.lock().unwrap().is_some();
+        let old = state.wake_on_demand.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let hosting = state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         (old, hosting)
     };
 
@@ -5236,7 +5394,7 @@ async fn get_sync_queue_status(
     telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
 ) -> Result<serde_json::Value, String> {
     let queue = load_sync_queue(&app);
-    let t = telemetry.lock().unwrap();
+    let t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
     
     Ok(serde_json::json!({
         "pendingOperations": queue.operations.len(),
@@ -5284,7 +5442,7 @@ async fn force_sync_now(
 async fn get_sync_telemetry(
     telemetry: tauri::State<'_, Arc<Mutex<SyncTelemetry>>>,
 ) -> Result<serde_json::Value, String> {
-    let t = telemetry.lock().unwrap();
+    let t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
     Ok(serde_json::json!({
         "totalSyncAttempts": t.total_sync_attempts,
         "totalSyncSuccess": t.total_sync_success,
@@ -5312,7 +5470,7 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
     state_ref.minecraft_stop_requested.store(true, Ordering::SeqCst);
 
     let has_stdin = {
-      let mut stdin_guard = state_ref.minecraft_stdin.lock().unwrap();
+      let mut stdin_guard = state_ref.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
       if let Some(ref mut stdin) = *stdin_guard {
         let _ = stdin.write_all(b"stop\n");
         let _ = stdin.flush();
@@ -5328,7 +5486,7 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
       for _ in 0..5 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let still_running = {
-          let mut guard = state_ref.minecraft_process.lock().unwrap();
+          let mut guard = state_ref.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
           if let Some(ref mut child) = *guard {
             matches!(child.try_wait(), Ok(None))
           } else {
@@ -5339,7 +5497,7 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
       }
 
       // Forçar kill se ainda estiver rodando
-      let mut guard = state_ref.minecraft_process.lock().unwrap();
+      let mut guard = state_ref.minecraft_process.lock().unwrap_or_else(|e| e.into_inner());
       if let Some(ref mut child) = *guard {
         if matches!(child.try_wait(), Ok(None)) {
           log_to_file(&app, "[SHUTDOWN] Forçando kill do servidor Minecraft.");
@@ -5347,14 +5505,14 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
         }
       }
       *guard = None;
-      *state_ref.minecraft_stdin.lock().unwrap() = None;
+      *state_ref.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
   }
 
   // 2. Parar sidecar Tailscale
   {
     let state_ref = app.state::<AppState>();
-    let mut process = state_ref.sidecar_process.lock().unwrap();
+    let mut process = state_ref.sidecar_process.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(child) = process.take() {
       log_to_file(&app, "[SHUTDOWN] Encerrando sidecar Tailscale.");
       let _ = child.kill();
@@ -5376,7 +5534,7 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
   {
     let sm_opt = {
       let state_ref = app.state::<AppState>();
-      let taken = state_ref.active_session_manager.lock().unwrap().take();
+      let taken = state_ref.active_session_manager.lock().unwrap_or_else(|e| e.into_inner()).take();
       taken
     };
     if let Some(sm) = sm_opt {
@@ -5580,8 +5738,11 @@ pub fn run() {
        prepare_launcher_profile,
        open_minecraft_launcher,
        download_server_jar,
+       extract_jre_zip,
        download_mod_file,
        compute_file_sha1,
+       list_local_server_mods,
+       copy_local_mod_file,
        start_minecraft_server,
        run_forge_installer,
        run_fabric_client_installer,

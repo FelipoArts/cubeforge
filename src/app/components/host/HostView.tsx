@@ -17,6 +17,7 @@ import {
   ChevronDown,
   Globe,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -43,7 +44,6 @@ import {
 import type { ResourceSnapshot } from "@/lib/resourceDiagnostics";
 import { getServerSlug, defaultSlugFor, inviteLinkUrl } from "@/lib/inviteLink";
 import { installModpack, type ParsedModpack } from "@/lib/modpackImport";
-import { DonationModal } from "./DonationModal";
 import { ServerConfigModal } from "@/app/ServerConfigModal";
 import { ConsolePanel } from "./ConsolePanel";
 import { ServerManagePanel } from "./ServerManagePanel";
@@ -108,6 +108,8 @@ interface HostViewProps {
   onSetServerConfigPort: (v: number) => void;
   onSetShortCode: (v: string) => void;
   onRegisterServer: (serverInfo: ServerInfo) => Promise<void>;
+  /** Abre as Configurações do app direto na aba "Assinatura" (card Cubicase Plus abaixo). */
+  onOpenSubscribe: () => void;
 }
 
 export function HostView({
@@ -150,6 +152,7 @@ export function HostView({
   onSetServerConfigPort,
   onSetShortCode,
   onRegisterServer,
+  onOpenSubscribe,
 }: HostViewProps) {
   // A conexão de rede ativa (se houver) pertence ao modo Convidado, não a este
   // painel — mostrar "Parar Rede Mesh" aqui seria afirmar que é a rede DESTE
@@ -185,7 +188,6 @@ export function HostView({
   const [isImporting, setIsImporting] = useState(false);
   const [showCrashDetail, setShowCrashDetail] = useState(false);
   const [showImportModpack, setShowImportModpack] = useState(false);
-  const [showDonationModal, setShowDonationModal] = useState(false);
   const [showRegenerateCode, setShowRegenerateCode] = useState(false);
   const [idleShutdownWarning, setIdleShutdownWarning] = useState<number | null>(null);
 
@@ -1171,30 +1173,26 @@ export function HostView({
             </div>
           </div>
 
-          {/* Suporte */}
+          {/* Cubicase Plus */}
           <div className="bg-indigo-600 p-6 rounded-[2rem] text-white shadow-theme-xl">
-            <h3 className="font-bold text-white mb-2">Suporte ao Cubicase</h3>
+            <h3 className="font-bold text-white mb-2 flex items-center gap-2">
+              <Sparkles className="w-4 h-4" /> Cubicase Plus
+            </h3>
             <p className="text-indigo-100 text-sm leading-relaxed mb-4">
-              O Cubicase Dash economiza taxas mensais de hosts cloud tradicionais. Apoie o projeto!
+              Servidor liga sozinho quando alguém entra e desliga sozinho quando fica vazio, além de endereço e link de convite personalizados.
             </p>
             <button
               type="button"
-              onClick={() => setShowDonationModal(true)}
+              onClick={onOpenSubscribe}
               className="w-full py-3 bg-white text-indigo-600 rounded-2xl font-bold text-sm hover:bg-indigo-50 transition-colors cursor-pointer flex items-center justify-center gap-2"
             >
-              Pagar uma Coquinha 🥤
+              Assinar Cubicase Plus
             </button>
           </div>
         </div>
       </div>
 
       {/* Modais */}
-      <DonationModal
-        isOpen={showDonationModal}
-        onClose={() => setShowDonationModal(false)}
-        onError={(message) => pushDiagnostic({ level: "error", source: "Doação", title: "Não foi possível abrir a página de doação", message })}
-      />
-
       <CreateServerModal
         isOpen={showCreateServer}
         onClose={() => onSetShowCreateServer(false)}

@@ -73,6 +73,14 @@ interface AppSettings {
   // Convidado te jogava de volta para a aba Host no meio de um teste.
   mode: "host" | "guest";
 
+  // Escolha feita na tela de boas-vindas (primeiro uso): qual aba deve abrir
+  // sempre que o app é iniciado. null enquanto o onboarding nunca rodou —
+  // é esse null que faz a OnboardingScreen aparecer (ver page.tsx). Editável
+  // depois em Configurações → Início. Diferente de `mode` acima: `mode` é a
+  // aba visível AGORA (muda ao clicar Host/Convidado no cabeçalho); esta aqui
+  // é só a preferência de qual aba `mode` deve assumir a cada boot do app.
+  defaultTab: "host" | "guest" | null;
+
   // Backup automático do mundo (parada/crash/sessão longa — ver
   // src/lib/autoBackup.ts). Preferência do usuário, então persistida.
   autoBackupEnabled: boolean;
@@ -142,6 +150,7 @@ interface AppSettings {
   setBackupSafetyNetIntervalHours: (hours: number) => void;
   setSelectedServer: (name: string | null) => void;
   setMode: (mode: "host" | "guest") => void;
+  setDefaultTab: (tab: "host" | "guest") => void;
   setRunningServer: (name: string | null) => void;
   setServerStatus: (status: ServerStatus) => void;
   setOnlinePlayers: (players: string[]) => void;
@@ -174,6 +183,7 @@ export const useAppStore = create<AppSettings>()(
       backupSafetyNetIntervalHours: 6,
       selectedServer: null,
       mode: "host",
+      defaultTab: null,
       runningServer: null,
       serverStatus: 'offline',
       onlinePlayers: [],
@@ -195,6 +205,9 @@ export const useAppStore = create<AppSettings>()(
       setBackupSafetyNetIntervalHours: (hours) => set({ backupSafetyNetIntervalHours: hours }),
       setSelectedServer: (name) => set({ selectedServer: name }),
       setMode: (mode) => set({ mode }),
+      // Grava a escolha do onboarding E já troca pra aba escolhida na hora
+      // (evita o usuário escolher "Convidado" e continuar vendo a tela de Host).
+      setDefaultTab: (tab) => set({ defaultTab: tab, mode: tab }),
       setRunningServer: (name) => set({ runningServer: name }),
       setServerStatus: (status) => set((state) => ({
         serverStatus: status,
@@ -277,6 +290,7 @@ export const useAppStore = create<AppSettings>()(
         backupSafetyNetIntervalHours: state.backupSafetyNetIntervalHours,
         selectedServer: state.selectedServer,
         mode: state.mode,
+        defaultTab: state.defaultTab,
         runningServer: state.runningServer,
         knownServers: state.knownServers,
         guestConnectedShortCode: state.guestConnectedShortCode,
@@ -284,6 +298,21 @@ export const useAppStore = create<AppSettings>()(
         logs: state.logs,
         mcLogsByServer: state.mcLogsByServer,
       }),
+      // Força `mode` a nascer igual à preferência (defaultTab) a cada boot do
+      // app — sem isso, `mode` (persistido só pra sobreviver a F5 durante dev)
+      // ficaria "grudado" na última aba vista antes de fechar o app, em vez de
+      // respeitar a preferência escolhida no onboarding/Configurações → Início.
+      // Precisa ser aqui no `merge` (não em `onRehydrateStorage`/useEffect):
+      // como localStorage é síncrono, a reidratação inteira roda de forma
+      // síncrona durante a criação da store, antes até da constante
+      // `useAppStore` terminar de ser atribuída — qualquer callback que
+      // referencie `useAppStore` nesse momento cai em erro de TDZ.
+      merge: (persistedState, currentState) => {
+        const merged = { ...currentState, ...(persistedState as Partial<AppSettings>) };
+        const persistedDefaultTab = (persistedState as Partial<AppSettings> | undefined)?.defaultTab;
+        if (persistedDefaultTab) merged.mode = persistedDefaultTab;
+        return merged;
+      },
     }
   )
 );

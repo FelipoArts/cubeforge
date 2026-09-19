@@ -7,7 +7,7 @@
 //
 // Fluxo (ver docs/entrar/index.html para o outro lado):
 //   1. requireAuth() abre https://cubicase.net/entrar/ no navegador do
-//      sistema (mesmo padrão de src/lib/donations.ts).
+//      sistema (mesmo padrão de src/lib/subscription.ts).
 //   2. O usuário loga por magic link, Google ou Discord nessa página.
 //   3. A página redireciona para cubicase://auth-callback#access_token=...
 //   4. O SO entrega essa URL de volta pro app — via onOpenUrl (primeira

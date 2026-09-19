@@ -30,10 +30,11 @@ import {
   installFabricClient,
   installForgeClient,
   getInstanceDir,
+  getLocalServerPort,
   findInstalledFabricVersion,
   findInstalledForgeVersion,
 } from "@/lib/clientSetup";
-import { planModSync, runModSync, INITIAL_PREP_STATE, type PrepState } from "@/lib/modSync";
+import { planModSync, runModSync, planLocalModSync, runLocalModSync, INITIAL_PREP_STATE, type PrepState } from "@/lib/modSync";
 import { connectAddressFor } from "@/lib/connectAddress";
 import { ModSyncModal } from "./ModSyncModal";
 
@@ -122,6 +123,9 @@ export function GuestView({
   const loaderLabel = (serverType: string): string =>
     serverType === "neoforge" ? "NeoForge" : serverType === "forge" ? "Forge" : "Fabric";
 
+  /** Pasta local (ServerInfo) do servidor do próprio host, se este KnownServer for "Meu" — usado pelo fluxo "Jogar" local (sem mesh). */
+  const getLocalServerInfo = (shortCode: string) => localServers.find(s => s.shortCode === shortCode) ?? null;
+
   const patchPrepState = (shortCode: string, patch: Partial<PrepState>) => {
     setPrepStates(prev => ({ ...prev, [shortCode]: { ...(prev[shortCode] ?? INITIAL_PREP_STATE), ...patch } }));
   };
@@ -135,6 +139,15 @@ export function GuestView({
       patchPrepState(server.shortCode, {
         phase: "error",
         errorMessage: `Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em ${connectAddressFor(server, minecraftPort)}.`,
+      });
+      return;
+    }
+
+    const localInfo = server.isOwnServer ? getLocalServerInfo(server.shortCode) : null;
+    if (server.isOwnServer && !localInfo) {
+      patchPrepState(server.shortCode, {
+        phase: "error",
+        errorMessage: "Não encontramos a pasta deste servidor no seu computador — ele pode ter sido removido.",
       });
       return;
     }
@@ -156,7 +169,9 @@ export function GuestView({
           loaderNote = already ? null : `Instalar o ${loaderLabel(server.serverType)} ${server.forgeVersion} no seu Minecraft (ainda não instalado).`;
         }
 
-        plan = await planModSync(server.shortCode, instanceModsDir);
+        plan = localInfo
+          ? await planLocalModSync(localInfo.path, instanceModsDir)
+          : await planModSync(server.shortCode, instanceModsDir);
       }
 
       patchPrepState(server.shortCode, {
@@ -194,6 +209,25 @@ export function GuestView({
         });
         return;
       }
+
+      // Servidor do próprio host: não há túnel mesh pra si mesmo, então
+      // adiciona diretamente o endereço local (127.0.0.1:<porta real>) na
+      // lista de Multiplayer do Minecraft — mesma cortesia que o convidado já
+      // recebe ao conectar (ver handleGuestConnect em page.tsx), só que aqui
+      // com a porta de verdade do server.properties, não a do túnel.
+      if (server.isOwnServer) {
+        const localInfo = getLocalServerInfo(server.shortCode);
+        if (localInfo) {
+          try {
+            const port = await getLocalServerPort(localInfo.path);
+            const address = port === 25565 ? "127.0.0.1" : `127.0.0.1:${port}`;
+            await invoke<string>("add_minecraft_server_entry", { name: server.name, address });
+          } catch (err) {
+            console.warn("[GuestView] Falha ao adicionar servidor local à lista de Multiplayer:", err);
+          }
+        }
+      }
+
       patchPrepState(server.shortCode, { phase: "done", versionId, gameDir, ...extra });
     } catch (err) {
       patchPrepState(server.shortCode, { phase: "error", errorMessage: String(err) });
@@ -210,6 +244,7 @@ export function GuestView({
     try {
       let versionId = server.version ?? "";
       let gameDir: string | null = null;
+      const localInfo = server.isOwnServer ? getLocalServerInfo(server.shortCode) : null;
 
       if (server.serverType === "fabric") {
         gameDir = await getInstanceDir(server.shortCode);
@@ -225,13 +260,23 @@ export function GuestView({
 
       if (ISOLATED_SERVER_TYPES.has(server.serverType) && current.modEntries.length > 0) {
         const entries = current.modEntries.map(e => ({ ...e }));
-        await runModSync({
-          shortCode: server.shortCode,
-          instanceModsDir: current.instanceModsDir,
-          remoteMods: current.remoteMods,
-          entries,
-          onProgress: (updated) => patchPrepState(server.shortCode, { modEntries: [...updated] }),
-        });
+        if (localInfo) {
+          await runLocalModSync({
+            serverDir: localInfo.path,
+            instanceModsDir: current.instanceModsDir,
+            remoteMods: current.remoteMods,
+            entries,
+            onProgress: (updated) => patchPrepState(server.shortCode, { modEntries: [...updated] }),
+          });
+        } else {
+          await runModSync({
+            shortCode: server.shortCode,
+            instanceModsDir: current.instanceModsDir,
+            remoteMods: current.remoteMods,
+            entries,
+            onProgress: (updated) => patchPrepState(server.shortCode, { modEntries: [...updated] }),
+          });
+        }
 
         if (entries.some(e => e.status === "failed")) {
           // Não prepara o perfil ainda — espera o jogador decidir (tentar de
@@ -256,19 +301,31 @@ export function GuestView({
     patchPrepState(server.shortCode, { phase: "syncing", stageMessage: "Tentando de novo os mods que falharam...", stagePercent: 50, modEntries: reset });
 
     const toRetry = reset.filter(e => e.status === "pending");
-    await runModSync({
-      shortCode: server.shortCode,
-      instanceModsDir: current.instanceModsDir,
-      remoteMods: current.remoteMods,
-      entries: toRetry,
-      onProgress: (updated) => {
-        setPrepStates(prev => {
-          const latest = prev[server.shortCode];
-          const merged = latest.modEntries.map(e => updated.find(u => u.filename === e.filename) ?? e);
-          return { ...prev, [server.shortCode]: { ...latest, modEntries: merged } };
-        });
-      },
-    });
+    const localInfo = server.isOwnServer ? getLocalServerInfo(server.shortCode) : null;
+    const onProgress = (updated: PrepState["modEntries"]) => {
+      setPrepStates(prev => {
+        const latest = prev[server.shortCode];
+        const merged = latest.modEntries.map(e => updated.find(u => u.filename === e.filename) ?? e);
+        return { ...prev, [server.shortCode]: { ...latest, modEntries: merged } };
+      });
+    };
+    if (localInfo) {
+      await runLocalModSync({
+        serverDir: localInfo.path,
+        instanceModsDir: current.instanceModsDir,
+        remoteMods: current.remoteMods,
+        entries: toRetry,
+        onProgress,
+      });
+    } else {
+      await runModSync({
+        shortCode: server.shortCode,
+        instanceModsDir: current.instanceModsDir,
+        remoteMods: current.remoteMods,
+        entries: toRetry,
+        onProgress,
+      });
+    }
 
     // `reset` e `toRetry` compartilham as MESMAS referências de objeto pros
     // itens que estavam "pending" — runModSync muta `entry.status` direto
@@ -706,6 +763,38 @@ export function GuestView({
   const isConnecting = netStatus === "connecting";
   const isOnline = netStatus === "online";
 
+  /**
+   * Botão "Jogar" para "Meus Servidores": o host não conecta na própria
+   * mesh (por isso o card nunca oferece "Conectar" pra si mesmo), mas o
+   * Minecraft já está rodando localmente — então em vez de só exibir um
+   * badge estático, abre direto o mesmo fluxo "Preparar e Jogar" (loader +
+   * mods + perfil do launcher), só que lendo os mods da pasta do servidor no
+   * disco e conectando em 127.0.0.1:<porta real>, sem precisar da rede mesh.
+   */
+  const renderOwnPlayButton = (server: KnownServer) => {
+    if (!PLAYABLE_SERVER_TYPES.has(server.serverType)) {
+      const display = getDisplayStatus(server);
+      return (
+        <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
+          <Zap className="w-3 h-3 text-indigo-400" />
+          {display.label}
+        </div>
+      );
+    }
+    const busy = prepModalFor === server.shortCode && prepStates[server.shortCode]?.phase !== "error" && prepStates[server.shortCode]?.phase !== "done";
+    return (
+      <button
+        type="button"
+        onClick={() => handlePrepareAndPlay(server)}
+        disabled={busy}
+        className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
+        title="Abre o Minecraft já configurado (loader, mods e versão certos) e conectado neste servidor local."
+      >
+        <Play className="w-3.5 h-3.5 fill-current" /> Jogar
+      </button>
+    );
+  };
+
   return (
     <div className="space-y-6">
       {/* Cabeçalho da Biblioteca */}
@@ -982,11 +1071,9 @@ export function GuestView({
                   </div>
                 ) : server.status === "online" ? (
                   server.isOwnServer ? (
-                    // Servidor do próprio host: não permite conectar (não pode conectar na própria mesh)
-                    <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
-                      <Zap className="w-3 h-3 text-indigo-400" />
-                      {display.label}
-                    </div>
+                    // Servidor do próprio host: não conecta na própria mesh, mas
+                    // já está rodando localmente — oferece "Jogar" em vez de "Conectar".
+                    renderOwnPlayButton(server)
                   ) : PLAYABLE_SERVER_TYPES.has(server.serverType) ? (
                     // Um clique conecta e já prepara + abre o Minecraft com o perfil certo
                     // selecionado (ver useEffect que dispara handleOpenLauncher assim que o
@@ -1031,15 +1118,21 @@ export function GuestView({
                     </button>
                   )
                 ) : server.minecraftStatus === "online" ? (
-                  // Minecraft de pé, mas sem a rede mesh do CubeForge: não dá pra conectar
-                  // por aqui — só via IP local (LAN) ou outra VPN que o host esteja usando.
-                  <div
-                    className="flex-1 h-10 rounded-xl bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-sky-600 dark:text-sky-400"
-                    title="O host ligou o servidor, mas não a rede mesh do CubeForge. Só dá pra entrar pelo IP local (LAN) ou outra VPN."
-                  >
-                    <Server className="w-3 h-3" />
-                    Sem rede mesh
-                  </div>
+                  server.isOwnServer ? (
+                    // Servidor do próprio host, mesh desligada: joga igual, direto
+                    // em 127.0.0.1 — não precisa da mesh pra acessar o próprio processo.
+                    renderOwnPlayButton(server)
+                  ) : (
+                    // Minecraft de pé, mas sem a rede mesh do CubeForge: não dá pra conectar
+                    // por aqui — só via IP local (LAN) ou outra VPN que o host esteja usando.
+                    <div
+                      className="flex-1 h-10 rounded-xl bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-sky-600 dark:text-sky-400"
+                      title="O host ligou o servidor, mas não a rede mesh do CubeForge. Só dá pra entrar pelo IP local (LAN) ou outra VPN."
+                    >
+                      <Server className="w-3 h-3" />
+                      Sem rede mesh
+                    </div>
+                  )
                 ) : server.minecraftStatus === "crashed" ? (
                   <div className="flex-1 h-10 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-rose-500">
                     <AlertTriangle className="w-3 h-3" />

@@ -35,6 +35,18 @@ export async function getInstanceDir(shortCode: string): Promise<string> {
   return await join(await appLocalDataDir(), "client_instances", shortCode);
 }
 
+/**
+ * Porta real (127.0.0.1) em que o servidor Minecraft local está escutando —
+ * lida direto do server.properties dele, não da porta do túnel mesh (que só
+ * existe para convidados). Usada pelo fluxo "Jogar" do próprio host, que
+ * conecta direto no processo local em vez de passar pela mesh.
+ */
+export async function getLocalServerPort(serverDir: string): Promise<number> {
+  const props = await invoke<Record<string, string>>("read_server_properties", { serverDir });
+  const port = Number(props["server-port"]);
+  return Number.isFinite(port) && port > 0 ? port : 25565;
+}
+
 interface FabricInstallerVersion {
   version: string;
   stable: boolean;

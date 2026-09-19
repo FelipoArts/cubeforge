@@ -197,7 +197,7 @@ impl SessionManager {
     pub async fn start(&self, short_code: &str, mode: &str, local_port: u16) -> Result<ConnectionSessionResponse, String> {
         // Verificar concorrência
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.status == SessionStatus::Creating
                 || state.status == SessionStatus::StartingProvider
                 || state.status == SessionStatus::WaitingProvider
@@ -213,7 +213,7 @@ impl SessionManager {
             .map_err(|e| format!("Erro interno: {}", e))?;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.status = SessionStatus::Creating;
             state.short_code = Some(short_code.to_string());
             state.timing = SessionTiming::default();
@@ -227,7 +227,7 @@ impl SessionManager {
             Ok(session) => {
                 // Transição: CREATING → STARTING_PROVIDER
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.session_id = Some(session.session_id.clone());
                     state.provider = Some(session.launcher.clone());
                     state.revision = 1;
@@ -239,7 +239,7 @@ impl SessionManager {
             }
             Err(err) => {
                 // Transição: CREATING → FAILED
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.status = SessionStatus::Failed;
                 state.termination_reason = Some(TerminationReason::ApiError);
                 state.timing.total_elapsed_ms = Some(state.timing.started_at.elapsed().as_millis() as u64);
@@ -254,7 +254,7 @@ impl SessionManager {
     // ============================================================
 
     pub fn set_waiting_provider(&self) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Self::validate_transition(&state.status, &SessionStatus::WaitingProvider)?;
         state.timing.provider_start_ms = Some(state.timing.started_at.elapsed().as_millis() as u64);
         state.status = SessionStatus::WaitingProvider;
@@ -271,7 +271,7 @@ impl SessionManager {
         let timing;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             Self::validate_transition(&state.status, &SessionStatus::Online)?;
             state.status = SessionStatus::Online;
             state.host_ip = Some(host_ip.to_string());
@@ -319,7 +319,7 @@ impl SessionManager {
             }
             if !succeeded {
                 // Se falhar ao notificar mesmo após as tentativas, entra em DEGRADED
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.status = SessionStatus::Degraded;
                 return Err(format!("Sidecar online, mas API falhou: {}", last_err));
             }
@@ -327,7 +327,7 @@ impl SessionManager {
 
         // Incrementar revision
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.revision += 1;
         }
 
@@ -342,7 +342,7 @@ impl SessionManager {
         let session_id;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.status = SessionStatus::Failed;
             state.termination_reason = Some(reason);
             state.timing.total_elapsed_ms = Some(state.timing.started_at.elapsed().as_millis() as u64);
@@ -364,7 +364,7 @@ impl SessionManager {
         let revision;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             Self::validate_transition(&state.status, &SessionStatus::Stopping)?;
             state.status = SessionStatus::Stopping;
             session_id = state.session_id.clone();
@@ -381,7 +381,7 @@ impl SessionManager {
         }
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.status = SessionStatus::Stopped;
             state.termination_reason = Some(TerminationReason::UserStopped);
             state.revision += 1;
@@ -398,7 +398,7 @@ impl SessionManager {
         let session_id;
 
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             session_id = state.session_id.clone();
         }
 
@@ -406,7 +406,7 @@ impl SessionManager {
             let _ = self.api.delete_connection_session(&sid, "application_closed").await;
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.status = SessionStatus::Cancelled;
         state.termination_reason = Some(TerminationReason::ApplicationClosed);
     }
@@ -417,7 +417,7 @@ impl SessionManager {
 
     pub async fn send_heartbeat(&self, players: u32) -> Result<(), String> {
         let (session_id, status) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (state.session_id.clone(), state.status)
         };
 
@@ -432,7 +432,7 @@ impl SessionManager {
             self.api.send_heartbeat(&sid, Some(metrics)).await
                 .map_err(|e| format!("Heartbeat falhou: {}", e))?;
 
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.heartbeat_count += 1;
         }
 
@@ -444,19 +444,19 @@ impl SessionManager {
     // ============================================================
 
     pub fn get_status(&self) -> SessionStatus {
-        self.state.lock().unwrap().status
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).status
     }
 
     pub fn get_session_id(&self) -> Option<String> {
-        self.state.lock().unwrap().session_id.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone()
     }
 
     pub fn get_host_ip(&self) -> Option<String> {
-        self.state.lock().unwrap().host_ip.clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).host_ip.clone()
     }
 
     pub fn get_heartbeat_count(&self) -> u64 {
-        self.state.lock().unwrap().heartbeat_count
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).heartbeat_count
     }
 }
 
@@ -493,7 +493,7 @@ mod tests {
     #[async_trait]
     impl ApiTransport for ScriptedTransport {
         async fn send(&self, _request: ApiRequest) -> Result<ApiResponse, ApiError> {
-            self.responses.lock().unwrap().pop_front().unwrap_or_else(|| {
+            self.responses.lock().unwrap_or_else(|e| e.into_inner()).pop_front().unwrap_or_else(|| {
                 fake_err("EXHAUSTED", "ScriptedTransport sem mais respostas roteirizadas")
             })
         }

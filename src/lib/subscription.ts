@@ -3,9 +3,9 @@
 // ============================================================
 // Leitura de status é direto no Supabase (RLS garante que o usuário só
 // enxerga a própria linha em `subscriptions`) — sem round-trip pelo Worker.
-// Checkout e portal de cobrança passam pelo Worker (mesmo padrão de
-// src/lib/donations.ts: abre a URL retornada no navegador do sistema, nunca
-// coleta cartão no app), autenticados com o access token do Supabase.
+// Checkout e portal de cobrança passam pelo Worker: abre a URL retornada no
+// navegador do sistema, nunca coleta cartão no app, autenticados com o
+// access token do Supabase.
 // ============================================================
 
 import { fetch } from "@tauri-apps/plugin-http";

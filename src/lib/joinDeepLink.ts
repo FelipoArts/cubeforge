@@ -41,11 +41,18 @@ function extractShortCode(url: string): string | null {
 }
 
 function handleJoinUrl(url: string): void {
+  // O esquema cubicase:// é compartilhado com outros fluxos (ex:
+  // cubicase://auth-callback do login, ver src/lib/auth.ts) — os dois
+  // listeners (onOpenUrl/getCurrent/deep-link-received) recebem TODAS as
+  // URLs entregues ao app, não só as do seu próprio prefixo. Uma URL que
+  // nem começa com JOIN_PREFIX simplesmente não é um convite e pertence a
+  // outro handler — ignorar em silêncio, sem avisar o usuário.
+  if (!url.startsWith(JOIN_PREFIX)) return;
+
   const code = extractShortCode(url);
   if (!code) {
-    // Não deveria acontecer (só registramos onOpenUrl/getCurrent pra este
-    // esquema), mas se acontecer é bom saber — evita um "não fez nada e
-    // ninguém sabe por quê" como o que motivou este comentário todo.
+    // Aqui sim é um convite de verdade (bate o prefixo) mas malformado —
+    // isso não deveria acontecer, então vale avisar.
     pushDiagnostic({
       level: "warning",
       source: "Convite",

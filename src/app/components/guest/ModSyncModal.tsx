@@ -53,7 +53,8 @@ export function ModSyncModal({
   const failedEntries = modEntries.filter((e) => e.status === "failed");
   const okCount = modEntries.filter((e) => e.status === "ok").length;
   const modrinthCount = modEntries.filter((e) => e.source === "modrinth").length;
-  const meshCount = modEntries.filter((e) => e.source === "mesh").length;
+  const meshCount = modEntries.filter((e) => e.source === "mesh" || e.source === "local").length;
+  const isLocalSync = modEntries.some((e) => e.source === "local");
   const canClose = phase === "confirm" || phase === "error" || phase === "done";
   const showFailureFooter = failedEntries.length > 0 && !state.acceptedPartial;
 
@@ -140,12 +141,14 @@ export function ModSyncModal({
                     <li className="flex items-start gap-2">
                       <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500 shrink-0 mt-0.5" />
                       <span>
-                        Baixar {modEntries.length} mod{modEntries.length !== 1 ? "s" : ""} (≈{formatBytes(state.totalBytesToDownload)})
+                        {isLocalSync ? "Copiar" : "Baixar"} {modEntries.length} mod{modEntries.length !== 1 ? "s" : ""} (≈{formatBytes(state.totalBytesToDownload)})
                         {modrinthCount > 0 && meshCount > 0 && (
-                          <> — {modrinthCount} direto do Modrinth, {meshCount} pelo próprio host</>
+                          <> — {modrinthCount} direto do Modrinth, {meshCount} {isLocalSync ? "direto da pasta do servidor" : "pelo próprio host"}</>
                         )}
                         {modrinthCount > 0 && meshCount === 0 && <> — direto do Modrinth</>}
-                        {modrinthCount === 0 && meshCount > 0 && <> — direto do host (não encontrados em catálogo público)</>}
+                        {modrinthCount === 0 && meshCount > 0 && (
+                          <> — {isLocalSync ? "direto da pasta do servidor no seu computador" : "direto do host (não encontrados em catálogo público)"}</>
+                        )}
                       </span>
                     </li>
                   ) : (
@@ -197,7 +200,7 @@ export function ModSyncModal({
                         {entry.filename}
                       </span>
                       <span className="text-[10px] text-theme-secondary shrink-0">
-                        {entry.status === "ok" ? "ok" : entry.status === "downloading" ? (entry.source === "modrinth" ? "Modrinth..." : "host...") : entry.status === "failed" ? "falhou" : ""}
+                        {entry.status === "ok" ? "ok" : entry.status === "downloading" ? (entry.source === "modrinth" ? "Modrinth..." : entry.source === "local" ? "copiando..." : "host...") : entry.status === "failed" ? "falhou" : ""}
                       </span>
                     </div>
                   ))}
