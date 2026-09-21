@@ -18,6 +18,13 @@
 //   painel -> relay -> agent (Fase 2 — já roteado, ainda não emitido pela UI):
 //     { type: "command", command } | { type: "start_server", serverId }
 //
+// O agent só empurra `status`/`server_list` por conta própria ao CONECTAR e
+// em mudanças de estado do Minecraft — não existe pedido do painel por um
+// resumo do estado atual. Por isso a DO guarda o último `status`/
+// `server_list` recebido (ctx.storage, sobrevive a hibernação) e repete pra
+// qualquer painel que conectar depois desses eventos (F5, segunda aba, etc.
+// — ver cacheAgentSnapshot / handleWebSocketUpgrade).
+//
 // Autenticação de cada lado acontece só aqui dentro (nunca no Worker "puro",
 // ver comentário em index.ts sobre por que o painel usa ticket em vez de
 // Authorization: o WebSocket do navegador não manda headers custom):
@@ -163,6 +170,20 @@ export class HostChannel {
       const agentConnected = this.ctx.getWebSockets('agent').length > 0;
       try {
         server.send(JSON.stringify({ type: agentConnected ? 'agent_connected' : 'agent_disconnected' }));
+        // O agent só empurra `status`/`server_list` por conta própria quando
+        // CONECTA (ou numa mudança de estado do Minecraft) — um painel que
+        // chega depois disso (ex: dar F5, abrir uma segunda aba) nunca via
+        // nada até o próximo evento, porque não existia como ele pedir um
+        // resumo do estado atual. Reproduz aqui o último retrato conhecido,
+        // guardado em ctx.storage por cacheAgentSnapshot.
+        if (agentConnected) {
+          const [lastStatus, lastServerList] = await Promise.all([
+            this.ctx.storage.get<string>('last:status'),
+            this.ctx.storage.get<string>('last:server_list'),
+          ]);
+          if (lastStatus) server.send(lastStatus);
+          if (lastServerList) server.send(lastServerList);
+        }
       } catch { /* conexão pode já ter caído antes deste send */ }
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -179,11 +200,29 @@ export class HostChannel {
 
   // ---- WebSocket Hibernation API ----
 
+  /** Guarda o último `status`/`server_list` recebido do agent, para poder repetir pra um painel que conecta depois (ver handleWebSocketUpgrade). */
+  private async cacheAgentSnapshot(raw: string): Promise<void> {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (parsed?.type === 'status' || parsed?.type === 'server_list') {
+      await this.ctx.storage.put(`last:${parsed.type}`, raw);
+    }
+  }
+
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const tags = this.ctx.getTags(ws);
     if (tags.includes('agent')) {
       // Log/status/lista de servidores do app desktop -> todos os painéis abertos.
-      this.broadcastToPanels(typeof message === 'string' ? JSON.parse(message) : message);
+      if (typeof message === 'string') {
+        await this.cacheAgentSnapshot(message);
+        this.broadcastToPanels(JSON.parse(message));
+      } else {
+        this.broadcastToPanels(message);
+      }
       return;
     }
     if (tags.includes('panel')) {
@@ -200,6 +239,7 @@ export class HostChannel {
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
+      await this.ctx.storage.delete(['last:status', 'last:server_list']);
       this.broadcastToPanels({ type: 'agent_disconnected' });
     }
     try { ws.close(); } catch { /* já fechado */ }
@@ -207,6 +247,7 @@ export class HostChannel {
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
+      await this.ctx.storage.delete(['last:status', 'last:server_list']);
       this.broadcastToPanels({ type: 'agent_disconnected' });
     }
   }
