@@ -85,6 +85,7 @@ export default function Home() {
     setLastCrashInfo,
     mcLogsByServer,
     setMcLogs: setMcLogsInStore,
+    importedServerPaths,
   } = useAppStore();
 
   // --- Estados locais (compartilhados entre Host e Guest) ---
@@ -697,6 +698,16 @@ export default function Home() {
       ensurePanelDeviceIfEligible().catch((err) => console.error("[panel] ensurePanelDeviceIfEligible falhou:", err))
     );
   }, []);
+
+  // Espelha a lista de servidores importados num arquivo local sempre que
+  // ela mudar, para o panel_agent (Rust) conseguir listá-los no painel web
+  // também — sem isso, o painel só veria os servidores da pasta padrão
+  // CubicaseServers. Ver src/lib/panelServers.ts.
+  useEffect(() => {
+    void import("@/lib/panelServers").then(({ syncImportedServersMirror }) =>
+      syncImportedServersMirror(importedServerPaths)
+    );
+  }, [importedServerPaths]);
 
   // Link de convite (cubicase://join/<shortCode>, ver play.cubicase.net/<slug>)
   // — mesmo padrão do listener de login acima, ver src/lib/joinDeepLink.ts.

@@ -16,11 +16,15 @@
 // usado pelo `network_session.json` (ver CLAUDE.md): arquivo local lido
 // pelo backend, sem o Rust precisar falar com o Supabase diretamente.
 //
-// Só conecta enquanto: (a) o arquivo do dispositivo existe, e (b) esta
-// instalação está hospedando pela rede mesh (active_network_mode == "host").
-// Não tenta adivinhar se a assinatura Plus está ativa — isso é responsabilidade
-// do Durable Object (ver verifyDeviceToken em host-channel.ts), que fecha a
-// conexão se a assinatura tiver expirado mesmo com o device_token válido.
+// Conecta sempre que houver um dispositivo pareado, independente de já
+// estar hospedando ou não — o próprio objetivo do painel é ligar um
+// servidor que está PARADO (ver plans/remote-web-panel-plan.md, Fase 2:
+// start_server), então a conexão não pode depender da rede mesh já estar
+// ativa, senão nunca haveria como receber esse comando em primeiro lugar.
+// Não tenta adivinhar se a assinatura Plus está ativa — isso é
+// responsabilidade do Durable Object (ver verifyDeviceToken em
+// host-channel.ts), que fecha a conexão se a assinatura tiver expirado
+// mesmo com o device_token válido.
 // ============================================================
 
 use std::time::Duration;
@@ -68,23 +72,75 @@ fn load_panel_device(app: &AppHandle) -> Option<PanelDeviceFile> {
     serde_json::from_str(&content).ok()
 }
 
-fn is_hosting(app: &AppHandle) -> bool {
-    let state = app.state::<AppState>();
-    let mode = state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner());
-    mode.as_deref() == Some("host")
+#[derive(Deserialize, Default)]
+struct ImportedServersMirror {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// Lê o mesmo caminho onde src/lib/panelServers.ts espelha
+/// `importedServerPaths` (store do Zustand, persistido só no localStorage da
+/// webview — sem isso o Rust não tem como saber quais são).
+fn load_imported_server_paths(app: &AppHandle) -> Vec<String> {
+    let Ok(data_dir) = app.path().app_local_data_dir() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(data_dir.join("imported_servers.json")) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<ImportedServersMirror>(&content)
+        .map(|m| m.paths)
+        .unwrap_or_default()
+}
+
+fn summarize_server_dir(path: &std::path::Path, active_dir: Option<&str>, has_running_process: bool) -> LocalServerSummary {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let mut version = "desconhecida".to_string();
+    let mut server_type = "vanilla".to_string();
+    let mut description = String::new();
+    let mut id = name.clone();
+
+    if let Ok(content) = std::fs::read_to_string(path.join("cubicase-meta.json")) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
+                version = v.to_string();
+            }
+            if let Some(v) = meta.get("serverType").and_then(|v| v.as_str()) {
+                server_type = v.to_string();
+            }
+            if let Some(v) = meta.get("description").and_then(|v| v.as_str()) {
+                description = v.to_string();
+            }
+            if let Some(v) = meta.get("uuid").and_then(|v| v.as_str()) {
+                id = v.to_string();
+            }
+        }
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let is_running = has_running_process && active_dir == Some(path_str.as_str());
+
+    LocalServerSummary {
+        id,
+        name,
+        version,
+        server_type,
+        description,
+        status: if is_running { "running".into() } else { "stopped".into() },
+    }
 }
 
 /// Réplica em Rust de listLocalServers (src/lib/server.ts) — o agent roda no
 /// backend e não pode depender da webview estar carregada para saber quais
-/// servidores existem localmente na pasta CubicaseServers.
+/// servidores existem localmente. Cobre as duas fontes que o frontend
+/// combina: a pasta padrão (Documents/CubicaseServers) e os servidores
+/// importados de um caminho arbitrário (ver load_imported_server_paths).
 fn scan_local_servers(app: &AppHandle) -> Vec<LocalServerSummary> {
     let mut servers = Vec::new();
-    let Ok(docs_dir) = app.path().document_dir() else {
-        return servers;
-    };
-    let Ok(entries) = std::fs::read_dir(docs_dir.join("CubicaseServers")) else {
-        return servers;
-    };
 
     let state = app.state::<AppState>();
     let active_dir = state
@@ -98,48 +154,38 @@ fn scan_local_servers(app: &AppHandle) -> Vec<LocalServerSummary> {
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        let mut version = "desconhecida".to_string();
-        let mut server_type = "vanilla".to_string();
-        let mut description = String::new();
-        let mut id = name.clone();
-
-        if let Ok(content) = std::fs::read_to_string(path.join("cubicase-meta.json")) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
-                    version = v.to_string();
+    match app.path().document_dir() {
+        Ok(docs_dir) => {
+            let servers_root = docs_dir.join("CubicaseServers");
+            match std::fs::read_dir(&servers_root) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            servers.push(summarize_server_dir(&path, active_dir.as_deref(), has_running_process));
+                        }
+                    }
                 }
-                if let Some(v) = meta.get("serverType").and_then(|v| v.as_str()) {
-                    server_type = v.to_string();
-                }
-                if let Some(v) = meta.get("description").and_then(|v| v.as_str()) {
-                    description = v.to_string();
-                }
-                if let Some(v) = meta.get("uuid").and_then(|v| v.as_str()) {
-                    id = v.to_string();
-                }
+                Err(e) => log_to_file(
+                    app,
+                    &format!("[PANEL] Não consegui ler {}: {}", servers_root.display(), e),
+                ),
             }
         }
-
-        let path_str = path.to_string_lossy().to_string();
-        let is_running = has_running_process && active_dir.as_deref() == Some(path_str.as_str());
-
-        servers.push(LocalServerSummary {
-            id,
-            name,
-            version,
-            server_type,
-            description,
-            status: if is_running { "running".into() } else { "stopped".into() },
-        });
+        Err(e) => log_to_file(app, &format!("[PANEL] document_dir() falhou: {}", e)),
     }
 
+    for imported in load_imported_server_paths(app) {
+        let path = std::path::Path::new(&imported);
+        if path.is_dir() {
+            servers.push(summarize_server_dir(path, active_dir.as_deref(), has_running_process));
+        }
+    }
+
+    log_to_file(
+        app,
+        &format!("[PANEL] server_list: {} servidor(es) encontrado(s).", servers.len()),
+    );
     servers
 }
 
@@ -264,14 +310,13 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
 
 /// Chamado uma vez em `run()` — mantém uma tentativa de conexão viva em
 /// segundo plano pela vida inteira do processo, sem bloquear o startup do
-/// app (não há nada pra esperar aqui: sem dispositivo pareado ou sem estar
-/// hospedando, o loop só fica de prontidão verificando de novo a cada
-/// alguns segundos).
+/// app (não há nada pra esperar aqui: sem dispositivo pareado, o loop só
+/// fica de prontidão verificando de novo a cada alguns segundos).
 pub fn spawn_panel_agent(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut backoff_index = 0usize;
         loop {
-            let device = load_panel_device(&app).filter(|_| is_hosting(&app));
+            let device = load_panel_device(&app);
 
             let Some(device) = device else {
                 tokio::time::sleep(Duration::from_secs(NO_DEVICE_RETRY_SECS)).await;

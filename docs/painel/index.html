@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/assets/style.css" />
   <style>
     /* Só o que é específico desta página — o resto vem de assets/style.css. */
-    .panel-shell { max-width: 720px; margin: 0 auto; padding: 0 20px; }
+    .panel-shell { max-width: 560px; margin: 0 auto; padding: 0 20px; }
     .device-list { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
     .device-item {
       display: flex; align-items: center; justify-content: space-between;
@@ -24,32 +24,49 @@
     .device-item:hover { border-color: var(--border-strong); }
     .device-item .name { font-weight: 600; }
     .device-item .seen { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; padding: 0; white-space: nowrap; }
+
+    /* ---- Painel em si: dashboard de largura quase total, fora do cartão de login ---- */
+    .panel-dashboard { max-width: 1400px; margin: 0 auto; padding: 28px 24px 64px; }
+    .panel-top-bar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; justify-content: space-between;
+      margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--border);
+    }
+    .panel-top-bar .left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 0; }
+    .panel-top-bar .device-name { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .panel-stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 26px; }
+    .panel-stat {
+      background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md);
+      padding: 18px 20px; min-width: 0;
+    }
+    .panel-stat .label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+    .panel-stat .value { font-size: 22px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .panel-body-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+    @media (max-width: 860px) { .panel-body-grid { grid-template-columns: 1fr; } }
+    .panel-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 22px 24px;
+    }
+    .panel-card h2 { font-size: 15px; margin-bottom: 14px; }
     .panel-console {
       background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);
       padding: 14px 16px; font-family: "SF Mono", "Cascadia Code", ui-monospace, monospace;
-      font-size: 12.5px; color: var(--text-secondary); height: 320px; overflow-y: auto;
+      font-size: 12.5px; color: var(--text-secondary); height: 480px; overflow-y: auto;
       white-space: pre-wrap; word-break: break-word;
     }
     .panel-console div + div { margin-top: 3px; }
     .panel-server-row {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 10px 0; border-bottom: 1px solid var(--border);
+      padding: 12px 0; border-bottom: 1px solid var(--border);
     }
     .panel-server-row:last-child { border-bottom: none; }
+    .panel-empty-note { color: var(--text-muted); font-size: 13px; }
     .status-pill.is-offline { color: var(--text-muted); }
     .status-pill.is-offline .blip { background: var(--text-muted); box-shadow: none; animation: none; }
-    .top-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; justify-content: space-between; margin-bottom: 24px; }
-    .top-bar .device-name { font-size: 13px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; padding: 0; white-space: nowrap; }
-    /* .mockup-stat-grid/.mockup-stat vêm de assets/style.css (pensados para o
-       mockup estático da home, num card mais largo) — min-width: 0 é o que
-       falta para as colunas do grid encolherem no card real e mais estreito
-       do painel em vez de estourar a largura em telas de celular. */
-    .panel-shell .mockup-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .panel-shell .mockup-stat { min-width: 0; }
-    .panel-shell .mockup-stat .value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     @media (max-width: 480px) {
       .download-card { padding: 24px; }
+      .panel-dashboard { padding: 20px 16px 48px; }
+      .panel-stat-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -64,7 +81,8 @@
     </div>
   </nav>
 
-  <header class="download-hero">
+  <!-- Login + escolha de dispositivo: cartão centralizado, como /entrar/. -->
+  <header class="download-hero" id="auth-screen">
     <div class="container panel-shell">
       <div class="eyebrow"><span class="dot"></span>Cubicase Plus</div>
       <h1>Painel</h1>
@@ -74,7 +92,6 @@
       </p>
 
       <div class="download-card" style="margin-top: 34px; text-align: left;">
-        <!-- Login (mesmo padrão de /entrar/, mas fica logado aqui — esta página é o destino, não uma ponte). -->
         <div id="login-form">
           <div class="login-providers">
             <button type="button" class="btn btn-ghost btn-block" id="btn-google">Continuar com Google</button>
@@ -99,30 +116,39 @@
           </p>
           <button type="button" class="link-btn" id="btn-logout" style="margin-top: 16px;">Sair</button>
         </div>
-
-        <!-- Painel em si, depois de escolher o dispositivo. -->
-        <div id="panel-view" hidden>
-          <div class="top-bar">
-            <span class="status-pill is-offline" id="agent-status"><span class="blip"></span><span id="agent-status-text">Conectando…</span></span>
-            <span class="device-name" id="device-name-label"></span>
-            <button type="button" class="link-btn" id="btn-change-device">Trocar computador</button>
-          </div>
-
-          <div class="mockup-stat-grid">
-            <div class="mockup-stat"><div class="label">Servidor</div><div class="value" id="stat-server-status">—</div></div>
-            <div class="mockup-stat"><div class="label">Jogadores</div><div class="value" id="stat-players">—</div></div>
-            <div class="mockup-stat"><div class="label">Nome</div><div class="value" id="stat-server-name">—</div></div>
-          </div>
-
-          <p class="hero-sub" style="text-align: left; margin: 0 0 8px; font-size: 13px;">Servidores neste computador</p>
-          <div id="server-list" style="margin-bottom: 22px;"></div>
-
-          <p class="hero-sub" style="text-align: left; margin: 0 0 8px; font-size: 13px;">Console (somente leitura por enquanto)</p>
-          <div class="panel-console" id="console"></div>
-        </div>
       </div>
     </div>
   </header>
+
+  <!-- Painel em si: fora do cartão de login, ocupa quase a largura toda. -->
+  <main class="panel-dashboard" id="panel-view" hidden>
+    <div class="panel-top-bar">
+      <div class="left">
+        <span class="status-pill is-offline" id="agent-status"><span class="blip"></span><span id="agent-status-text">Conectando…</span></span>
+        <span class="device-name" id="device-name-label"></span>
+      </div>
+      <button type="button" class="link-btn" id="btn-change-device">Trocar computador</button>
+    </div>
+
+    <div class="panel-stat-grid">
+      <div class="panel-stat"><div class="label">Servidor</div><div class="value" id="stat-server-status">—</div></div>
+      <div class="panel-stat"><div class="label">Jogadores</div><div class="value" id="stat-players">—</div></div>
+      <div class="panel-stat"><div class="label">Nome</div><div class="value" id="stat-server-name">—</div></div>
+    </div>
+
+    <div class="panel-body-grid">
+      <div class="panel-card">
+        <h2>Servidores neste computador</h2>
+        <div id="server-list"></div>
+        <p class="panel-empty-note" id="server-list-empty" hidden>Nenhum servidor encontrado neste computador ainda.</p>
+      </div>
+
+      <div class="panel-card">
+        <h2>Console (somente leitura por enquanto)</h2>
+        <div class="panel-console" id="console"></div>
+      </div>
+    </div>
+  </main>
 
   <script src="/assets/site.js"></script>
   <script type="module">
@@ -153,10 +179,18 @@
     });
 
     const el = (id) => document.getElementById(id);
+    const authScreen = el("auth-screen");
     const loginForm = el("login-form");
     const devicePicker = el("device-picker");
     const panelView = el("panel-view");
     const statusEl = el("login-status");
+
+    // Passo atual, para o listener de auth (abaixo) não "puxar o tapete" do
+    // painel já conectado quando o navegador refaz a checagem de sessão ao
+    // voltar o foco da aba (supabase-js reemite SIGNED_IN nesse momento —
+    // sem essa guarda, voltar pra aba resetava o painel pra tela de escolher
+    // computador do nada).
+    let currentStep = "login";
 
     function showStatus(message, isError = false) {
       statusEl.textContent = message;
@@ -165,6 +199,8 @@
     }
 
     function showStep(step) {
+      currentStep = step;
+      authScreen.hidden = step === "panel";
       loginForm.hidden = step !== "login";
       devicePicker.hidden = step !== "devices";
       panelView.hidden = step !== "panel";
@@ -264,6 +300,7 @@
       el("stat-players").textContent = "—";
       el("stat-server-name").textContent = "—";
       el("server-list").innerHTML = "";
+      el("server-list-empty").hidden = true;
       el("console").innerHTML = "";
     }
 
@@ -337,8 +374,11 @@
 
       if (msg.type === "server_list") {
         const container = el("server-list");
+        const empty = el("server-list-empty");
         container.innerHTML = "";
-        for (const s of msg.servers || []) {
+        const list = msg.servers || [];
+        empty.hidden = list.length > 0;
+        for (const s of list) {
           const row = document.createElement("div");
           row.className = "panel-server-row";
           const running = s.status === "running";
@@ -361,7 +401,11 @@
       else showStep("login");
     });
     supabase.auth.onAuthStateChange((event, session) => {
-      if (event === "SIGNED_IN" && session) loadDevices();
+      // SIGNED_IN pode reaparecer sozinho (ex: navegador reafirmando a
+      // sessão ao voltar o foco da aba) mesmo sem o usuário ter feito nada —
+      // só reage a isso enquanto ainda está na tela de login, pra não
+      // interromper quem já está no painel conectado.
+      if (event === "SIGNED_IN" && session && currentStep === "login") loadDevices();
       if (event === "SIGNED_OUT") { closeSocket(); showStep("login"); }
     });
   </script>

@@ -27,6 +27,7 @@
     },
     "shell:default",
     "os:default",
+    "os:allow-hostname",
     "fs:default",
     {
       "identifier": "fs:allow-exists",
