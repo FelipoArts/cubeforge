@@ -7,6 +7,19 @@ kv_namespaces = [
   { binding = "CUBEFORGE_REGISTRY", id = "296c93195b224bdba5484f877102c458", preview_id = "server_registry_preview" }
 ]
 
+# Durable Object do painel web remoto (Cubicase Plus) — um "canal" por
+# dispositivo, ver src/durable-objects/host-channel.ts e
+# plans/remote-web-panel-plan.md. new_sqlite_classes porque contas novas do
+# Workers só ganham o storage backend SQLite para Durable Objects (o backend
+# antigo baseado em key-value já não é oferecido para namespaces novos).
+[[durable_objects.bindings]]
+name = "HOST_CHANNEL"
+class_name = "HostChannel"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HostChannel"]
+
 # Environment variables (configurable)
 [vars]
 SERVER_TTL_SECONDS = "14400"

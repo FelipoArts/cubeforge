@@ -689,6 +689,15 @@ export default function Home() {
     };
   }, []);
 
+  // Painel Web Remoto (Cubicase Plus) — pareia esta instalação na primeira
+  // vez que houver sessão + assinatura ativa (best-effort, não bloqueia
+  // nada se falhar). Ver src/lib/panelDevice.ts e panel_agent.rs no backend.
+  useEffect(() => {
+    void import("@/lib/panelDevice").then(({ ensurePanelDeviceIfEligible }) =>
+      ensurePanelDeviceIfEligible().catch((err) => console.error("[panel] ensurePanelDeviceIfEligible falhou:", err))
+    );
+  }, []);
+
   // Link de convite (cubicase://join/<shortCode>, ver play.cubicase.net/<slug>)
   // — mesmo padrão do listener de login acima, ver src/lib/joinDeepLink.ts.
   useEffect(() => {

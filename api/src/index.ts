@@ -1,3 +1,6 @@
+import { resolveSupabaseUserId, userHasActiveSubscription, SUPABASE_URL } from './supabase';
+export { HostChannel } from './durable-objects/host-channel';
+
 const LEASE_DURATION_MS = 90_000;  // 90s lease
 const SESSION_TTL_SECONDS = 90;    // 90s TTL (em vez de 14400s = 4h)
 // O host manda heartbeat a cada 60s exatos (ver o loop em session_manager.rs/lib.rs).
@@ -41,6 +44,11 @@ interface Env {
   // supabaseRestUpsertSubscription). Configurar com:
   //   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
   SUPABASE_SERVICE_ROLE_KEY?: string;
+  // Durable Object do painel web remoto (Cubicase Plus) — um "canal" por
+  // dispositivo (panel_devices.id), mantém a conexão WebSocket do app
+  // desktop e roteia mensagens para o(s) painel(is) web logados no mesmo
+  // usuário. Ver durable-objects/host-channel.ts e plans/remote-web-panel-plan.md.
+  HOST_CHANNEL: DurableObjectNamespace;
 }
 
 // 'sleeping' = wake-on-demand armado, host de pé só em modo de espera (sem
@@ -147,6 +155,7 @@ const WAKE_COOLDOWN_SECONDS = 60;   // por shortCode, independente do IP — ver
 const SLUG_RATE_LIMIT = 5;          // definir/trocar link de convite: ação manual e rara, mesmo raciocínio de REGEN_CODE_RATE_LIMIT
 const CONNECT_NAME_RATE_LIMIT = 5;  // definir/trocar endereço de conexão: mesmo raciocínio de SLUG_RATE_LIMIT
 const SLUG_RESOLVE_RATE_LIMIT = 20; // resolver slug->shortCode: chamado pela página de convite (uma vez por visita) — folgado o bastante pra não incomodar visitas legítimas, apertado o bastante pra desanimar varredura de slugs
+const PANEL_TICKET_RATE_LIMIT = 20; // painel web (Cubicase Plus): um ticket por tentativa de conexão/reconexão — folgado o bastante para quedas de rede legítimas
 
 function clientIp(req: Request): string {
   return req.headers.get('CF-Connecting-IP') || 'unknown';
@@ -778,11 +787,6 @@ async function handleCreateDonationCheckout(env: Env, cors: Record<string, strin
 // escrita por aqui, via SUPABASE_SERVICE_ROLE_KEY (bypassa RLS) — o app só
 // LÊ, direto do Supabase, com a própria sessão do usuário.
 
-const SUPABASE_URL = 'https://rtfxcyvymlxebvemgwaj.supabase.co';
-// Mesma publishable key de src/lib/supabaseClient.ts — pública por design
-// (RLS protege os dados, não o segredo desta key).
-const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_ggAEPrue0lgmIlXGkv4vUg_Hot7Xe0Y';
-
 // Criados uma vez no Dashboard do Stripe (Product "Cubicase Plus", dois
 // Prices recorrentes) — IDs de preço não são segredo, só a chave de API é.
 const SUBSCRIPTION_PRICE_MONTHLY = 'price_1UEtMAJrnDGUaagEswwcRrr0'; // R$14,90/mês
@@ -802,22 +806,6 @@ function planForPriceId(priceId: string | undefined): SubscriptionPlan | null {
   return null;
 }
 
-/** Valida o Bearer token do Supabase contra o próprio Supabase Auth — nunca confia num userId vindo do cliente. */
-async function resolveSupabaseUserId(req: Request): Promise<string | null> {
-  const auth = req.headers.get('Authorization');
-  if (!auth?.startsWith('Bearer ')) return null;
-  try {
-    const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: auth },
-    });
-    if (!resp.ok) return null;
-    const data: any = await resp.json().catch(() => null);
-    return data?.id ?? null;
-  } catch {
-    return null;
-  }
-}
-
 /** Busca o stripe_customer_id já salvo para este usuário (evita duplicar Customer no Stripe ao reassinar). */
 async function supabaseRestGetCustomerId(env: Env, userId: string): Promise<string | null> {
   if (!env.SUPABASE_SERVICE_ROLE_KEY) return null;
@@ -831,23 +819,6 @@ async function supabaseRestGetCustomerId(env: Env, userId: string): Promise<stri
     return rows?.[0]?.stripe_customer_id ?? null;
   } catch {
     return null;
-  }
-}
-
-/** true se o usuário tem Cubicase Plus ativo agora — mesmos status aceitos de isSubscriptionActive no app (src/lib/subscription.ts). */
-async function userHasActiveSubscription(env: Env, userId: string): Promise<boolean> {
-  if (!env.SUPABASE_SERVICE_ROLE_KEY) return false;
-  try {
-    const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${encodeURIComponent(userId)}&select=status`,
-      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
-    );
-    if (!resp.ok) return false;
-    const rows: any = await resp.json().catch(() => []);
-    const status = rows?.[0]?.status;
-    return status === 'active' || status === 'trialing';
-  } catch {
-    return false;
   }
 }
 
@@ -1226,6 +1197,67 @@ async function handleResolveSlug(slug: string, env: Env, cors: Record<string, st
 }
 
 // ============================================================
+// PAINEL WEB REMOTO (Cubicase Plus) — ver plans/remote-web-panel-plan.md
+// ============================================================
+// O canal em si (WebSocket do app desktop <-> painel web) vive inteiro no
+// Durable Object HostChannel (durable-objects/host-channel.ts) — um por
+// `panel_devices.id`. Este Worker só faz duas coisas:
+//   1. Autentica o painel web (sessão Supabase) e emite um ticket de uso
+//      único para a conexão WS, porque o WebSocket nativo do navegador não
+//      permite mandar um header Authorization no handshake — só dá pra
+//      levar credencial na query string, então evitamos colocar o access
+//      token do Supabase (de vida longa) ali, e usamos um ticket efêmero
+//      (30s, consumido no primeiro uso) em vez disso.
+//   2. Encaminha o upgrade de WebSocket (tanto do app desktop quanto do
+//      painel) para o Durable Object do dispositivo certo — a validação de
+//      credencial de cada lado (device_token do app; ticket do painel)
+//      acontece dentro do próprio Durable Object.
+// O app desktop NÃO passa por aqui: ele já manda o device_token direto num
+// header Authorization de verdade (não é um navegador, não tem essa
+// limitação), então conecta direto na rota de WebSocket abaixo.
+
+/** POST /api/v1/panel/ws-ticket — painel web pede um ticket de uso único para abrir o WebSocket do dispositivo. */
+async function handlePanelWsTicket(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
+  const userId = await resolveSupabaseUserId(req);
+  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Sessão inválida ou expirada. Faça login novamente.'), 401, cors);
+
+  let body: any; try { body = await req.json(); } catch { return json(fail(ResponseCodes.BAD_REQUEST, 'JSON inválido.'), 400, cors); }
+  const deviceId = typeof body?.deviceId === 'string' ? body.deviceId : null;
+  if (!deviceId) return json(fail(ResponseCodes.VALIDATION_ERROR, 'deviceId obrigatório.'), 400, cors);
+
+  if (!(await userHasActiveSubscription(env, userId))) {
+    return json(fail(ResponseCodes.SUBSCRIPTION_REQUIRED, 'O painel web remoto é um recurso do Cubicase Plus.'), 402, cors);
+  }
+
+  // Confere que o dispositivo pertence mesmo a este usuário antes de emitir
+  // o ticket — sem isso, qualquer assinante Plus logado poderia adivinhar o
+  // id (UUID) de outro dispositivo e pedir um ticket para ele.
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json(fail(ResponseCodes.INTERNAL_ERROR, 'Painel web não configurado neste servidor.'), 503, cors);
+  const ownerResp = await fetch(
+    `${SUPABASE_URL}/rest/v1/panel_devices?id=eq.${encodeURIComponent(deviceId)}&select=user_id`,
+    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+  );
+  const ownerRows: any = ownerResp.ok ? await ownerResp.json().catch(() => []) : [];
+  if (ownerRows?.[0]?.user_id !== userId) {
+    return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Dispositivo não encontrado para este usuário.'), 404, cors);
+  }
+
+  const id = env.HOST_CHANNEL.idFromName(deviceId);
+  const stub = env.HOST_CHANNEL.get(id);
+  const mintResp = await stub.fetch('https://host-channel.internal/mint-ticket', { method: 'POST' });
+  const { ticket } = await mintResp.json() as { ticket: string };
+
+  return json(ok(ResponseCodes.SUCCESS, 'Ticket emitido.', { ticket, deviceId }), 200, cors);
+}
+
+/** GET /panel/ws/{deviceId}?role=agent|panel — encaminha o upgrade de WebSocket para o Durable Object do dispositivo. */
+async function handlePanelWebSocket(deviceId: string, req: Request, env: Env): Promise<Response> {
+  const id = env.HOST_CHANNEL.idFromName(deviceId);
+  const stub = env.HOST_CHANNEL.get(id);
+  return stub.fetch(req);
+}
+
+// ============================================================
 // MAIN ROUTER
 // ============================================================
 
@@ -1357,6 +1389,18 @@ export default {
       if (m === 'POST' && p === '/api/v1/subscriptions/portal-session') {
         if (!(await checkRateLimit(env, 'sub-portal', clientIp(req), SUB_PORTAL_RATE_LIMIT))) return rateLimitedResponse(cors);
         return await handleCreateBillingPortalSession(req, env, cors);
+      }
+
+      // POST /api/v1/panel/ws-ticket — painel web (Cubicase Plus) pede ticket para abrir o WebSocket
+      if (m === 'POST' && p === '/api/v1/panel/ws-ticket') {
+        if (!(await checkRateLimit(env, 'panel-ticket', clientIp(req), PANEL_TICKET_RATE_LIMIT))) return rateLimitedResponse(cors);
+        return await handlePanelWsTicket(req, env, cors);
+      }
+
+      // GET /panel/ws/{deviceId} — upgrade de WebSocket (app desktop com device_token, ou painel web com ticket)
+      const mWs = p.match(/^\/panel\/ws\/([A-Za-z0-9-]+)$/);
+      if (m === 'GET' && mWs && req.headers.get('Upgrade') === 'websocket') {
+        return await handlePanelWebSocket(mWs[1], req, env);
       }
 
       if (m === 'GET' && p === '/health') return new Response(JSON.stringify(ok(ResponseCodes.SUCCESS, 'OK', { status: 'ok', version: 'v1' })), { status: 200, headers: { 'Content-Type': 'application/json', ...cors } });

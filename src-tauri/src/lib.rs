@@ -25,6 +25,7 @@ mod api_client;
 mod session_manager;
 mod provider_manager;
 mod job_object;
+mod panel_agent;
 #[cfg(test)]
 mod tests;
 
@@ -5672,6 +5673,11 @@ pub fn run() {
           process_sync_queue(app_handle.clone(), telemetry.clone()).await;
         }
       });
+
+      // Painel Web Remoto (Cubicase Plus) — ver plans/remote-web-panel-plan.md
+      // e panel_agent.rs. Sem custo se não houver dispositivo pareado ainda
+      // (fica só verificando a cada alguns segundos).
+      panel_agent::spawn_panel_agent(app.handle().clone());
 
       // --- System tray ---
       // Fechar a janela (X) pergunta ao usuário (via modal no frontend, ver

@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Painel — Cubicase</title>
+  <meta name="description" content="Painel web remoto do Cubicase Plus: acompanhe e controle seu servidor de qualquer lugar." />
+  <meta name="robots" content="noindex" />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <link rel="apple-touch-icon" href="/assets/icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/style.css" />
+  <style>
+    /* Só o que é específico desta página — o resto vem de assets/style.css. */
+    .panel-shell { max-width: 720px; margin: 0 auto; padding: 0 20px; }
+    .device-list { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+    .device-item {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 14px 16px; cursor: pointer; transition: border-color 0.15s ease;
+    }
+    .device-item:hover { border-color: var(--border-strong); }
+    .device-item .name { font-weight: 600; }
+    .device-item .seen { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    .panel-console {
+      background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 14px 16px; font-family: "SF Mono", "Cascadia Code", ui-monospace, monospace;
+      font-size: 12.5px; color: var(--text-secondary); height: 320px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .panel-console div + div { margin-top: 3px; }
+    .panel-server-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    .panel-server-row:last-child { border-bottom: none; }
+    .status-pill.is-offline { color: var(--text-muted); }
+    .status-pill.is-offline .blip { background: var(--text-muted); box-shadow: none; animation: none; }
+    .top-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; justify-content: space-between; margin-bottom: 24px; }
+    .top-bar .device-name { font-size: 13px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; padding: 0; white-space: nowrap; }
+    /* .mockup-stat-grid/.mockup-stat vêm de assets/style.css (pensados para o
+       mockup estático da home, num card mais largo) — min-width: 0 é o que
+       falta para as colunas do grid encolherem no card real e mais estreito
+       do painel em vez de estourar a largura em telas de celular. */
+    .panel-shell .mockup-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel-shell .mockup-stat { min-width: 0; }
+    .panel-shell .mockup-stat .value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    @media (max-width: 480px) {
+      .download-card { padding: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient-glow"></div>
+
+  <nav class="nav">
+    <div class="container nav-inner">
+      <a href="/" class="nav-brand">
+        <img src="/assets/logo-dark.png" alt="Cubicase" />
+      </a>
+    </div>
+  </nav>
+
+  <header class="download-hero">
+    <div class="container panel-shell">
+      <div class="eyebrow"><span class="dot"></span>Cubicase Plus</div>
+      <h1>Painel</h1>
+      <p class="hero-sub" style="margin: 18px auto 0; text-align: center;">
+        Acompanhe e controle seu servidor de qualquer lugar — o computador
+        precisa estar ligado, conectado à internet e com o Cubicase aberto.
+      </p>
+
+      <div class="download-card" style="margin-top: 34px; text-align: left;">
+        <!-- Login (mesmo padrão de /entrar/, mas fica logado aqui — esta página é o destino, não uma ponte). -->
+        <div id="login-form">
+          <div class="login-providers">
+            <button type="button" class="btn btn-ghost btn-block" id="btn-google">Continuar com Google</button>
+            <button type="button" class="btn btn-ghost btn-block" id="btn-discord">Continuar com Discord</button>
+          </div>
+          <div class="login-divider"><span>ou por e-mail</span></div>
+          <form id="magic-link-form">
+            <label for="email" class="login-label">E-mail</label>
+            <input type="email" id="email" required autocomplete="email" placeholder="voce@exemplo.com" class="login-input" />
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top: 14px;">Enviar link mágico</button>
+          </form>
+          <p id="login-status" class="login-status" hidden></p>
+        </div>
+
+        <!-- Escolha de dispositivo (vários computadores podem estar pareados na mesma conta). -->
+        <div id="device-picker" hidden>
+          <p class="hero-sub" style="text-align: left; margin: 0 0 6px;">Escolha o computador:</p>
+          <div class="device-list" id="device-list"></div>
+          <p id="device-empty" class="login-status" hidden>
+            Nenhum computador pareado ainda. Abra o Cubicase no computador que vai hospedar, com o Cubicase Plus
+            ativo — o pareamento acontece sozinho.
+          </p>
+          <button type="button" class="link-btn" id="btn-logout" style="margin-top: 16px;">Sair</button>
+        </div>
+
+        <!-- Painel em si, depois de escolher o dispositivo. -->
+        <div id="panel-view" hidden>
+          <div class="top-bar">
+            <span class="status-pill is-offline" id="agent-status"><span class="blip"></span><span id="agent-status-text">Conectando…</span></span>
+            <span class="device-name" id="device-name-label"></span>
+            <button type="button" class="link-btn" id="btn-change-device">Trocar computador</button>
+          </div>
+
+          <div class="mockup-stat-grid">
+            <div class="mockup-stat"><div class="label">Servidor</div><div class="value" id="stat-server-status">—</div></div>
+            <div class="mockup-stat"><div class="label">Jogadores</div><div class="value" id="stat-players">—</div></div>
+            <div class="mockup-stat"><div class="label">Nome</div><div class="value" id="stat-server-name">—</div></div>
+          </div>
+
+          <p class="hero-sub" style="text-align: left; margin: 0 0 8px; font-size: 13px;">Servidores neste computador</p>
+          <div id="server-list" style="margin-bottom: 22px;"></div>
+
+          <p class="hero-sub" style="text-align: left; margin: 0 0 8px; font-size: 13px;">Console (somente leitura por enquanto)</p>
+          <div class="panel-console" id="console"></div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <script src="/assets/site.js"></script>
+  <script type="module">
+    // ============================================================
+    // Painel Web Remoto (Cubicase Plus) — MVP somente leitura (Fase 1)
+    // ============================================================
+    // Ver plans/remote-web-panel-plan.md para o desenho completo. Fluxo:
+    //   1. Login Supabase (igual /entrar/, mas persiste sessão aqui mesmo).
+    //   2. Lista os dispositivos pareados do usuário (tabela panel_devices,
+    //      RLS já restringe à própria linha — sem passar pelo Worker).
+    //   3. Pede um ticket de uso único ao Worker (POST /api/v1/panel/ws-ticket)
+    //      — o WebSocket nativo do navegador não manda header Authorization
+    //      no handshake, então a sessão de longa duração nunca vai na URL.
+    //   4. Abre o WebSocket contra o Durable Object daquele dispositivo e
+    //      renderiza status/console/lista de servidores em tempo real.
+    // Nenhum comando é enviado ainda (Fase 2) — esta tela só lê.
+    // ============================================================
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    const SUPABASE_URL = "https://rtfxcyvymlxebvemgwaj.supabase.co";
+    const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ggAEPrue0lgmIlXGkv4vUg_Hot7Xe0Y";
+    const API_BASE = "https://cubeforge-api.cubeforge.workers.dev";
+    const WS_BASE = "wss://cubeforge-api.cubeforge.workers.dev/panel/ws";
+    const RECONNECT_STEPS_MS = [2000, 5000, 10000, 30000];
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: { persistSession: true, detectSessionInUrl: true },
+    });
+
+    const el = (id) => document.getElementById(id);
+    const loginForm = el("login-form");
+    const devicePicker = el("device-picker");
+    const panelView = el("panel-view");
+    const statusEl = el("login-status");
+
+    function showStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.hidden = false;
+      statusEl.classList.toggle("is-error", isError);
+    }
+
+    function showStep(step) {
+      loginForm.hidden = step !== "login";
+      devicePicker.hidden = step !== "devices";
+      panelView.hidden = step !== "panel";
+    }
+
+    // ---- Passo 1: login ----
+
+    el("btn-google").addEventListener("click", () => {
+      supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } });
+    });
+    el("btn-discord").addEventListener("click", () => {
+      supabase.auth.signInWithOAuth({ provider: "discord", options: { redirectTo: window.location.href } });
+    });
+    el("magic-link-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const email = el("email").value.trim();
+      if (!email) return;
+      const submitBtn = e.target.querySelector("button[type=submit]");
+      submitBtn.disabled = true;
+      const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+      submitBtn.disabled = false;
+      showStatus(error ? `Não foi possível enviar o link: ${error.message}` : "Link enviado! Confira seu e-mail.", !!error);
+    });
+    el("btn-logout").addEventListener("click", async () => {
+      closeSocket();
+      await supabase.auth.signOut();
+      showStep("login");
+    });
+    el("btn-change-device").addEventListener("click", () => {
+      closeSocket();
+      loadDevices();
+    });
+
+    // ---- Passo 2: escolher dispositivo ----
+
+    async function loadDevices() {
+      const { data, error } = await supabase
+        .from("panel_devices")
+        .select("id, device_name, last_seen_at")
+        .order("last_seen_at", { ascending: false, nullsFirst: false });
+
+      showStep("devices");
+      const list = el("device-list");
+      const empty = el("device-empty");
+      list.innerHTML = "";
+
+      if (error || !data || data.length === 0) {
+        empty.hidden = false;
+        return;
+      }
+      empty.hidden = true;
+
+      for (const device of data) {
+        const row = document.createElement("div");
+        row.className = "device-item";
+        const seen = device.last_seen_at
+          ? `Visto por último em ${new Date(device.last_seen_at).toLocaleString("pt-BR")}`
+          : "Nunca conectou ainda";
+        row.innerHTML = `<div><div class="name">${escapeHtml(device.device_name)}</div><div class="seen">${seen}</div></div><div>›</div>`;
+        row.addEventListener("click", () => openDevice(device));
+        list.appendChild(row);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // ---- Passo 3+4: conectar no dispositivo escolhido ----
+
+    let socket = null;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+    let currentDevice = null;
+    let manuallyClosed = false;
+
+    function closeSocket() {
+      manuallyClosed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (socket) { try { socket.close(); } catch {} }
+      socket = null;
+    }
+
+    function openDevice(device) {
+      manuallyClosed = false;
+      reconnectAttempt = 0;
+      currentDevice = device;
+      el("device-name-label").textContent = device.device_name;
+      resetPanelView();
+      showStep("panel");
+      connect();
+    }
+
+    function resetPanelView() {
+      setAgentStatus(false);
+      el("stat-server-status").textContent = "—";
+      el("stat-players").textContent = "—";
+      el("stat-server-name").textContent = "—";
+      el("server-list").innerHTML = "";
+      el("console").innerHTML = "";
+    }
+
+    function setAgentStatus(connected) {
+      const pill = el("agent-status");
+      pill.classList.toggle("is-offline", !connected);
+      el("agent-status-text").textContent = connected ? "Computador conectado" : "Computador desconectado";
+      if (!connected) {
+        el("stat-server-status").textContent = "—";
+        el("stat-players").textContent = "—";
+      }
+    }
+
+    async function connect() {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) { showStep("login"); return; }
+
+      let ticket;
+      try {
+        const resp = await fetch(`${API_BASE}/api/v1/panel/ws-ticket`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+          body: JSON.stringify({ deviceId: currentDevice.id }),
+        });
+        const json = await resp.json().catch(() => null);
+        if (!resp.ok || !json?.data?.ticket) throw new Error(json?.message || `HTTP ${resp.status}`);
+        ticket = json.data.ticket;
+      } catch (err) {
+        scheduleReconnect();
+        return;
+      }
+
+      socket = new WebSocket(`${WS_BASE}/${currentDevice.id}?role=panel&ticket=${encodeURIComponent(ticket)}`);
+      socket.addEventListener("open", () => { reconnectAttempt = 0; });
+      socket.addEventListener("message", (event) => handleMessage(event.data));
+      socket.addEventListener("close", () => { setAgentStatus(false); if (!manuallyClosed) scheduleReconnect(); });
+      socket.addEventListener("error", () => { try { socket.close(); } catch {} });
+    }
+
+    function scheduleReconnect() {
+      if (manuallyClosed) return;
+      const wait = RECONNECT_STEPS_MS[Math.min(reconnectAttempt, RECONNECT_STEPS_MS.length - 1)];
+      reconnectAttempt++;
+      reconnectTimer = setTimeout(connect, wait);
+    }
+
+    function handleMessage(raw) {
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+
+      if (msg.type === "agent_connected") { setAgentStatus(true); return; }
+      if (msg.type === "agent_disconnected") { setAgentStatus(false); return; }
+
+      if (msg.type === "status") {
+        setAgentStatus(true);
+        el("stat-server-status").textContent = msg.serverRunning ? "Rodando" : "Parado";
+        el("stat-players").textContent = `${msg.playerCount ?? 0}/${msg.maxPlayers ?? 20}`;
+        el("stat-server-name").textContent = msg.serverName || "—";
+        return;
+      }
+
+      if (msg.type === "log_line") {
+        const box = el("console");
+        const line = document.createElement("div");
+        line.textContent = msg.line;
+        box.appendChild(line);
+        while (box.children.length > 500) box.removeChild(box.firstChild);
+        box.scrollTop = box.scrollHeight;
+        return;
+      }
+
+      if (msg.type === "server_list") {
+        const container = el("server-list");
+        container.innerHTML = "";
+        for (const s of msg.servers || []) {
+          const row = document.createElement("div");
+          row.className = "panel-server-row";
+          const running = s.status === "running";
+          row.innerHTML = `
+            <div>
+              <div style="font-weight:600;">${escapeHtml(s.name)}</div>
+              <div style="font-size:12px;color:var(--text-muted);">Minecraft ${escapeHtml(s.version)} · ${escapeHtml(s.serverType)}</div>
+            </div>
+            <span class="status-pill${running ? "" : " is-offline"}"><span class="blip"></span>${running ? "Rodando" : "Parado"}</span>
+          `;
+          container.appendChild(row);
+        }
+      }
+    }
+
+    // ---- Boot ----
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) loadDevices();
+      else showStep("login");
+    });
+    supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_IN" && session) loadDevices();
+      if (event === "SIGNED_OUT") { closeSocket(); showStep("login"); }
+    });
+  </script>
+</body>
+</html>
