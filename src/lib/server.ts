@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { join, documentDir } from "@tauri-apps/api/path";
 import { exists, mkdir, writeTextFile, readDir, readTextFile, remove, size } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
+import { isJREInstalled, installJRE, getJREPath } from "@/lib/jre";
 
 // ============================================================
 // Tipos exportados
@@ -1915,4 +1916,105 @@ export async function listLocalServers(): Promise<ServerInfo[]> {
   }
 
   return servers;
+}
+
+/**
+ * Junta os servidores da pasta padrão com os importados de paths
+ * arbitrários — mesmo merge (por path, sem duplicar) que HostView.tsx faz
+ * no próprio efeito de carregar a lista, extraído pra cá porque o listener
+ * de início remoto (page.tsx) precisa resolver um servidor pelo id mesmo
+ * quando HostView não está montada (app fora da aba Host).
+ */
+export async function listAllServers(importedPaths: string[]): Promise<ServerInfo[]> {
+  const defaultServers = await listLocalServers();
+  const knownPaths = new Set(defaultServers.map((s) => s.path.toLowerCase()));
+
+  for (const path of importedPaths) {
+    try {
+      const scanned = await scanExternalServer(path);
+      if (scanned && !knownPaths.has(scanned.path.toLowerCase())) {
+        defaultServers.push(scanned);
+        knownPaths.add(scanned.path.toLowerCase());
+      }
+    } catch {
+      // Path não é mais acessível — ignora aqui; a limpeza da lista
+      // persistida continua sendo responsabilidade do efeito em HostView.tsx.
+    }
+  }
+
+  return defaultServers;
+}
+
+/** Resolve um servidor pelo mesmo `id` que panel_agent.rs usa em `server_list` (meta.uuid, com o nome da pasta como fallback). */
+export function findServerById(servers: ServerInfo[], serverId: string): ServerInfo | null {
+  return servers.find((s) => s.uuid === serverId) ?? servers.find((s) => s.name === serverId) ?? null;
+}
+
+export interface StartServerCallbacks {
+  onLog?: (line: string) => void;
+  onInstallProgress?: (progress: ServerInstallProgress | null) => void;
+}
+
+/**
+ * Orquestra o início de um servidor: resolve a versão de Java exigida,
+ * garante o JRE instalado (baixa do Adoptium se preciso), lê RAM
+ * (cubicase-meta.json) e porta (server.properties) configuradas, e chama o
+ * comando Tauri que sobe o processo Java. Mesma lógica usada pelo botão
+ * "Iniciar Servidor" em HostView.tsx — extraída pra cá para ser reaproveitada
+ * também pelo pedido de início remoto vindo do painel web (ver page.tsx,
+ * listener do evento "panel-start-server-request" — panel_agent.rs no
+ * backend emite esse evento em vez de reimplementar toda essa orquestração
+ * em Rust; ver plans/remote-web-panel-plan.md, Fase 2).
+ */
+export async function startServerOrchestrated(
+  serverInfo: ServerInfo,
+  callbacks: StartServerCallbacks = {}
+): Promise<void> {
+  const { onLog, onInstallProgress } = callbacks;
+  const log = (msg: string) => onLog?.(msg);
+
+  const version = serverInfo.version || "1.20.1";
+  const javaVer = getJavaVersion(version);
+
+  log(`Verificando compatibilidade com Java JRE ${javaVer}...`);
+  const installed = await isJREInstalled(javaVer);
+  if (!installed) {
+    log(`JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`);
+    await installJRE(javaVer, (p) => {
+      onInstallProgress?.({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: p.percent });
+    });
+  }
+  onInstallProgress?.(null);
+  log(`JRE ${javaVer} pronto!`);
+
+  const jrePath = await getJREPath(javaVer);
+  const javaPath = `${jrePath}\\bin\\java.exe`;
+
+  let ram = 4;
+  try {
+    const metaContent = await readTextFile(await join(serverInfo.path, "cubicase-meta.json"));
+    const meta = JSON.parse(metaContent) as { ramGb?: number };
+    if (typeof meta.ramGb === "number" && meta.ramGb >= 2) ram = meta.ramGb;
+  } catch {
+    // usa o padrão de 4GB
+  }
+
+  let port = 25565;
+  try {
+    const propsContent = await readTextFile(await join(serverInfo.path, "server.properties"));
+    const match = propsContent.match(/^server-port=(\d+)/m);
+    if (match) port = parseInt(match[1], 10);
+  } catch {
+    // usa a porta padrão
+  }
+
+  log(`Iniciando Java runtime com ${ram}GB de RAM...`);
+  await invoke("start_minecraft_server", {
+    serverDir: serverInfo.path,
+    javaPath,
+    ramGb: ram,
+    localPort: port,
+    serverJarName: serverInfo.serverJar || null,
+    launchArgsDir: serverInfo.launchArgsDir || null,
+  });
 }

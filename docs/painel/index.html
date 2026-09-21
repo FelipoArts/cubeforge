@@ -63,6 +63,17 @@
     .panel-empty-note { color: var(--text-muted); font-size: 13px; }
     .status-pill.is-offline { color: var(--text-muted); }
     .status-pill.is-offline .blip { background: var(--text-muted); box-shadow: none; animation: none; }
+    .panel-server-row .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+    .btn-mini {
+      background: var(--bg-elevated); border: 1px solid var(--border-strong); color: var(--text-primary);
+      border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    }
+    .btn-mini:hover { border-color: var(--accent); }
+    .btn-mini:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-mini-danger { border-color: rgba(255, 68, 51, 0.4); color: var(--accent); }
+    .btn-mini-danger:hover { background: var(--accent-soft); }
+    .console-command-form { display: flex; gap: 8px; margin-top: 12px; }
+    .console-command-form input { flex: 1; }
     @media (max-width: 480px) {
       .download-card { padding: 24px; }
       .panel-dashboard { padding: 20px 16px 48px; }
@@ -144,8 +155,12 @@
       </div>
 
       <div class="panel-card">
-        <h2>Console (somente leitura por enquanto)</h2>
+        <h2>Console</h2>
         <div class="panel-console" id="console"></div>
+        <form class="console-command-form" id="console-command-form">
+          <input type="text" id="console-command-input" placeholder="Comando (ex: say olá, time set day)" class="login-input" autocomplete="off" />
+          <button type="submit" class="btn btn-primary">Enviar</button>
+        </form>
       </div>
     </div>
   </main>
@@ -153,7 +168,7 @@
   <script src="/assets/site.js"></script>
   <script type="module">
     // ============================================================
-    // Painel Web Remoto (Cubicase Plus) — MVP somente leitura (Fase 1)
+    // Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1 + Fase 2
     // ============================================================
     // Ver plans/remote-web-panel-plan.md para o desenho completo. Fluxo:
     //   1. Login Supabase (igual /entrar/, mas persiste sessão aqui mesmo).
@@ -163,8 +178,11 @@
     //      — o WebSocket nativo do navegador não manda header Authorization
     //      no handshake, então a sessão de longa duração nunca vai na URL.
     //   4. Abre o WebSocket contra o Durable Object daquele dispositivo e
-    //      renderiza status/console/lista de servidores em tempo real.
-    // Nenhum comando é enviado ainda (Fase 2) — esta tela só lê.
+    //      renderiza status/console/lista de servidores em tempo real, e
+    //      envia comandos de volta (Fase 2): parar, reiniciar, iniciar um
+    //      servidor parado e comandos de console livres. Toda ação
+    //      irreversível pede confirmação antes de mandar (ver sendToAgent /
+    //      requestStartServer / delegate de clique em #server-list).
     // ============================================================
     import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -302,7 +320,64 @@
       el("server-list").innerHTML = "";
       el("server-list-empty").hidden = true;
       el("console").innerHTML = "";
+      pendingStartServerId = null;
     }
+
+    // ---- Fase 2: comandos (parar/reiniciar/iniciar/console) ----
+
+    function sendToAgent(payload) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        alert("Sem conexão com o computador agora. Tente de novo em alguns instantes.");
+        return;
+      }
+      socket.send(JSON.stringify(payload));
+    }
+
+    // Reiniciar e "trocar pra outro servidor enquanto um está rodando" usam
+    // o mesmo mecanismo: pede pra parar, e só manda o start_server quando a
+    // próxima mensagem de status confirmar serverRunning=false (ver
+    // handleMessage). Sem isso, um start logo em seguida do stop seria
+    // recusado pelo backend (regra de "só um processo MC por vez").
+    let pendingStartServerId = null;
+
+    function requestStartServer(serverId, { stopFirst = false } = {}) {
+      if (stopFirst) {
+        pendingStartServerId = serverId;
+        sendToAgent({ type: "stop_server" });
+      } else {
+        sendToAgent({ type: "start_server", serverId });
+      }
+    }
+
+    el("server-list").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-action]");
+      if (!btn) return;
+      const { action, serverId } = btn.dataset;
+
+      if (action === "stop") {
+        if (!confirm("Isso vai parar o servidor agora (comando de stop). Continuar?")) return;
+        sendToAgent({ type: "stop_server" });
+      } else if (action === "restart") {
+        if (!confirm("Isso vai reiniciar o servidor — jogadores conectados serão desconectados. Continuar?")) return;
+        requestStartServer(serverId, { stopFirst: true });
+      } else if (action === "start") {
+        const stopFirst = btn.dataset.stopFirst === "true";
+        if (stopFirst && !confirm("Outro servidor está rodando agora. Isso vai pará-lo para iniciar este. Continuar?")) return;
+        requestStartServer(serverId, { stopFirst });
+      }
+    });
+
+    el("console-command-form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = el("console-command-input");
+      const raw = input.value.trim();
+      if (!raw) return;
+      if (raw.replace(/^\//, "").toLowerCase() === "stop") {
+        if (!confirm('Isso vai parar o servidor (comando "stop"). Continuar?')) return;
+      }
+      sendToAgent({ type: "command", command: raw });
+      input.value = "";
+    });
 
     function setAgentStatus(connected) {
       const pill = el("agent-status");
@@ -359,6 +434,11 @@
         el("stat-server-status").textContent = msg.serverRunning ? "Rodando" : "Parado";
         el("stat-players").textContent = `${msg.playerCount ?? 0}/${msg.maxPlayers ?? 20}`;
         el("stat-server-name").textContent = msg.serverName || "—";
+        if (!msg.serverRunning && pendingStartServerId) {
+          const serverId = pendingStartServerId;
+          pendingStartServerId = null;
+          sendToAgent({ type: "start_server", serverId });
+        }
         return;
       }
 
@@ -378,16 +458,24 @@
         container.innerHTML = "";
         const list = msg.servers || [];
         empty.hidden = list.length > 0;
+        const anyRunning = list.some((s) => s.status === "running");
         for (const s of list) {
           const row = document.createElement("div");
           row.className = "panel-server-row";
           const running = s.status === "running";
+          const actionsHtml = running
+            ? `<button type="button" class="btn-mini btn-mini-danger" data-action="stop">Parar</button>
+               <button type="button" class="btn-mini" data-action="restart" data-server-id="${escapeHtml(s.id)}">Reiniciar</button>`
+            : `<button type="button" class="btn-mini" data-action="start" data-server-id="${escapeHtml(s.id)}" data-stop-first="${anyRunning}">Iniciar</button>`;
           row.innerHTML = `
             <div>
               <div style="font-weight:600;">${escapeHtml(s.name)}</div>
               <div style="font-size:12px;color:var(--text-muted);">Minecraft ${escapeHtml(s.version)} · ${escapeHtml(s.serverType)}</div>
             </div>
-            <span class="status-pill${running ? "" : " is-offline"}"><span class="blip"></span>${running ? "Rodando" : "Parado"}</span>
+            <div class="actions">
+              <span class="status-pill${running ? "" : " is-offline"}"><span class="blip"></span>${running ? "Rodando" : "Parado"}</span>
+              ${actionsHtml}
+            </div>
           `;
           container.appendChild(row);
         }

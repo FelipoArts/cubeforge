@@ -709,6 +709,57 @@ export default function Home() {
     );
   }, [importedServerPaths]);
 
+  // Início remoto de servidor pelo painel web (Cubicase Plus) — panel_agent.rs
+  // recebe o pedido do painel e emite este evento em vez de duplicar em Rust
+  // a checagem/instalação de JRE e a resolução de porta/RAM (ver
+  // plans/remote-web-panel-plan.md, Fase 2). Ouvido aqui, fora de HostView,
+  // porque precisa funcionar mesmo com o app fora da aba Host (é exatamente
+  // o cenário de "computador ligado, Cubicase aberto, ninguém olhando").
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const un = await listen<string>("panel-start-server-request", async (event) => {
+        const serverId = event.payload;
+        try {
+          const { listAllServers, findServerById, startServerOrchestrated } = await import("@/lib/server");
+          const store = useAppStore.getState();
+          const servers = await listAllServers(store.importedServerPaths);
+          const serverInfo = findServerById(servers, serverId);
+          if (!serverInfo) {
+            console.error(`[panel] Início remoto: servidor "${serverId}" não encontrado.`);
+            return;
+          }
+          // Mesma regra do plano: nunca sobe um servidor por cima de outro
+          // já rodando (diferente do botão local, que troca em silêncio —
+          // um comando disparado remotamente merece essa checagem extra).
+          if (store.runningServer && store.runningServer !== serverInfo.name) {
+            console.error(`[panel] Início remoto recusado: "${store.runningServer}" já está em execução.`);
+            return;
+          }
+          if (store.runningServer === serverInfo.name) return; // já rodando — nada a fazer
+
+          store.setSelectedServer(serverInfo.name);
+          store.setRunningServer(serverInfo.name);
+          store.setServerStatus("starting");
+          await startServerOrchestrated(serverInfo, {
+            onLog: (line) => console.log(`[panel] ${line}`),
+          });
+        } catch (err) {
+          console.error("[panel] Falha ao iniciar servidor remotamente:", err);
+          useAppStore.getState().setServerStatus("offline");
+        }
+      });
+      if (cancelled) un();
+      else unlisten = un;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Link de convite (cubicase://join/<shortCode>, ver play.cubicase.net/<slug>)
   // — mesmo padrão do listener de login acima, ver src/lib/joinDeepLink.ts.
   useEffect(() => {

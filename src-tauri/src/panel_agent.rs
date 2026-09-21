@@ -1,13 +1,24 @@
 // ============================================================
-// Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1
+// Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1 + Fase 2
 // ============================================================
 // Ver plans/remote-web-panel-plan.md para o desenho completo. Este módulo é
 // o lado "agent" do protocolo: conecta (sempre de dentro pra fora, contorna
 // CGNAT/firewall igual ao tsnet) no Durable Object HostChannel do Worker
-// (api/src/durable-objects/host-channel.ts) e envia status/console/lista de
-// servidores locais em tempo real — só leitura nesta fase, nenhum comando
-// vindo do painel é executado ainda (a rota de mensagens já existe do lado
-// do relay, mas o loop abaixo só ignora o que chega).
+// (api/src/durable-objects/host-channel.ts), envia status/console/lista de
+// servidores locais em tempo real, e agora também executa comandos vindos
+// do painel (Fase 2 — ver handle_incoming_message):
+//   - "command"      -> stdin do processo Minecraft já em execução
+//   - "stop_server"  -> para o processo em execução (mesma rotina do botão
+//                       "Parar" local)
+//   - "start_server" -> NÃO reimplementa em Rust a checagem/instalação de
+//                       JRE e resolução de porta/RAM (isso é orquestrado em
+//                       TypeScript, src/lib/server.ts:startServerOrchestrated,
+//                       reaproveitando o mesmo código do botão "Iniciar
+//                       Servidor"). Em vez disso, emite o evento Tauri
+//                       "panel-start-server-request" pro frontend — que
+//                       continua rodando mesmo com a janela minimizada pro
+//                       tray, contanto que o Cubicase esteja aberto (mesma
+//                       premissa do recurso desde o início).
 //
 // Autenticação: usa um `device_token` (não é sessão de usuário) persistido
 // em `panel_device.json` na pasta de dados do app — o mesmo arquivo é
@@ -30,12 +41,12 @@
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{log_to_file, AppState};
+use crate::{log_to_file, send_minecraft_command, stop_minecraft_server_internal, AppState};
 
 const PANEL_RELAY_WS_BASE: &str = "wss://cubeforge-api.cubeforge.workers.dev/panel/ws";
 // 2s, 5s, 10s, 30s (máx) — mesma progressão descrita no plano, em vez de
@@ -228,6 +239,44 @@ fn build_server_list_message(app: &AppHandle) -> String {
     serde_json::json!({ "type": "server_list", "servers": scan_local_servers(app) }).to_string()
 }
 
+/// Interpreta uma mensagem vinda do painel (via relay). Erros são só
+/// logados localmente por enquanto — reportar de volta pro painel fica pra
+/// uma fase de robustez futura (ver Fase 4 no plano).
+async fn handle_incoming_message(app: &AppHandle, raw: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) else {
+        return;
+    };
+
+    match msg_type {
+        "command" => {
+            let Some(command) = value.get("command").and_then(|v| v.as_str()) else { return; };
+            let state = app.state::<AppState>();
+            if let Err(e) = send_minecraft_command(state, command.to_string()).await {
+                log_to_file(app, &format!("[PANEL] Comando remoto \"{}\" falhou: {}", command, e));
+            }
+        }
+        "stop_server" => {
+            log_to_file(app, "[PANEL] Parada remota solicitada pelo painel.");
+            let state = app.state::<AppState>();
+            stop_minecraft_server_internal(app, &state).await;
+        }
+        "start_server" => {
+            let Some(server_id) = value.get("serverId").and_then(|v| v.as_str()) else { return; };
+            log_to_file(app, &format!("[PANEL] Início remoto solicitado pelo painel para \"{}\".", server_id));
+            // A checagem/instalação de JRE e a resolução de porta/RAM vivem em
+            // TypeScript (src/lib/server.ts:startServerOrchestrated) — mesma
+            // rotina do botão "Iniciar Servidor" local — em vez de duplicadas
+            // aqui. O listener no frontend (page.tsx) também aplica a regra de
+            // "recusar se outro servidor já estiver rodando".
+            let _ = app.emit("panel-start-server-request", server_id);
+        }
+        _ => {}
+    }
+}
+
 async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Result<(), String> {
     let url = format!("{}/{}?role=agent", PANEL_RELAY_WS_BASE, device.id);
     let mut request = url
@@ -295,8 +344,10 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
             incoming = read.next() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break Ok(()),
-                    // Fase 2 vai interpretar "command"/"start_server" aqui.
-                    Some(Ok(_)) => {}
+                    Some(Ok(Message::Text(txt))) => {
+                        handle_incoming_message(app, txt.as_ref()).await;
+                    }
+                    Some(Ok(_)) => {} // Binary/Ping/Pong — nada esperado do relay além de texto
                     Some(Err(e)) => break Err(e.to_string()),
                 }
             }
