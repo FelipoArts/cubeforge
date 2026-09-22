@@ -1,12 +1,12 @@
 // ============================================================
-// Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1 + Fase 2
+// Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1 + Fase 2 + Fase 3 (métricas)
 // ============================================================
 // Ver plans/remote-web-panel-plan.md para o desenho completo. Este módulo é
 // o lado "agent" do protocolo: conecta (sempre de dentro pra fora, contorna
 // CGNAT/firewall igual ao tsnet) no Durable Object HostChannel do Worker
 // (api/src/durable-objects/host-channel.ts), envia status/console/lista de
-// servidores locais em tempo real, e agora também executa comandos vindos
-// do painel (Fase 2 — ver handle_incoming_message):
+// servidores locais/métricas de CPU-RAM em tempo real, e agora também
+// executa comandos vindos do painel (Fase 2 — ver handle_incoming_message):
 //   - "command"      -> stdin do processo Minecraft já em execução
 //   - "stop_server"  -> para o processo em execução (mesma rotina do botão
 //                       "Parar" local)
@@ -19,6 +19,12 @@
 //                       continua rodando mesmo com a janela minimizada pro
 //                       tray, contanto que o Cubicase esteja aberto (mesma
 //                       premissa do recurso desde o início).
+//
+// Métricas (Fase 3): não existe uma segunda coleta de CPU/RAM só para o
+// painel — build_metrics_message só lê `state.minecraft_last_resource_sample`,
+// a mesma amostra que a thread de monitoramento em lib.rs já mantém a cada
+// 15s enquanto o servidor está rodando (usada também para diagnóstico de
+// crash). Enviada junto do poll de status (ver STATUS_POLL_SECS).
 //
 // Autenticação: usa um `device_token` (não é sessão de usuário) persistido
 // em `panel_device.json` na pasta de dados do app — o mesmo arquivo é
@@ -284,6 +290,26 @@ fn build_status_message(app: &AppHandle) -> String {
     .to_string()
 }
 
+/// CPU/RAM da máquina host (e do processo Java) para o painel — reaproveita a
+/// mesma amostra que a thread de monitoramento em lib.rs já calcula a cada 15s
+/// enquanto o servidor está rodando (ver ResourceSample/minecraft_last_resource_sample),
+/// em vez de abrir uma segunda fonte de coleta. `None` antes do primeiro
+/// servidor ser iniciado nesta sessão do app — o painel trata isso mostrando
+/// "—" (ver stat-resources em docs/painel/index.html).
+fn build_metrics_message(app: &AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    let sample = state
+        .minecraft_last_resource_sample
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let mut value = serde_json::to_value(&sample).ok()?;
+    let map = value.as_object_mut()?;
+    map.insert("type".to_string(), serde_json::Value::String("metrics".to_string()));
+    map.insert("ts".to_string(), serde_json::Value::String(now_iso()));
+    Some(value.to_string())
+}
+
 fn build_server_list_message(app: &AppHandle) -> String {
     serde_json::json!({ "type": "server_list", "servers": scan_local_servers(app) }).to_string()
 }
@@ -389,6 +415,9 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
     // Snapshot inicial assim que conecta, sem esperar o primeiro poll.
     let _ = tx.send(build_status_message(app));
     let _ = tx.send(build_server_list_message_async(app).await);
+    if let Some(metrics) = build_metrics_message(app) {
+        let _ = tx.send(metrics);
+    }
 
     let mut status_poll = tokio::time::interval(Duration::from_secs(STATUS_POLL_SECS));
     status_poll.tick().await; // o primeiro tick é imediato; o snapshot acima já cobriu isso
@@ -408,6 +437,9 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
             _ = status_poll.tick() => {
                 let _ = tx.send(build_status_message(app));
                 let _ = tx.send(build_server_list_message_async(app).await);
+                if let Some(metrics) = build_metrics_message(app) {
+                    let _ = tx.send(metrics);
+                }
             }
             incoming = read.next() => {
                 match incoming {

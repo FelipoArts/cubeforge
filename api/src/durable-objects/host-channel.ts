@@ -15,6 +15,8 @@
 //     { type: "server_list", servers: [{ id, name, version, serverType, status }] }
 //     { type: "error", message } — comando que o agent tentou executar e falhou
 //       (ex: enviar comando de console sem servidor rodando)
+//     { type: "metrics", totalRamMb, availableRamMb, cpuUsagePercent, processRamMb?, processCpuPercent?, ts }
+//       (Fase 3 — só enviada quando o agent já tem uma amostra, ver build_metrics_message)
 //   relay -> painel (sem vir do agent):
 //     { type: "agent_connected" } | { type: "agent_disconnected" }
 //   painel -> relay -> agent (Fase 2):

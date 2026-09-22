@@ -236,30 +236,36 @@ export const useAppStore = create<AppSettings>()(
         knownServers: state.knownServers.filter(s => s.shortCode !== shortCode),
       })),
       updateKnownServerStatus: (shortCode, status, minecraftStatus, currentPlayers) => set((state) => ({
-        knownServers: state.knownServers.map(s =>
-          s.shortCode === shortCode
-            ? {
-                ...s,
-                status,
-                minecraftStatus: minecraftStatus !== undefined ? minecraftStatus : s.minecraftStatus,
-                currentPlayers: currentPlayers ?? s.currentPlayers,
-                lastSeenOnline: status === 'online' ? new Date().toISOString() : s.lastSeenOnline,
-                // Marca o início da sessão "online" apenas na transição para online;
-                // permanece parado enquanto o status continuar online (para servir de
-                // base ao contador de tempo online) e reseta quando o servidor cai.
-                onlineSince: status === 'online'
-                  // Preserva o timestamp existente só se já havia um (evita resetar a
-                  // contagem a cada poll); senão inicializa agora — cobre tanto a
-                  // transição real para online quanto servidores persistidos antes
-                  // deste campo existir (onlineSince ausente apesar de status "online").
-                  ? (s.status === 'online' && s.onlineSince ? s.onlineSince : new Date().toISOString())
-                  : null,
-                // Só é chamado após uma resposta bem-sucedida da API: marca o momento
-                // em que este status foi de fato confirmado (usado para detectar dados obsoletos).
-                lastConfirmedAt: new Date().toISOString(),
-              }
-            : s
-        ),
+        knownServers: state.knownServers.map(s => {
+          if (s.shortCode !== shortCode) return s;
+          const resolvedMcStatus = minecraftStatus !== undefined ? minecraftStatus : s.minecraftStatus;
+          // "Online há X" / "visto por último" descrevem o processo Java em si
+          // (minecraftStatus), não a rede mesh (status) — um host pode manter a
+          // mesh sempre ligada (ou nunca ligar), o que fazia esses campos nunca
+          // avançarem (ou avançarem o tempo todo) independente do servidor estar
+          // de pé de verdade. Ver getDisplayStatus/isFullyOnline em GuestView.tsx.
+          const mcOnline = resolvedMcStatus === 'online';
+          return {
+            ...s,
+            status,
+            minecraftStatus: resolvedMcStatus,
+            currentPlayers: currentPlayers ?? s.currentPlayers,
+            lastSeenOnline: mcOnline ? new Date().toISOString() : s.lastSeenOnline,
+            // Marca o início da sessão "online" apenas na transição para online;
+            // permanece parado enquanto o Minecraft continuar online (para servir de
+            // base ao contador de tempo online) e reseta quando o servidor cai.
+            onlineSince: mcOnline
+              // Preserva o timestamp existente só se já havia um (evita resetar a
+              // contagem a cada poll); senão inicializa agora — cobre tanto a
+              // transição real para online quanto servidores persistidos antes
+              // deste campo existir (onlineSince ausente apesar de minecraftStatus "online").
+              ? (s.minecraftStatus === 'online' && s.onlineSince ? s.onlineSince : new Date().toISOString())
+              : null,
+            // Só é chamado após uma resposta bem-sucedida da API: marca o momento
+            // em que este status foi de fato confirmado (usado para detectar dados obsoletos).
+            lastConfirmedAt: new Date().toISOString(),
+          };
+        }),
       })),
       addImportedServerPath: (path) => set((state) => {
         if (state.importedServerPaths.includes(path)) return state;

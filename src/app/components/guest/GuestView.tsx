@@ -123,6 +123,16 @@ export function GuestView({
   const loaderLabel = (serverType: string): string =>
     serverType === "neoforge" ? "NeoForge" : serverType === "forge" ? "Forge" : "Fabric";
 
+  /** Nome de exibição do tipo de servidor para o textinho "tipo + versão" do card — ao
+   * contrário de loaderLabel (só usado pra forge/neoforge/fabric em mensagens de erro),
+   * esta cobre todos os tipos, incluindo vanilla/paper. */
+  const serverKindLabel = (serverType: string): string =>
+    serverType === "neoforge" ? "NeoForge" :
+    serverType === "forge" ? "Forge" :
+    serverType === "fabric" ? "Fabric" :
+    serverType === "paper" ? "Paper" :
+    "Vanilla";
+
   /** Pasta local (ServerInfo) do servidor do próprio host, se este KnownServer for "Meu" — usado pelo fluxo "Jogar" local (sem mesh). */
   const getLocalServerInfo = (shortCode: string) => localServers.find(s => s.shortCode === shortCode) ?? null;
 
@@ -373,7 +383,7 @@ export function GuestView({
           name: server.name,
           version: server.version || "1.20.1",
           serverType: server.serverType || "vanilla",
-          description: server.description || `Servidor Minecraft Vanilla ${server.version || "1.20.1"}`,
+          description: server.description || `Servidor Minecraft ${server.version || "1.20.1"}`,
           status: "offline",
           minecraftStatus: null,
           port: 25565,
@@ -564,8 +574,8 @@ export function GuestView({
         port: session.port || 25565,
         maxPlayers: session.maxPlayers || 20,
         currentPlayers: session.currentPlayers || 0,
-        lastSeenOnline: networkStatus === "online" ? new Date().toISOString() : null,
-        onlineSince: networkStatus === "online" ? new Date().toISOString() : null,
+        lastSeenOnline: session.minecraftStatus === "online" ? new Date().toISOString() : null,
+        onlineSince: session.minecraftStatus === "online" ? new Date().toISOString() : null,
         lastConfirmedAt: new Date().toISOString(),
         addedAt: new Date().toISOString(),
         isOwnServer: false,
@@ -891,6 +901,7 @@ export function GuestView({
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {knownServers.map((server, index) => {
             const stale = isServerStale(server, now);
+            const mcOnline = server.minecraftStatus === "online";
             const isThisConnected = connectedShortCode === server.shortCode;
             const display = getDisplayStatus(server);
             const isFullyOnline = server.status === "online" && server.minecraftStatus === "online";
@@ -969,7 +980,7 @@ export function GuestView({
                 <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-[10px] text-theme-secondary">
                   <span className="flex items-center gap-1">
                     <Server className="w-3 h-3" />
-                    Vanilla {server.version}
+                    {serverKindLabel(server.serverType)} {server.version}
                   </span>
                   {server.currentPlayers !== undefined && server.minecraftStatus === "online" && (
                     <span className="flex items-center gap-1">
@@ -979,7 +990,7 @@ export function GuestView({
                   )}
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {isFullyOnline && !stale
+                    {mcOnline && !stale
                       ? `Online há ${formatUptime(server.onlineSince)}`
                       : formatLastSeen(server.lastSeenOnline, now)}
                   </span>

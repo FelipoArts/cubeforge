@@ -34,7 +34,7 @@
     }
     .panel-top-bar .left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 0; }
     .panel-top-bar .device-name { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .panel-stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 26px; }
+    .panel-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 26px; }
     .panel-stat {
       background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md);
       padding: 18px 20px; min-width: 0;
@@ -146,6 +146,7 @@
       <div class="panel-stat"><div class="label">Servidor</div><div class="value" id="stat-server-status">—</div></div>
       <div class="panel-stat"><div class="label">Jogadores</div><div class="value" id="stat-players">—</div></div>
       <div class="panel-stat"><div class="label">Nome</div><div class="value" id="stat-server-name">—</div></div>
+      <div class="panel-stat"><div class="label">CPU / RAM</div><div class="value" id="stat-resources">—</div></div>
     </div>
 
     <div class="panel-body-grid">
@@ -313,11 +314,19 @@
       connect();
     }
 
+    // Espelha o último "status" recebido — usado só para não deixar o
+    // stat de CPU/RAM mostrar a última amostra de quando o servidor ainda
+    // estava rodando (ver comentário em build_metrics_message, em
+    // panel_agent.rs: a amostra em si não é limpa ao parar o servidor).
+    let lastServerRunning = false;
+
     function resetPanelView() {
       setAgentStatus(false);
       el("stat-server-status").textContent = "—";
       el("stat-players").textContent = "—";
       el("stat-server-name").textContent = "—";
+      el("stat-resources").textContent = "—";
+      lastServerRunning = false;
       el("server-list").innerHTML = "";
       el("server-list-empty").hidden = true;
       el("console").innerHTML = "";
@@ -397,6 +406,8 @@
       if (!connected) {
         el("stat-server-status").textContent = "—";
         el("stat-players").textContent = "—";
+        el("stat-resources").textContent = "—";
+        lastServerRunning = false;
       }
     }
 
@@ -445,11 +456,24 @@
         el("stat-server-status").textContent = msg.serverRunning ? "Rodando" : "Parado";
         el("stat-players").textContent = `${msg.playerCount ?? 0}/${msg.maxPlayers ?? 20}`;
         el("stat-server-name").textContent = msg.serverName || "—";
+        lastServerRunning = !!msg.serverRunning;
+        if (!lastServerRunning) el("stat-resources").textContent = "—";
         if (!msg.serverRunning && pendingStartServerId) {
           const serverId = pendingStartServerId;
           pendingStartServerId = null;
           sendToAgent({ type: "start_server", serverId });
         }
+        return;
+      }
+
+      if (msg.type === "metrics") {
+        // A amostra do lado Rust não é limpa quando o servidor para (ver
+        // comentário em build_metrics_message) — só mostra enquanto o
+        // último "status" confirmar que o servidor está mesmo rodando.
+        if (!lastServerRunning) return;
+        const cpu = msg.processCpuPercent ?? msg.cpuUsagePercent ?? 0;
+        const ram = msg.processRamMb ?? Math.max(0, (msg.totalRamMb ?? 0) - (msg.availableRamMb ?? 0));
+        el("stat-resources").textContent = `${cpu.toFixed(0)}% CPU · ${ram} MB`;
         return;
       }
 
