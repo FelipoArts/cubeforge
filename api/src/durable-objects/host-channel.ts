@@ -13,17 +13,22 @@
 //     { type: "status", serverRunning, serverName?, playerCount?, maxPlayers?, ts }
 //     { type: "log_line", line, ts }
 //     { type: "server_list", servers: [{ id, name, version, serverType, status }] }
+//     { type: "error", message } — comando que o agent tentou executar e falhou
+//       (ex: enviar comando de console sem servidor rodando)
 //   relay -> painel (sem vir do agent):
 //     { type: "agent_connected" } | { type: "agent_disconnected" }
-//   painel -> relay -> agent (Fase 2 — já roteado, ainda não emitido pela UI):
-//     { type: "command", command } | { type: "start_server", serverId }
+//   painel -> relay -> agent (Fase 2):
+//     { type: "command", command } | { type: "stop_server" } | { type: "start_server", serverId }
 //
-// O agent só empurra `status`/`server_list` por conta própria ao CONECTAR e
-// em mudanças de estado do Minecraft — não existe pedido do painel por um
-// resumo do estado atual. Por isso a DO guarda o último `status`/
-// `server_list` recebido (ctx.storage, sobrevive a hibernação) e repete pra
-// qualquer painel que conectar depois desses eventos (F5, segunda aba, etc.
-// — ver cacheAgentSnapshot / handleWebSocketUpgrade).
+// O agent só empurra `status`/`server_list` por conta própria ao CONECTAR,
+// em mudanças de estado do Minecraft, e logo depois de processar um
+// comando vindo do painel (ver handle_incoming_message em panel_agent.rs —
+// reenvia um snapshot fresco em vez de confiar só no evento se propagar
+// sozinho). Ainda assim, um painel que conecta DEPOIS desses eventos (F5,
+// segunda aba) não veria nada até o próximo — por isso a DO guarda o
+// último `status`/`server_list`, e um histórico curto de `log_line`
+// (ctx.storage, sobrevive a hibernação) e repete tudo pra qualquer painel
+// que conectar depois (ver cacheAgentSnapshot / handleWebSocketUpgrade).
 //
 // Autenticação de cada lado acontece só aqui dentro (nunca no Worker "puro",
 // ver comentário em index.ts sobre por que o painel usa ticket em vez de
@@ -40,6 +45,8 @@ import { SUPABASE_URL, userHasActiveSubscription, type SupabaseEnv } from '../su
 interface Env extends SupabaseEnv {}
 
 const TICKET_TTL_MS = 30_000;
+const LOG_HISTORY_KEY = 'log_history';
+const LOG_HISTORY_MAX = 200;
 
 interface PendingTicket {
   userId: string;
@@ -177,12 +184,14 @@ export class HostChannel {
         // resumo do estado atual. Reproduz aqui o último retrato conhecido,
         // guardado em ctx.storage por cacheAgentSnapshot.
         if (agentConnected) {
-          const [lastStatus, lastServerList] = await Promise.all([
+          const [lastStatus, lastServerList, logHistory] = await Promise.all([
             this.ctx.storage.get<string>('last:status'),
             this.ctx.storage.get<string>('last:server_list'),
+            this.ctx.storage.get<string[]>(LOG_HISTORY_KEY),
           ]);
           if (lastStatus) server.send(lastStatus);
           if (lastServerList) server.send(lastServerList);
+          for (const line of logHistory ?? []) server.send(line);
         }
       } catch { /* conexão pode já ter caído antes deste send */ }
       return new Response(null, { status: 101, webSocket: client });
@@ -200,7 +209,12 @@ export class HostChannel {
 
   // ---- WebSocket Hibernation API ----
 
-  /** Guarda o último `status`/`server_list` recebido do agent, para poder repetir pra um painel que conecta depois (ver handleWebSocketUpgrade). */
+  /**
+   * Guarda o último `status`/`server_list` recebido do agent (pra repetir
+   * pra um painel que conecta depois) e um histórico curto de `log_line`
+   * (pra o console do painel não voltar vazio a cada F5/segunda aba — antes
+   * disso, log_line nunca era cacheado, só repassado ao vivo).
+   */
   private async cacheAgentSnapshot(raw: string): Promise<void> {
     let parsed: any;
     try {
@@ -210,6 +224,13 @@ export class HostChannel {
     }
     if (parsed?.type === 'status' || parsed?.type === 'server_list') {
       await this.ctx.storage.put(`last:${parsed.type}`, raw);
+      return;
+    }
+    if (parsed?.type === 'log_line') {
+      const history = (await this.ctx.storage.get<string[]>(LOG_HISTORY_KEY)) ?? [];
+      history.push(raw);
+      if (history.length > LOG_HISTORY_MAX) history.splice(0, history.length - LOG_HISTORY_MAX);
+      await this.ctx.storage.put(LOG_HISTORY_KEY, history);
     }
   }
 
@@ -239,7 +260,7 @@ export class HostChannel {
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
-      await this.ctx.storage.delete(['last:status', 'last:server_list']);
+      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY]);
       this.broadcastToPanels({ type: 'agent_disconnected' });
     }
     try { ws.close(); } catch { /* já fechado */ }
@@ -247,7 +268,7 @@ export class HostChannel {
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
-      await this.ctx.storage.delete(['last:status', 'last:server_list']);
+      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY]);
       this.broadcastToPanels({ type: 'agent_disconnected' });
     }
   }

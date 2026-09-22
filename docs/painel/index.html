@@ -55,6 +55,7 @@
       white-space: pre-wrap; word-break: break-word;
     }
     .panel-console div + div { margin-top: 3px; }
+    .panel-console .is-error-line { color: var(--accent); font-weight: 600; }
     .panel-server-row {
       display: flex; align-items: center; justify-content: space-between;
       padding: 12px 0; border-bottom: 1px solid var(--border);
@@ -323,6 +324,16 @@
       pendingStartServerId = null;
     }
 
+    function appendConsoleLine(text, { isError = false } = {}) {
+      const box = el("console");
+      const line = document.createElement("div");
+      line.textContent = text;
+      if (isError) line.classList.add("is-error-line");
+      box.appendChild(line);
+      while (box.children.length > 500) box.removeChild(box.firstChild);
+      box.scrollTop = box.scrollHeight;
+    }
+
     // ---- Fase 2: comandos (parar/reiniciar/iniciar/console) ----
 
     function sendToAgent(payload) {
@@ -443,12 +454,12 @@
       }
 
       if (msg.type === "log_line") {
-        const box = el("console");
-        const line = document.createElement("div");
-        line.textContent = msg.line;
-        box.appendChild(line);
-        while (box.children.length > 500) box.removeChild(box.firstChild);
-        box.scrollTop = box.scrollHeight;
+        appendConsoleLine(msg.line);
+        return;
+      }
+
+      if (msg.type === "error") {
+        appendConsoleLine(`⚠ ${msg.message}`, { isError: true });
         return;
       }
 

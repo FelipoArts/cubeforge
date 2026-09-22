@@ -722,32 +722,54 @@ export default function Home() {
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<string>("panel-start-server-request", async (event) => {
         const serverId = event.payload;
+        // Sempre visível na UI (toast), mesmo quando tudo dá certo — sem isso,
+        // qualquer falha nos passos abaixo (servidor não encontrado, outro já
+        // rodando, exceção na orquestração) fica só num console.error que
+        // ninguém olha, e do ponto de vista de quem está na frente do PC
+        // "nada acontece" quando na real algo falhou silenciosamente.
+        pushDiagnostic({ level: "info", source: "Painel", title: "Início remoto pedido pelo painel web", message: `Procurando servidor (id: ${serverId})...` });
         try {
           const { listAllServers, findServerById, startServerOrchestrated } = await import("@/lib/server");
           const store = useAppStore.getState();
           const servers = await listAllServers(store.importedServerPaths);
           const serverInfo = findServerById(servers, serverId);
           if (!serverInfo) {
-            console.error(`[panel] Início remoto: servidor "${serverId}" não encontrado.`);
+            pushDiagnostic({ level: "error", source: "Painel", title: "Início remoto falhou", message: `Nenhum servidor local corresponde ao id "${serverId}" enviado pelo painel.` });
             return;
           }
-          // Mesma regra do plano: nunca sobe um servidor por cima de outro
-          // já rodando (diferente do botão local, que troca em silêncio —
-          // um comando disparado remotamente merece essa checagem extra).
-          if (store.runningServer && store.runningServer !== serverInfo.name) {
-            console.error(`[panel] Início remoto recusado: "${store.runningServer}" já está em execução.`);
+          // Mesma regra do plano: nunca sobe um servidor por cima de outro já
+          // rodando. IMPORTANTE: `runningServer` é persistido entre reinícios
+          // do app (ver partialize em store.ts), mas `serverStatus` não —
+          // volta pra "offline" sempre que o Cubicase abre. Então só confiar
+          // em `runningServer` sozinho trava pra sempre depois de qualquer
+          // tentativa anterior mal-sucedida (o nome fica "preso" lá, sem
+          // nenhum processo de verdade por trás) — foi exatamente isso que
+          // fez os pedidos seguintes saírem em silêncio, sem log nem toast
+          // nenhum. Só considera "ocupado" quando serverStatus também indica
+          // algo ativo agora.
+          const somethingActive = !!store.runningServer && ["starting", "online", "stopping"].includes(store.serverStatus);
+          if (somethingActive && store.runningServer !== serverInfo.name) {
+            pushDiagnostic({ level: "warning", source: "Painel", title: "Início remoto recusado", message: `"${store.runningServer}" já está em execução. Pare-o antes de iniciar outro pelo painel.` });
             return;
           }
-          if (store.runningServer === serverInfo.name) return; // já rodando — nada a fazer
+          if (somethingActive && store.runningServer === serverInfo.name) return; // já rodando — nada a fazer
 
           store.setSelectedServer(serverInfo.name);
           store.setRunningServer(serverInfo.name);
           store.setServerStatus("starting");
+          // Mesmo passo que o botão local dá antes de start_minecraft_server
+          // (ver handleStartMCServer em HostView.tsx) — é isso que grava em
+          // AppState::active_server_dir (Rust) qual pasta é "o servidor ativo
+          // agora". Sem isso, scan_local_servers() nunca marca este servidor
+          // como "rodando" (compara contra active_server_dir), então nem o
+          // painel web nem o restante da UI local refletem o estado real.
+          await registerServerWithCentral(serverInfo);
           await startServerOrchestrated(serverInfo, {
             onLog: (line) => console.log(`[panel] ${line}`),
           });
         } catch (err) {
           console.error("[panel] Falha ao iniciar servidor remotamente:", err);
+          pushDiagnostic({ level: "error", source: "Painel", title: "Início remoto falhou", message: String(err) });
           useAppStore.getState().setServerStatus("offline");
         }
       });

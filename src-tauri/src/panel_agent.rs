@@ -239,10 +239,19 @@ fn build_server_list_message(app: &AppHandle) -> String {
     serde_json::json!({ "type": "server_list", "servers": scan_local_servers(app) }).to_string()
 }
 
-/// Interpreta uma mensagem vinda do painel (via relay). Erros são só
-/// logados localmente por enquanto — reportar de volta pro painel fica pra
-/// uma fase de robustez futura (ver Fase 4 no plano).
-async fn handle_incoming_message(app: &AppHandle, raw: &str) {
+/// Interpreta uma mensagem vinda do painel (via relay).
+///
+/// `tx` é o mesmo canal que `run_agent_connection` usa pra escrever no
+/// WebSocket — depois de agir (parar/comando), manda um `status`/`server_list`
+/// **fresco, lido direto do estado atual do Rust** na hora, em vez de confiar
+/// só no evento `minecraft-status-changed` se propagar sozinho até o listener
+/// registrado em `run_agent_connection`. Isso fecha um buraco real: se por
+/// qualquer motivo aquele evento não chegar (app suspenso, corrida entre
+/// tasks, etc.), o painel ficava mostrando o estado antigo indefinidamente,
+/// mesmo depois de dar F5 — porque o `ctx.storage` do Durable Object só
+/// guarda o que o agent efetivamente mandou, e sem reenvio explícito aqui
+/// nada corrigia isso.
+async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
@@ -256,12 +265,15 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str) {
             let state = app.state::<AppState>();
             if let Err(e) = send_minecraft_command(state, command.to_string()).await {
                 log_to_file(app, &format!("[PANEL] Comando remoto \"{}\" falhou: {}", command, e));
+                let _ = tx.send(serde_json::json!({ "type": "error", "message": format!("Comando \"{}\" falhou: {}", command, e) }).to_string());
             }
         }
         "stop_server" => {
             log_to_file(app, "[PANEL] Parada remota solicitada pelo painel.");
             let state = app.state::<AppState>();
             stop_minecraft_server_internal(app, &state).await;
+            let _ = tx.send(build_status_message(app));
+            let _ = tx.send(build_server_list_message(app));
         }
         "start_server" => {
             let Some(server_id) = value.get("serverId").and_then(|v| v.as_str()) else { return; };
@@ -345,7 +357,21 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break Ok(()),
                     Some(Ok(Message::Text(txt))) => {
-                        handle_incoming_message(app, txt.as_ref()).await;
+                        // Roda em background em vez de dar await aqui dentro:
+                        // "stop_server" pode levar até 15s (stop_minecraft_server_internal
+                        // espera o processo encerrar sozinho antes de forçar). Se
+                        // ficássemos parados aqui, este loop pararia de responder
+                        // a Ping do relay durante esse tempo — Cloudflare pode
+                        // considerar a conexão morta e fechar, derrubando o
+                        // agent bem na hora em que o painel mais precisa ver o
+                        // resultado do comando.
+                        let app_for_msg = app.clone();
+                        let raw_ref: &str = txt.as_ref();
+                        let raw = raw_ref.to_string();
+                        let tx_for_msg = tx.clone();
+                        tauri::async_runtime::spawn(async move {
+                            handle_incoming_message(&app_for_msg, &raw, &tx_for_msg).await;
+                        });
                     }
                     Some(Ok(_)) => {} // Binary/Ping/Pong — nada esperado do relay além de texto
                     Some(Err(e)) => break Err(e.to_string()),
