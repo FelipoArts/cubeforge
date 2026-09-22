@@ -127,10 +127,17 @@ struct AppState {
     // duplicar um segundo aviso genérico sobre o mesmo evento.
     network_last_error: Mutex<Option<(String, String)>>,
 
-    // Processo do servidor Minecraft (java.exe)
-    // stdin é guardado separadamente pois `std::process::Child` não é Clone
-    minecraft_process: Mutex<Option<std::process::Child>>,
-    minecraft_stdin: Mutex<Option<std::process::ChildStdin>>,
+    // Processo do servidor Minecraft (java.exe), rodando sob um pseudo-terminal
+    // (ver início de start_minecraft_server) em vez de um pipe simples — Forge
+    // (e potencialmente outros mod loaders) faz buffering em bloco da própria
+    // saída quando detecta que não está conectado a um terminal de verdade,
+    // então mensagens esparsas (chat, comandos) durante o jogo nunca chegavam
+    // a ser descarregadas do buffer; só a rajada de mensagens do boot, densa o
+    // bastante pra encher o buffer sozinha, aparecia. Um PTY faz o processo
+    // achar que está mesmo num terminal, e ele volta a dar flush por linha.
+    // stdin é guardado separadamente pois o child não é Clone.
+    minecraft_process: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
+    minecraft_stdin: Mutex<Option<Box<dyn std::io::Write + Send>>>,
     
     // Flag atômica para saber se a parada foi solicitada pelo usuário
     // (diferencia parada limpa de crash). Usamos AtomicBool em vez de Mutex<bool>
@@ -1410,6 +1417,67 @@ struct DiagnosticPayload {
     allocated_ram_mb: Option<u64>,
 }
 
+/// Remove sequências de escape ANSI (CSI `ESC [ ... <letra>` e OSC `ESC ] ... BEL/ESC`)
+/// de uma linha lida do processo Minecraft. Rodar o Java sob um pseudo-terminal
+/// (ver start_minecraft_server) faz processos que decidiam sozinhos, via
+/// detecção de terminal, se coloriam a saída, passarem a emitir códigos de cor
+/// mesmo aqui — sem isso, o console mostraria caracteres de controle brutos
+/// misturados no meio das mensagens. Não tenta ser um parser completo de
+/// VT100, só cobre os casos práticos de saída de console (cores, cursor).
+fn strip_ansi_codes(input: &str) -> String {
+    if !input.contains('\u{1b}') {
+        return input.to_string(); // caminho comum: nada a remover
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2 == '\u{7}' || c2 == '\u{1b}' {
+                        break;
+                    }
+                }
+            }
+            _ => {} // ESC solto — descarta só ele
+        }
+    }
+    out
+}
+
+/// Remove um prompt "> " solto no início de uma linha.
+///
+/// O Forge usa o JLine pro console, que — ao detectar que está conectado a
+/// um terminal de verdade (nosso pseudo-terminal, ver start_minecraft_server)
+/// em vez de um pipe simples — imprime um prompt "> " antes de esperar cada
+/// comando, SEM quebra de linha depois. Como não há ninguém "digitando" de
+/// verdade pra sobrescrever esse prompt na tela (é tudo injetado
+/// programaticamente), ele acaba grudado no início do que vier em seguida no
+/// fluxo — o eco do próximo comando, ou até uma linha de log real do
+/// servidor. Tentei desativar isso via configuração da JVM (flags de JLine
+/// 2.x e 3.x) sem sucesso total; isso aqui trata o sintoma diretamente:
+/// remove só os 2 caracteres do prompt, preservando o resto da linha —
+/// nunca acontece com Vanilla (log real sempre começa com "[HH:MM:SS]").
+fn strip_leading_jline_prompt(line: &str) -> String {
+    line.strip_prefix("> ")
+        .or_else(|| line.strip_prefix('>'))
+        .unwrap_or(line)
+        .to_string()
+}
+
 /// Reconhece padrões conhecidos de causa de crash em uma linha de stdout/stderr
 /// do processo Java e retorna (código, título, mensagem) prontos para exibição
 /// ao usuário — e para o frontend decidir se há uma auto-correção aplicável.
@@ -1534,6 +1602,26 @@ async fn start_minecraft_server(
     let mut args = vec![
         format!("-Xms512M"),
         format!("-Xmx{}G", ram_gb),
+        // Complementa o "chcp 65001" (ver spawn logo abaixo): garante que a
+        // própria JVM decodifica/codifica texto como UTF-8 em vez de herdar
+        // a code page ANSI legada do Windows pra essas propriedades. Sem
+        // isso, acentos e caracteres especiais em chat/comandos viravam "?"
+        // ou ficavam ilegíveis nos dois sentidos sob um pseudo-terminal.
+        "-Dfile.encoding=UTF-8".to_string(),
+        "-Dsun.jnu.encoding=UTF-8".to_string(),
+        "-Dstdin.encoding=UTF-8".to_string(),
+        "-Dstdout.encoding=UTF-8".to_string(),
+        "-Dstderr.encoding=UTF-8".to_string(),
+        // Forge usa JLine pro console — ao rodar sob um pseudo-terminal de
+        // verdade (em vez de um pipe simples), o JLine detecta isso e ativa
+        // modo "terminal esperto" (eco de entrada, edição de linha), fazendo
+        // cada comando enviado aparecer duplicado no console (uma vez pelo
+        // nosso próprio eco, outra pelo eco do JLine). O Vanilla usa um
+        // leitor mais simples que não faz isso. Essa flag manda o JLine
+        // tratar o terminal como "não suportado" (modo simples, sem eco) —
+        // mesma recomendação usada por outras ferramentas que encapsulam o
+        // console do Minecraft/Forge.
+        "-Djline.terminal=jline.UnsupportedTerminal".to_string(),
     ];
     if let Some(args_dir) = &launch_args_dir {
         // Forge/NeoForge 1.17+: não há JAR único, o instalador gera libraries/ + run.bat/run.sh
@@ -1596,33 +1684,114 @@ async fn start_minecraft_server(
         }
     }
 
-    // Iniciar processo Java com stdin/stdout/stderr redirecionados
-    let mut child = silent_command(&java_path)
-        .args(&args)
-        .current_dir(&server_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    // Iniciar processo Java sob um pseudo-terminal (PTY), não um pipe simples.
+    //
+    // Por quê: Forge (e potencialmente outros mod loaders) substitui/envolve o
+    // System.out do Java pra rotear a saída dos mods pelo log formatado, e esse
+    // wrapper faz buffering em bloco em vez de dar flush por linha quando
+    // detecta que a saída não está conectada a um terminal de verdade. Durante
+    // o boot, a rajada de mensagens é densa o bastante pra encher o buffer
+    // sozinha; depois, com mensagens esparsas de jogo (chat, comandos, entrada
+    // de jogador), o buffer nunca enche e a saída nunca é descarregada — o
+    // console parece "travar" bem depois do "Done (", mesmo com o servidor
+    // funcionando normalmente (confirmado: Vanilla não tem esse problema,
+    // só servidores com Forge). Um PTY faz o processo achar que está mesmo
+    // conectado a um terminal interativo, o que restaura o flush por linha —
+    // é a mesma técnica usada por painéis de hospedagem de Minecraft.
+    //
+    // Diferença prática: um PTY combina stdout+stderr num único fluxo (é
+    // assim que um terminal de verdade funciona) — não há mais streams
+    // separados, então a thread de leitura abaixo aplica a mesma lógica que
+    // antes só rodava pro stdout (detecção de "Done (", causa de crash,
+    // entrada/saída de jogador) em tudo que chega.
+    let pty_system = portable_pty::native_pty_system();
+    let pty_pair = pty_system
+        .openpty(portable_pty::PtySize { rows: 50, cols: 200, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| {
-            let msg = format!("Falha ao iniciar Java: {}", e);
+            let msg = format!("Falha ao alocar pseudo-terminal para o Java: {}", e);
             log_to_file(&app, &msg);
             msg
         })?;
 
+    // NOTA: uma tentativa anterior envolvia isto num "cmd.exe /c chcp 65001 & ..."
+    // pra forçar a code page do console pra UTF-8. Revertido: o próprio
+    // portable-pty já aplica seu escaping padrão de argumento em cada `.arg()`
+    // — como a string montada à mão já continha aspas próprias ao redor do
+    // caminho do java, elas saíam escapadas em dobro (`\"`), e o cmd.exe não
+    // reconhecia mais o comando. Também tentei mudar a code page depois do
+    // spawn via AttachConsole+SetConsoleCP/SetConsoleOutputCP (sem precisar
+    // de cmd.exe nenhum) — não resolveu: a JVM aparentemente decide sua
+    // codificação de console durante a própria inicialização, então nossa
+    // mudança (feita alguns milissegundos DEPOIS do spawn, pelo processo pai)
+    // provavelmente chega tarde demais, depois da JVM já ter lido/decidido.
+    //
+    // A correção de verdade: "chcp 65001" tem que rodar ANTES do Java, no
+    // MESMO console (não como um passo separado do processo pai). O erro de
+    // aspas duplicadas de antes veio de eu ter montado a linha de comando
+    // inteira como UMA string com aspas próprias em volta do caminho do
+    // Java — o CommandBuilder já escapa cada `.arg()` que recebe (conferido
+    // no código-fonte da crate: `append_quoted` em cmdbuilder.rs só adiciona
+    // aspas quando o argumento tem espaço/aspas, e escapa aspas internas),
+    // então minhas aspas manuais viravam uma segunda camada de escaping que
+    // o cmd.exe não sabia interpretar de volta. A correção é dar cada parte
+    // (chcp, 65001, &, o caminho do java, cada arg) como um `.arg()`
+    // separado — o CommandBuilder cuida de aspas por conta própria, e só
+    // onde for realmente necessário (ex: se o caminho tiver espaço).
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = portable_pty::CommandBuilder::new("cmd.exe");
+        c.arg("/c");
+        c.arg("chcp");
+        c.arg("65001");
+        c.arg("&");
+        c.arg(&java_path);
+        for a in &args {
+            c.arg(a);
+        }
+        c
+    } else {
+        let mut c = portable_pty::CommandBuilder::new(&java_path);
+        c.args(&args);
+        c
+    };
+    cmd.cwd(&server_dir);
+    // Convenção universal (Unix e bibliotecas de terminal cross-platform,
+    // JLine incluso — usado pelo console do Forge) pra sinalizar "não faça
+    // truques de terminal esperto" — mais confiável que uma flag de sistema
+    // específica de uma versão de biblioteca (a flag -Djline.terminal=...
+    // que tentei antes é só pro JLine 2.x; Forge moderno tende a empacotar
+    // JLine 3.x, que ignora essa flag e olha isto aqui em vez disso).
+    cmd.env("TERM", "dumb");
+
+    let child = pty_pair.slave.spawn_command(cmd).map_err(|e| {
+        let msg = format!("Falha ao iniciar Java: {}", e);
+        log_to_file(&app, &msg);
+        msg
+    })?;
+    // Recomendado pela própria portable-pty: soltar o lado "slave" no processo
+    // pai assim que o filho for criado — o filho já tem sua própria referência.
+    drop(pty_pair.slave);
+
     // Amarrar ao job object: se o app morrer (fechado ou finalizado à força),
     // o Windows mata o servidor Minecraft junto em vez de deixá-lo órfão.
-    job_object::track_process(child.id());
-    // PID capturado aqui (antes de `child` ser movido pro Mutex abaixo) para a
-    // thread de amostragem de recursos poder consultar o processo específico.
-    let mc_pid = child.id();
+    let mc_pid = child.process_id().unwrap_or(0);
+    if mc_pid != 0 {
+        job_object::track_process(mc_pid);
+    } else {
+        log_to_file(&app, "[MC] Aviso: não consegui obter o PID do processo (job object não aplicado).");
+    }
 
-    // Extrair stdin antes de mover `child` para o Mutex
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let pty_reader = pty_pair.master.try_clone_reader().map_err(|e| {
+        let msg = format!("Falha ao abrir leitura do pseudo-terminal: {}", e);
+        log_to_file(&app, &msg);
+        msg
+    })?;
+    let pty_writer = pty_pair.master.take_writer().map_err(|e| {
+        let msg = format!("Falha ao abrir escrita do pseudo-terminal: {}", e);
+        log_to_file(&app, &msg);
+        msg
+    })?;
 
-    // Guardar processo e stdin no estado global
+    // Guardar processo e stdin (aqui, o "writer" do PTY) no estado global
     {
         state.minecraft_stop_requested.store(false, Ordering::SeqCst);
         // Reseta para esta nova execução — sem isso, um restart reaproveitaria o
@@ -1632,7 +1801,7 @@ async fn start_minecraft_server(
         // sem abrir a porta nem imprimir "Done (").
         state.minecraft_was_online.store(false, Ordering::SeqCst);
         state.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner()) = stdin;
+        *state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner()) = Some(pty_writer);
         *state.minecraft_process.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
         *state.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -1659,76 +1828,56 @@ async fn start_minecraft_server(
     };
     log_to_file(&app, &format!("[MC] Contagem de crash-reports antes de iniciar: {}", crash_reports_before.len()));
 
-    // --- Thread de leitura de stdout ---
-    let app_stdout = app.clone();
-    let state_stdout_handle = app.state::<AppState>().inner() as *const AppState as usize;
-    if let Some(stdout_pipe) = stdout {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout_pipe);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        log_to_file(&app_stdout, &format!("[MC-Stdout] {}", l));
-                        let _ = app_stdout.emit("minecraft-log", &l);
-                        let state_ref = unsafe { &*(state_stdout_handle as *const AppState) };
-                        // Detect server ready line
-                        if l.contains("Done (") && l.contains("INFO") {
-                            // Marcar que o servidor ficou online (para a thread de polling TCP
-                            // não emitir "crashed" quando o servidor for parado depois)
-                            state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
-                            let _ = app_stdout.emit("minecraft-status-changed", "online");
-                            report_mc_status(&app_stdout, state_ref, "online");
-                        }
-                        // Guardar a causa raiz do crash (primeiro padrão reconhecido vence —
-                        // erros em cascata depois costumam ser só consequência do primeiro).
-                        if let Some(cause) = detect_known_mc_error(&l) {
-                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner());
-                            if last_error.is_none() {
-                                *last_error = Some(cause);
-                            }
-                        }
-                        // Manter a contagem de jogadores online (ver comentário no campo
-                        // minecraft_online_players) em sincronia com o mesmo log que o
-                        // frontend já usa para o painel de Jogadores.
-                        if let Some((name, joined)) = parse_player_event(&l) {
-                            let mut players = state_ref.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner());
-                            if joined {
-                                players.insert(name);
-                            } else {
-                                players.remove(&name);
-                            }
+    // --- Thread de leitura do PTY (stdout+stderr combinados) ---
+    // `pty_pair.master` precisa continuar vivo enquanto o reader/writer
+    // clonados dele estiverem em uso — movido pra dentro desta thread só pra
+    // não ser descartado cedo demais (não é usado diretamente aqui).
+    let app_pty = app.clone();
+    let state_pty_handle = app.state::<AppState>().inner() as *const AppState as usize;
+    let pty_master_keepalive = pty_pair.master;
+    std::thread::spawn(move || {
+        let _keepalive = pty_master_keepalive;
+        let reader = BufReader::new(pty_reader);
+        for line in reader.lines() {
+            match line {
+                Ok(raw_l) => {
+                    let l = strip_leading_jline_prompt(&strip_ansi_codes(&raw_l));
+                    log_to_file(&app_pty, &format!("[MC-PTY] {}", l));
+                    let _ = app_pty.emit("minecraft-log", &l);
+                    panel_agent::push_minecraft_log_line(&l);
+                    let state_ref = unsafe { &*(state_pty_handle as *const AppState) };
+                    // Detect server ready line
+                    if l.contains("Done (") && l.contains("INFO") {
+                        // Marcar que o servidor ficou online (para a thread de polling TCP
+                        // não emitir "crashed" quando o servidor for parado depois)
+                        state_ref.minecraft_was_online.store(true, Ordering::SeqCst);
+                        let _ = app_pty.emit("minecraft-status-changed", "online");
+                        report_mc_status(&app_pty, state_ref, "online");
+                    }
+                    // Guardar a causa raiz do crash (primeiro padrão reconhecido vence —
+                    // erros em cascata depois costumam ser só consequência do primeiro).
+                    if let Some(cause) = detect_known_mc_error(&l) {
+                        let mut last_error = state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if last_error.is_none() {
+                            *last_error = Some(cause);
                         }
                     }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    // --- Thread de leitura de stderr ---
-    let app_stderr = app.clone();
-    let state_stderr_handle = app.state::<AppState>().inner() as *const AppState as usize;
-    if let Some(stderr_pipe) = stderr {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr_pipe);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        log_to_file(&app_stderr, &format!("[MC-Stderr] {}", l));
-                        let _ = app_stderr.emit("minecraft-log", &l);
-                        if let Some(cause) = detect_known_mc_error(&l) {
-                            let state_ref = unsafe { &*(state_stderr_handle as *const AppState) };
-                            let mut last_error = state_ref.minecraft_last_error.lock().unwrap_or_else(|e| e.into_inner());
-                            if last_error.is_none() {
-                                *last_error = Some(cause);
-                            }
+                    // Manter a contagem de jogadores online (ver comentário no campo
+                    // minecraft_online_players) em sincronia com o mesmo log que o
+                    // frontend já usa para o painel de Jogadores.
+                    if let Some((name, joined)) = parse_player_event(&l) {
+                        let mut players = state_ref.minecraft_online_players.lock().unwrap_or_else(|e| e.into_inner());
+                        if joined {
+                            players.insert(name);
+                        } else {
+                            players.remove(&name);
                         }
                     }
-                    Err(_) => break,
                 }
+                Err(_) => break,
             }
-        });
-    }
+        }
+    });
 
     // --- Rotina de polling TCP para detectar quando o servidor está online ---
     // Reusa `server_port` já resolvido acima (server.properties, com fallback em local_port).
@@ -1882,8 +2031,10 @@ async fn start_minecraft_server(
             match guard.as_mut() {
                 Some(child) => match child.try_wait() {
                     Ok(Some(status)) => {
-                        let code = status.code();
-                        log_to_file(&app_monitor, &format!("[MC-DEBUG] try_wait() detectou saída. ExitStatus.code() = {:?}", code));
+                        // portable_pty::ExitStatus não tem .code() (Option<i32>) como
+                        // std::process::ExitStatus — só .exit_code() (u32), sempre presente.
+                        let code = Some(status.exit_code() as i32);
+                        log_to_file(&app_monitor, &format!("[MC-DEBUG] try_wait() detectou saída. exit_code() = {:?}", code));
                         break code;
                     }
                     Ok(None) => {
@@ -2446,7 +2597,11 @@ async fn stop_minecraft_server_internal(
     let has_stdin = {
         let mut stdin_guard = state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut stdin) = *stdin_guard {
-            let _ = stdin.write_all(b"stop\n");
+            // \r\n, não só \n: o "stdin" agora é a entrada de um pseudo-terminal
+            // (ver start_minecraft_server) — o console do Windows completa uma
+            // linha de entrada ao ver Enter (\r), igual digitação de verdade,
+            // não no \n que bastava com o pipe simples de antes.
+            let _ = stdin.write_all(b"stop\r\n");
             let _ = stdin.flush();
             true
         } else {
@@ -2483,6 +2638,13 @@ async fn stop_minecraft_server_internal(
         if let Some(ref mut child) = *guard {
             if matches!(child.try_wait(), Ok(None)) {
                 log_to_file(app, "[MC] Forçando encerramento do processo Java.");
+                // O processo rastreado aqui é o cmd.exe que envolve o Java
+                // (ver start_minecraft_server — precisa dele pra rodar
+                // "chcp 65001" antes do Java começar). Matar só o cmd.exe
+                // não mata o java.exe filho dele.
+                if let Some(pid) = child.process_id() {
+                    job_object::kill_process_tree(pid);
+                }
                 let _ = child.kill();
             }
         }
@@ -2508,7 +2670,8 @@ async fn send_minecraft_command(
     
     let mut stdin_guard = state.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref mut stdin) = *stdin_guard {
-        let line = format!("{}\n", trimmed);
+        // \r\n — ver comentário equivalente em stop_minecraft_server_internal.
+        let line = format!("{}\r\n", trimmed);
         stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         stdin.flush().map_err(|e| e.to_string())?;
         Ok(())
@@ -5473,7 +5636,7 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
     let has_stdin = {
       let mut stdin_guard = state_ref.minecraft_stdin.lock().unwrap_or_else(|e| e.into_inner());
       if let Some(ref mut stdin) = *stdin_guard {
-        let _ = stdin.write_all(b"stop\n");
+        let _ = stdin.write_all(b"stop\r\n"); // \r\n — ver comentário em stop_minecraft_server_internal
         let _ = stdin.flush();
         true
       } else {
@@ -5502,6 +5665,11 @@ async fn graceful_shutdown_and_exit(app: tauri::AppHandle) {
       if let Some(ref mut child) = *guard {
         if matches!(child.try_wait(), Ok(None)) {
           log_to_file(&app, "[SHUTDOWN] Forçando kill do servidor Minecraft.");
+          // Ver comentário equivalente em stop_minecraft_server_internal:
+          // o processo rastreado é o cmd.exe que envolve o Java.
+          if let Some(pid) = child.process_id() {
+            job_object::kill_process_tree(pid);
+          }
           let _ = child.kill();
         }
       }

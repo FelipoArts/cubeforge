@@ -38,10 +38,12 @@
 // mesmo com o device_token válido.
 // ============================================================
 
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -54,7 +56,54 @@ const PANEL_RELAY_WS_BASE: &str = "wss://cubeforge-api.cubeforge.workers.dev/pan
 // quedas curtas de rede, comuns num link doméstico).
 const BACKOFF_STEPS_SECS: [u64; 4] = [2, 5, 10, 30];
 const NO_DEVICE_RETRY_SECS: u64 = 5;
-const STATUS_HEARTBEAT_SECS: u64 = 20;
+// Poll, não evento: ver comentário grande em cima de LOG_SINK sobre por que
+// nada aqui usa AppHandle::listen. 5s (não 2s) de propósito, como margem
+// extra depois de mover scan_local_servers (I/O de disco síncrono) pra
+// spawn_blocking — ver build_server_list_message_async.
+const STATUS_POLL_SECS: u64 = 5;
+
+// ============================================================
+// Por que log_line NÃO usa AppHandle::listen("minecraft-log", ...)
+// ============================================================
+// Uma versão anterior deste módulo registrava um listener Rust (`app.listen`)
+// pros eventos "minecraft-log"/"minecraft-status-changed". Isso quebrou o
+// console do Minecraft por completo (local E no painel, mesmo sem o painel
+// estar em uso) — a suspeita forte é que listeners Rust do Tauri rodam
+// SÍNCRONOS, dentro da própria chamada de `emit()`, e "minecraft-log" é
+// emitido de dentro da thread nativa (`std::thread::spawn`, não uma task
+// async) que lê a stdout do processo Java linha a linha em lib.rs. Qualquer
+// travamento ali — mesmo um lock brevemente contestado — atrasa ou empaca
+// essa thread crítica, e como ela nunca solta a leitura em caso de pane
+// silenciosa, o console para de vez.
+//
+// Em vez de escutar o evento, o próprio ponto de emissão em lib.rs chama
+// `push_minecraft_log_line` diretamente (uma linha adicionada logo depois do
+// `emit` existente) — um sender trocado aqui, protegido por um Mutex normal
+// (contenção mínima, nunca segurado durante I/O). Isso nunca participa do
+// barramento de eventos do Tauri, então não tem como interferir com a
+// entrega do evento pro frontend (que continua existindo, intocada).
+//
+// Por simetria e pelo mesmo motivo, status também deixou de depender do
+// evento "minecraft-status-changed" — em vez de um listener, o loop principal
+// já fazia polling a cada 20s (heartbeat) e agora faz a cada 2s, sempre
+// lendo o estado atual direto do AppState. Mais simples, sem listener
+// nenhum, e responsivo o bastante pro painel.
+static LOG_SINK: OnceLock<Mutex<Option<UnboundedSender<String>>>> = OnceLock::new();
+
+fn log_sink() -> &'static Mutex<Option<UnboundedSender<String>>> {
+    LOG_SINK.get_or_init(|| Mutex::new(None))
+}
+
+/// Chamado por lib.rs logo depois de `app.emit("minecraft-log", &l)`, na
+/// mesma thread nativa que lê a stdout do Java. Precisa ser barato e nunca
+/// bloquear — só compara um Option e manda por um canal não-bloqueante.
+pub(crate) fn push_minecraft_log_line(line: &str) {
+    let guard = log_sink().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        let msg = serde_json::json!({ "type": "log_line", "line": line, "ts": now_iso() }).to_string();
+        let _ = tx.send(msg);
+    }
+}
 
 #[derive(Deserialize, Clone)]
 struct PanelDeviceFile {
@@ -239,18 +288,28 @@ fn build_server_list_message(app: &AppHandle) -> String {
     serde_json::json!({ "type": "server_list", "servers": scan_local_servers(app) }).to_string()
 }
 
+/// `scan_local_servers` faz I/O de disco síncrono (read_dir + ler
+/// cubicase-meta.json de cada pasta) — rodar isso direto dentro de uma task
+/// async, chamado a cada 2s pelo poll de status, prende a worker thread do
+/// Tokio que a runtime também usa pra entregar eventos (emit) pro frontend.
+/// Foi exatamente isso que fez o console "travar" de novo depois do poll
+/// passar de 20s pra 2s: não é mais raro o bastante pra passar despercebido.
+/// `spawn_blocking` roda no pool de threads dedicado a isso, sem competir
+/// pela runtime assíncrona.
+async fn build_server_list_message_async(app: &AppHandle) -> String {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || build_server_list_message(&app))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "type": "server_list", "servers": [] }).to_string())
+}
+
 /// Interpreta uma mensagem vinda do painel (via relay).
 ///
 /// `tx` é o mesmo canal que `run_agent_connection` usa pra escrever no
 /// WebSocket — depois de agir (parar/comando), manda um `status`/`server_list`
-/// **fresco, lido direto do estado atual do Rust** na hora, em vez de confiar
-/// só no evento `minecraft-status-changed` se propagar sozinho até o listener
-/// registrado em `run_agent_connection`. Isso fecha um buraco real: se por
-/// qualquer motivo aquele evento não chegar (app suspenso, corrida entre
-/// tasks, etc.), o painel ficava mostrando o estado antigo indefinidamente,
-/// mesmo depois de dar F5 — porque o `ctx.storage` do Durable Object só
-/// guarda o que o agent efetivamente mandou, e sem reenvio explícito aqui
-/// nada corrigia isso.
+/// **fresco, lido direto do estado atual do Rust** na hora, sem esperar o
+/// próximo tick do poll (ver STATUS_POLL_SECS) — o painel vê o resultado
+/// imediatamente em vez de até 2s depois.
 async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
@@ -262,6 +321,16 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
     match msg_type {
         "command" => {
             let Some(command) = value.get("command").and_then(|v| v.as_str()) else { return; };
+            // Comando local ecoa "> comando" na tela na hora (é a própria UI do
+            // app fazendo isso, ver console do HostView) — um comando vindo do
+            // painel pula direto pro Rust sem passar pelo frontend, então esse
+            // eco nunca acontecia em lugar nenhum (nem no app, nem no painel),
+            // mesmo o comando executando de verdade. Reproduz o mesmo eco nos
+            // dois lugares aqui.
+            let echo = format!("> {} (via painel web)", command);
+            let _ = app.emit("minecraft-log", &echo);
+            let _ = tx.send(serde_json::json!({ "type": "log_line", "line": echo, "ts": now_iso() }).to_string());
+
             let state = app.state::<AppState>();
             if let Err(e) = send_minecraft_command(state, command.to_string()).await {
                 log_to_file(app, &format!("[PANEL] Comando remoto \"{}\" falhou: {}", command, e));
@@ -273,7 +342,7 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
             let state = app.state::<AppState>();
             stop_minecraft_server_internal(app, &state).await;
             let _ = tx.send(build_status_message(app));
-            let _ = tx.send(build_server_list_message(app));
+            let _ = tx.send(build_server_list_message_async(app).await);
         }
         "start_server" => {
             let Some(server_id) = value.get("serverId").and_then(|v| v.as_str()) else { return; };
@@ -305,38 +374,24 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
     log_to_file(app, "[PANEL] Conectado ao painel web remoto.");
     let (mut write, mut read) = ws_stream.split();
 
-    // Canal interno: os listeners de evento (chamados de forma síncrona pelo
-    // Tauri) só empilham a mensagem aqui; quem realmente escreve no
-    // WebSocket é o loop principal abaixo, que também lê mensagens
-    // recebidas — evita ter duas tasks concorrentes escrevendo no mesmo
-    // sink do WebSocket.
+    // Canal interno: tanto o sink de log (ver push_minecraft_log_line) quanto
+    // as respostas de handle_incoming_message só empilham a mensagem aqui;
+    // quem realmente escreve no WebSocket é o loop principal abaixo, que
+    // também lê mensagens recebidas — evita ter duas tasks concorrentes
+    // escrevendo no mesmo sink do WebSocket.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    let tx_log = tx.clone();
-    let unlisten_log = app.listen("minecraft-log", move |event| {
-        if let Ok(line) = serde_json::from_str::<String>(event.payload()) {
-            let msg = serde_json::json!({ "type": "log_line", "line": line, "ts": now_iso() }).to_string();
-            let _ = tx_log.send(msg);
-        }
-    });
+    // Troca o sink de log para esta conexão (substitui o de uma conexão
+    // anterior, se houver) — ver comentário grande acima de LOG_SINK sobre
+    // por que isso não é um AppHandle::listen.
+    *log_sink().lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
-    // Reenvia status E lista de servidores em toda transição (iniciar,
-    // parar, crashar) — sem isso, o painel só saberia que outro servidor
-    // ficou disponível/indisponível no próximo reconnect, porque o snapshot
-    // de server_list logo abaixo só roda uma vez, ao abrir a conexão.
-    let app_for_status = app.clone();
-    let tx_status = tx.clone();
-    let unlisten_status = app.listen("minecraft-status-changed", move |_event| {
-        let _ = tx_status.send(build_status_message(&app_for_status));
-        let _ = tx_status.send(build_server_list_message(&app_for_status));
-    });
-
-    // Snapshot inicial assim que conecta, sem esperar o primeiro heartbeat.
+    // Snapshot inicial assim que conecta, sem esperar o primeiro poll.
     let _ = tx.send(build_status_message(app));
-    let _ = tx.send(build_server_list_message(app));
+    let _ = tx.send(build_server_list_message_async(app).await);
 
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(STATUS_HEARTBEAT_SECS));
-    heartbeat.tick().await; // o primeiro tick é imediato; o snapshot acima já cobriu isso
+    let mut status_poll = tokio::time::interval(Duration::from_secs(STATUS_POLL_SECS));
+    status_poll.tick().await; // o primeiro tick é imediato; o snapshot acima já cobriu isso
 
     let result = loop {
         tokio::select! {
@@ -350,8 +405,9 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
                     None => break Ok(()), // nunca deveria acontecer (tx segue vivo no escopo desta função)
                 }
             }
-            _ = heartbeat.tick() => {
+            _ = status_poll.tick() => {
                 let _ = tx.send(build_status_message(app));
+                let _ = tx.send(build_server_list_message_async(app).await);
             }
             incoming = read.next() => {
                 match incoming {
@@ -380,8 +436,14 @@ async fn run_agent_connection(app: &AppHandle, device: &PanelDeviceFile) -> Resu
         }
     };
 
-    app.unlisten(unlisten_log);
-    app.unlisten(unlisten_status);
+    // Só limpa o sink se ainda for o nosso — outra conexão pode já ter
+    // assumido (ex: reconexão rápida) entre este loop terminar e aqui.
+    {
+        let mut guard = log_sink().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|s| s.same_channel(&tx)) {
+            *guard = None;
+        }
+    }
     result
 }
 

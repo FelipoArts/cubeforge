@@ -50,9 +50,10 @@ sysinfo = "0.32"
 md5 = "0.7"
 hematite-nbt = "0.5"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+portable-pty = "0.8"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
 tempfile = "3"
