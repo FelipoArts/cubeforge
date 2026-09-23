@@ -329,6 +329,20 @@ async fn build_server_list_message_async(app: &AppHandle) -> String {
         .unwrap_or_else(|_| serde_json::json!({ "type": "server_list", "servers": [] }).to_string())
 }
 
+fn by_suffix(by: &Option<String>) -> String {
+    by.as_deref().map(|n| format!(" (por {})", n)).unwrap_or_default()
+}
+
+/// Deixa registrado no console (do app e do painel) quem ligou/desligou pelo
+/// painel — só quando há um nome (acesso compartilhado); o dono usando o
+/// próprio painel já sabe o que fez.
+fn announce_panel_action(app: &AppHandle, tx: &UnboundedSender<String>, by: &Option<String>, what: &str) {
+    let Some(name) = by else { return; };
+    let line = format!("[Painel] {} {}.", name, what);
+    let _ = app.emit("minecraft-log", &line);
+    let _ = tx.send(serde_json::json!({ "type": "log_line", "line": line, "ts": now_iso() }).to_string());
+}
+
 /// Interpreta uma mensagem vinda do painel (via relay).
 ///
 /// `tx` é o mesmo canal que `run_agent_connection` usa pra escrever no
@@ -344,6 +358,10 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
         return;
     };
 
+    // Nome de quem pediu — preenchido pelo relay (Durable Object), nunca pelo
+    // painel (ver host-channel.ts); presente quando há acesso compartilhado.
+    let by = value.get("by").and_then(|v| v.as_str()).map(|s| s.to_string());
+
     match msg_type {
         "command" => {
             let Some(command) = value.get("command").and_then(|v| v.as_str()) else { return; };
@@ -353,7 +371,10 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
             // eco nunca acontecia em lugar nenhum (nem no app, nem no painel),
             // mesmo o comando executando de verdade. Reproduz o mesmo eco nos
             // dois lugares aqui.
-            let echo = format!("> {} (via painel web)", command);
+            let echo = match &by {
+                Some(name) => format!("> {} (via painel web — {})", command, name),
+                None => format!("> {} (via painel web)", command),
+            };
             let _ = app.emit("minecraft-log", &echo);
             let _ = tx.send(serde_json::json!({ "type": "log_line", "line": echo, "ts": now_iso() }).to_string());
 
@@ -364,7 +385,8 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
             }
         }
         "stop_server" => {
-            log_to_file(app, "[PANEL] Parada remota solicitada pelo painel.");
+            log_to_file(app, &format!("[PANEL] Parada remota solicitada pelo painel{}.", by_suffix(&by)));
+            announce_panel_action(app, tx, &by, "desligou o servidor");
             let state = app.state::<AppState>();
             stop_minecraft_server_internal(app, &state).await;
             let _ = tx.send(build_status_message(app));
@@ -372,7 +394,8 @@ async fn handle_incoming_message(app: &AppHandle, raw: &str, tx: &tokio::sync::m
         }
         "start_server" => {
             let Some(server_id) = value.get("serverId").and_then(|v| v.as_str()) else { return; };
-            log_to_file(app, &format!("[PANEL] Início remoto solicitado pelo painel para \"{}\".", server_id));
+            log_to_file(app, &format!("[PANEL] Início remoto solicitado pelo painel para \"{}\"{}.", server_id, by_suffix(&by)));
+            announce_panel_action(app, tx, &by, "ligou o servidor");
             // A checagem/instalação de JRE e a resolução de porta/RAM vivem em
             // TypeScript (src/lib/server.ts:startServerOrchestrated) — mesma
             // rotina do botão "Iniciar Servidor" local — em vez de duplicadas

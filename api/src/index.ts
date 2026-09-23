@@ -1,4 +1,5 @@
 import { resolveSupabaseUserId, userHasActiveSubscription, SUPABASE_URL } from './supabase';
+import { handlePanelAccessRoute, handlePanelWsTicket, type PanelResult } from './panel-members';
 export { HostChannel } from './durable-objects/host-channel';
 
 const LEASE_DURATION_MS = 90_000;  // 90s lease
@@ -87,7 +88,7 @@ const ResponseCodes = {
   BAD_REQUEST: 'BAD_REQUEST', NOT_FOUND: 'NOT_FOUND', SERVER_NOT_FOUND: 'SERVER_NOT_FOUND', SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
   CONFLICT: 'CONFLICT', INTERNAL_ERROR: 'INTERNAL_ERROR', VALIDATION_ERROR: 'VALIDATION_ERROR',
   STALE_WRITE: 'STALE_WRITE', OPERATION_IN_PROGRESS: 'OPERATION_IN_PROGRESS', RATE_LIMITED: 'RATE_LIMITED',
-  SUBSCRIPTION_REQUIRED: 'SUBSCRIPTION_REQUIRED',
+  SUBSCRIPTION_REQUIRED: 'SUBSCRIPTION_REQUIRED', FORBIDDEN: 'FORBIDDEN',
 } as const;
 
 const SHORT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -1216,38 +1217,9 @@ async function handleResolveSlug(slug: string, env: Env, cors: Record<string, st
 // header Authorization de verdade (não é um navegador, não tem essa
 // limitação), então conecta direto na rota de WebSocket abaixo.
 
-/** POST /api/v1/panel/ws-ticket — painel web pede um ticket de uso único para abrir o WebSocket do dispositivo. */
-async function handlePanelWsTicket(req: Request, env: Env, cors: Record<string, string>): Promise<Response> {
-  const userId = await resolveSupabaseUserId(req);
-  if (!userId) return json(fail(ResponseCodes.BAD_REQUEST, 'Sessão inválida ou expirada. Faça login novamente.'), 401, cors);
-
-  let body: any; try { body = await req.json(); } catch { return json(fail(ResponseCodes.BAD_REQUEST, 'JSON inválido.'), 400, cors); }
-  const deviceId = typeof body?.deviceId === 'string' ? body.deviceId : null;
-  if (!deviceId) return json(fail(ResponseCodes.VALIDATION_ERROR, 'deviceId obrigatório.'), 400, cors);
-
-  if (!(await userHasActiveSubscription(env, userId))) {
-    return json(fail(ResponseCodes.SUBSCRIPTION_REQUIRED, 'O painel web remoto é um recurso do Cubicase Plus.'), 402, cors);
-  }
-
-  // Confere que o dispositivo pertence mesmo a este usuário antes de emitir
-  // o ticket — sem isso, qualquer assinante Plus logado poderia adivinhar o
-  // id (UUID) de outro dispositivo e pedir um ticket para ele.
-  if (!env.SUPABASE_SERVICE_ROLE_KEY) return json(fail(ResponseCodes.INTERNAL_ERROR, 'Painel web não configurado neste servidor.'), 503, cors);
-  const ownerResp = await fetch(
-    `${SUPABASE_URL}/rest/v1/panel_devices?id=eq.${encodeURIComponent(deviceId)}&select=user_id`,
-    { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
-  );
-  const ownerRows: any = ownerResp.ok ? await ownerResp.json().catch(() => []) : [];
-  if (ownerRows?.[0]?.user_id !== userId) {
-    return json(fail(ResponseCodes.SERVER_NOT_FOUND, 'Dispositivo não encontrado para este usuário.'), 404, cors);
-  }
-
-  const id = env.HOST_CHANNEL.idFromName(deviceId);
-  const stub = env.HOST_CHANNEL.get(id);
-  const mintResp = await stub.fetch('https://host-channel.internal/mint-ticket', { method: 'POST' });
-  const { ticket } = await mintResp.json() as { ticket: string };
-
-  return json(ok(ResponseCodes.SUCCESS, 'Ticket emitido.', { ticket, deviceId }), 200, cors);
+/** Embrulha o resultado simples de panel-members.ts (que não conhece ok()/fail()) na resposta padrão da API. */
+function panelJson(r: PanelResult, cors: Record<string, string>): Response {
+  return json(r.status < 400 ? ok(r.code, r.message, r.data) : fail(r.code, r.message, r.data), r.status, cors);
 }
 
 /** GET /panel/ws/{deviceId}?role=agent|panel — encaminha o upgrade de WebSocket para o Durable Object do dispositivo. */
@@ -1394,7 +1366,17 @@ export default {
       // POST /api/v1/panel/ws-ticket — painel web (Cubicase Plus) pede ticket para abrir o WebSocket
       if (m === 'POST' && p === '/api/v1/panel/ws-ticket') {
         if (!(await checkRateLimit(env, 'panel-ticket', clientIp(req), PANEL_TICKET_RATE_LIMIT))) return rateLimitedResponse(cors);
-        return await handlePanelWsTicket(req, env, cors);
+        return panelJson(await handlePanelWsTicket(req, env), cors);
+      }
+
+      // Acesso compartilhado do painel (dispositivos, membros, convites) — ver panel-members.ts
+      if (p.startsWith('/api/v1/panel/')) {
+        const result = await handlePanelAccessRoute(
+          req,
+          { env, rateLimit: (bucket, key, limit) => checkRateLimit(env, bucket, key, limit) },
+          m, p, url,
+        );
+        if (result) return panelJson(result, cors);
       }
 
       // GET /panel/ws/{deviceId} — upgrade de WebSocket (app desktop com device_token, ou painel web com ticket)

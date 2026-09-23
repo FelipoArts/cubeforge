@@ -14,17 +14,25 @@
   <link rel="stylesheet" href="/assets/style.css" />
   <style>
     /* Só o que é específico desta página — o resto vem de assets/style.css. */
+    [hidden] { display: none !important; }
     .panel-shell { max-width: 560px; margin: 0 auto; padding: 0 20px; }
-    .device-list { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+    .device-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
     .device-item {
-      display: flex; align-items: center; justify-content: space-between;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
       background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);
       padding: 14px 16px; cursor: pointer; transition: border-color 0.15s ease;
     }
     .device-item:hover { border-color: var(--border-strong); }
+    .device-item.is-static { cursor: default; }
+    .device-item.is-static:hover { border-color: var(--border); }
     .device-item .name { font-weight: 600; }
     .device-item .seen { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    .device-item .perms { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+    .device-item .row-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .device-section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin: 22px 0 0; }
     .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 13px; padding: 0; white-space: nowrap; }
+    .notice { font-size: 13px; color: var(--text-secondary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; margin: 0 0 14px; }
+    .notice.is-error { color: var(--accent); border-color: var(--accent-soft-strong); }
 
     /* ---- Painel em si: dashboard de largura quase total, fora do cartão de login ---- */
     .panel-dashboard { max-width: 1400px; margin: 0 auto; padding: 28px 24px 64px; }
@@ -33,7 +41,9 @@
       margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--border);
     }
     .panel-top-bar .left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 0; }
+    .panel-top-bar .right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
     .panel-top-bar .device-name { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge-shared { font-size: 12px; font-weight: 600; color: var(--text-secondary); border: 1px solid var(--border-strong); border-radius: 999px; padding: 3px 10px; }
     .panel-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 26px; }
     .panel-stat {
       background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md);
@@ -70,15 +80,60 @@
       border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap;
     }
     .btn-mini:hover { border-color: var(--accent); }
-    .btn-mini:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-mini:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-mini:disabled:hover { border-color: var(--border-strong); }
     .btn-mini-danger { border-color: rgba(255, 68, 51, 0.4); color: var(--accent); }
     .btn-mini-danger:hover { background: var(--accent-soft); }
     .console-command-form { display: flex; gap: 8px; margin-top: 12px; }
     .console-command-form input { flex: 1; }
+    .console-hint { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+    .console-denied { color: var(--text-muted); font-size: 13px; padding: 14px 0; }
+
+    /* ---- Aviso curto (permissão negada, acesso alterado...) ---- */
+    .panel-toast {
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 60;
+      background: var(--bg-card); border: 1px solid var(--border-strong); color: var(--text-primary);
+      border-radius: var(--radius-sm); padding: 12px 18px; font-size: 14px; max-width: min(92vw, 520px);
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    }
+    .panel-toast.is-error { border-color: var(--accent-soft-strong); color: var(--accent); }
+
+    /* ---- Compartilhar acesso (modal) ---- */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.65); z-index: 50;
+      display: flex; align-items: flex-start; justify-content: center; padding: 32px 16px; overflow-y: auto;
+    }
+    .modal-card {
+      background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 24px; width: 100%; max-width: 680px;
+    }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+    .modal-head h2 { font-size: 18px; margin: 0; }
+    .share-section { margin-top: 26px; }
+    .share-section h3 { font-size: 14px; margin: 0 0 10px; }
+    .segmented { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 999px; overflow: hidden; margin-bottom: 14px; }
+    .segmented button { background: none; border: none; color: var(--text-secondary); padding: 7px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .segmented button.is-active { background: var(--accent-soft); color: var(--accent); }
+    .field-row { margin-bottom: 12px; }
+    .perm-label { display: block; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 12px 0 6px; }
+    .perm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 12px; }
+    .perm-grid label, .check-row { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
+    .perm-hint { font-size: 12px; color: var(--text-muted); margin: 6px 0 0; }
+    .perm-allowlist { font-family: "SF Mono", "Cascadia Code", ui-monospace, monospace; font-size: 13px; resize: vertical; }
+    .share-result { margin-top: 12px; }
+    .link-box { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .link-box input { flex: 1; min-width: 0; }
+    .share-row { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 8px; background: var(--bg-elevated); }
+    .share-row .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .share-row .who { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .share-row .who small { display: block; font-weight: 400; color: var(--text-muted); font-size: 12px; }
+    .share-row .perms { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+    .share-row .editor-slot { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
     @media (max-width: 480px) {
       .download-card { padding: 24px; }
       .panel-dashboard { padding: 20px 16px 48px; }
       .panel-stat-grid { grid-template-columns: 1fr 1fr; }
+      .perm-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -93,7 +148,7 @@
     </div>
   </nav>
 
-  <!-- Login + escolha de dispositivo: cartão centralizado, como /entrar/. -->
+  <!-- Login + escolha de dispositivo + convite: cartão centralizado, como /entrar/. -->
   <header class="download-hero" id="auth-screen">
     <div class="container panel-shell">
       <div class="eyebrow"><span class="dot"></span>Cubicase Plus</div>
@@ -118,13 +173,23 @@
           <p id="login-status" class="login-status" hidden></p>
         </div>
 
+        <!-- Convite recebido por link (?convite=...): mostra o que está sendo oferecido antes de aceitar. -->
+        <div id="invite-view" hidden>
+          <p class="hero-sub" style="text-align: left; margin: 0 0 12px;" id="invite-title"></p>
+          <div class="notice" id="invite-perms"></div>
+          <div style="display: flex; gap: 10px; margin-top: 16px;">
+            <button type="button" class="btn btn-primary" id="btn-invite-accept">Aceitar convite</button>
+            <button type="button" class="btn btn-ghost" id="btn-invite-decline">Agora não</button>
+          </div>
+        </div>
+
         <!-- Escolha de dispositivo (vários computadores podem estar pareados na mesma conta). -->
         <div id="device-picker" hidden>
-          <p class="hero-sub" style="text-align: left; margin: 0 0 6px;">Escolha o computador:</p>
-          <div class="device-list" id="device-list"></div>
+          <p class="notice" id="device-notice" hidden></p>
+          <div id="device-sections"></div>
           <p id="device-empty" class="login-status" hidden>
-            Nenhum computador pareado ainda. Abra o Cubicase no computador que vai hospedar, com o Cubicase Plus
-            ativo — o pareamento acontece sozinho.
+            Nenhum computador ainda. Abra o Cubicase no computador que vai hospedar, com o Cubicase Plus
+            ativo — o pareamento acontece sozinho — ou peça um convite a quem hospeda.
           </p>
           <button type="button" class="link-btn" id="btn-logout" style="margin-top: 16px;">Sair</button>
         </div>
@@ -138,8 +203,12 @@
       <div class="left">
         <span class="status-pill is-offline" id="agent-status"><span class="blip"></span><span id="agent-status-text">Conectando…</span></span>
         <span class="device-name" id="device-name-label"></span>
+        <span class="badge-shared" id="access-badge" hidden>Acesso compartilhado</span>
       </div>
-      <button type="button" class="link-btn" id="btn-change-device">Trocar computador</button>
+      <div class="right">
+        <button type="button" class="btn-mini" id="btn-share" hidden>Compartilhar acesso</button>
+        <button type="button" class="link-btn" id="btn-change-device">Trocar computador</button>
+      </div>
     </div>
 
     <div class="panel-stat-grid">
@@ -159,32 +228,89 @@
       <div class="panel-card">
         <h2>Console</h2>
         <div class="panel-console" id="console"></div>
+        <p class="console-denied" id="console-denied" hidden>Você não tem permissão para ver o console deste servidor.</p>
         <form class="console-command-form" id="console-command-form">
           <input type="text" id="console-command-input" placeholder="Comando (ex: say olá, time set day)" class="login-input" autocomplete="off" />
           <button type="submit" class="btn btn-primary">Enviar</button>
         </form>
+        <p class="console-hint" id="console-hint" hidden></p>
       </div>
     </div>
   </main>
 
+  <!-- Compartilhar acesso (só o dono) -->
+  <div class="modal-backdrop" id="share-modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Compartilhar acesso</h2>
+        <button type="button" class="link-btn" id="share-close">Fechar</button>
+      </div>
+      <p class="perm-hint" style="margin: 0 0 6px;">
+        Dê a outras contas acesso a este computador, escolhendo exatamente o que cada uma pode fazer.
+      </p>
+
+      <div class="share-section" style="margin-top: 18px;">
+        <h3>Novo convite</h3>
+        <div class="segmented" id="invite-kind">
+          <button type="button" data-kind="email" class="is-active">Por e-mail</button>
+          <button type="button" data-kind="link">Por link</button>
+        </div>
+        <div id="invite-email-fields" class="field-row">
+          <label for="invite-email" class="perm-label" style="margin-top: 0;">E-mail da conta</label>
+          <input type="email" id="invite-email" class="login-input" placeholder="amigo@exemplo.com" autocomplete="off" />
+          <p class="perm-hint">A pessoa precisa já ter uma conta (ter feito login no Cubicase pelo menos uma vez).</p>
+        </div>
+        <div id="invite-link-fields" class="field-row" hidden>
+          <label class="check-row"><input type="checkbox" id="invite-single-use" checked /> Link de uso único (para de funcionar depois que alguém entrar)</label>
+          <label for="invite-expiry" class="perm-label">Validade do link</label>
+          <select id="invite-expiry" class="login-input">
+            <option value="24">1 dia</option>
+            <option value="168" selected>7 dias</option>
+            <option value="720">30 dias</option>
+          </select>
+        </div>
+        <div id="invite-editor-slot"></div>
+        <button type="button" class="btn btn-primary" id="btn-send-invite" style="margin-top: 16px;">Enviar convite</button>
+        <div class="share-result" id="share-result" hidden></div>
+      </div>
+
+      <div class="share-section">
+        <h3>Pessoas com acesso</h3>
+        <div id="share-members"></div>
+      </div>
+
+      <div class="share-section">
+        <h3>Convites pendentes</h3>
+        <div id="share-invites"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-toast" id="panel-toast" hidden></div>
+
   <script src="/assets/site.js"></script>
   <script type="module">
     // ============================================================
-    // Painel Web Remoto (Cubicase Plus) — Fase 0 + Fase 1 + Fase 2
+    // Painel Web Remoto (Cubicase Plus) — Fase 0 a 3 + acesso compartilhado
     // ============================================================
     // Ver plans/remote-web-panel-plan.md para o desenho completo. Fluxo:
     //   1. Login Supabase (igual /entrar/, mas persiste sessão aqui mesmo).
-    //   2. Lista os dispositivos pareados do usuário (tabela panel_devices,
-    //      RLS já restringe à própria linha — sem passar pelo Worker).
+    //   2. Lista os computadores acessíveis (GET /api/v1/panel/devices): os
+    //      do próprio usuário, os compartilhados com ele por outras contas e
+    //      os convites por e-mail ainda pendentes. Convite por link
+    //      (?convite=TOKEN) passa por uma tela de confirmação antes.
     //   3. Pede um ticket de uso único ao Worker (POST /api/v1/panel/ws-ticket)
     //      — o WebSocket nativo do navegador não manda header Authorization
     //      no handshake, então a sessão de longa duração nunca vai na URL.
     //   4. Abre o WebSocket contra o Durable Object daquele dispositivo e
     //      renderiza status/console/lista de servidores em tempo real, e
-    //      envia comandos de volta (Fase 2): parar, reiniciar, iniciar um
-    //      servidor parado e comandos de console livres. Toda ação
-    //      irreversível pede confirmação antes de mandar (ver sendToAgent /
-    //      requestStartServer / delegate de clique em #server-list).
+    //      envia comandos de volta: parar, reiniciar, iniciar um servidor
+    //      parado e comandos de console livres.
+    //
+    // As permissões (o que esta conta pode fazer) chegam na mensagem
+    // "access" — aqui só escondem/desabilitam botões. Quem de fato barra é o
+    // Durable Object, a cada mensagem (ver host-channel.ts): mexer neste
+    // JavaScript pelo console do navegador não dá acesso a nada a mais.
     // ============================================================
     import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -193,6 +319,7 @@
     const API_BASE = "https://cubeforge-api.cubeforge.workers.dev";
     const WS_BASE = "wss://cubeforge-api.cubeforge.workers.dev/panel/ws";
     const RECONNECT_STEPS_MS = [2000, 5000, 10000, 30000];
+    const INVITE_KEY = "cubicase_panel_invite";
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
       auth: { persistSession: true, detectSessionInUrl: true },
@@ -202,6 +329,7 @@
     const authScreen = el("auth-screen");
     const loginForm = el("login-form");
     const devicePicker = el("device-picker");
+    const inviteView = el("invite-view");
     const panelView = el("panel-view");
     const statusEl = el("login-status");
 
@@ -211,6 +339,10 @@
     // sem essa guarda, voltar pra aba resetava o painel pra tela de escolher
     // computador do nada).
     let currentStep = "login";
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
 
     function showStatus(message, isError = false) {
       statusEl.textContent = message;
@@ -223,7 +355,125 @@
       authScreen.hidden = step === "panel";
       loginForm.hidden = step !== "login";
       devicePicker.hidden = step !== "devices";
+      inviteView.hidden = step !== "invite";
       panelView.hidden = step !== "panel";
+    }
+
+    let toastTimer = null;
+    function showToast(message, isError = false) {
+      const t = el("panel-toast");
+      t.textContent = message;
+      t.classList.toggle("is-error", isError);
+      t.hidden = false;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
+    }
+
+    // ---- API do painel (Worker) ----
+
+    async function api(path, { method = "GET", body } = {}) {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) { showStep("login"); throw new Error("sem sessão"); }
+      const resp = await fetch(`${API_BASE}/api/v1/panel${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${session.access_token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const json = await resp.json().catch(() => null);
+      return { ok: resp.ok && json?.success !== false, status: resp.status, code: json?.code, data: json?.data, message: json?.message };
+    }
+
+    // ---- Permissões: presets, resumo e editor ----
+
+    const PRESETS = {
+      viewer: { label: "Visualizador", desc: "só acompanha status e console", perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "none", allowlist: [] } } },
+      operator: { label: "Operador", desc: "liga, desliga e reinicia", perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "none", allowlist: [] } } },
+      moderator: { label: "Moderador", desc: "console + say, kick e whitelist", perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "allowlist", allowlist: ["say", "kick", "whitelist"] } } },
+      admin: { label: "Administrador", desc: "tudo, inclusive comandos livres", perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "all", allowlist: [] } } },
+    };
+
+    function summarizePermissions(p) {
+      if (!p) return "Permissões inválidas";
+      const out = [];
+      if (p.viewConsole) out.push("Ver console");
+      if (p.start) out.push("Ligar");
+      if (p.stop) out.push("Desligar");
+      if (p.restart) out.push("Reiniciar");
+      if (p.commands.mode === "all") out.push("Todos os comandos");
+      else if (p.commands.mode === "allowlist") out.push(`Comandos: ${p.commands.allowlist.join(", ")}`);
+      return out.length ? out.join(" · ") : "Só vê o status";
+    }
+
+    function normalizeEntry(s) {
+      return s.trim().replace(/^\/+/, "").trim().toLowerCase().replace(/\s+/g, " ");
+    }
+
+    function samePerms(a, b) {
+      return a.viewConsole === b.viewConsole && a.start === b.start && a.stop === b.stop && a.restart === b.restart &&
+        a.commands.mode === b.commands.mode &&
+        JSON.stringify([...a.commands.allowlist].sort()) === JSON.stringify([...b.commands.allowlist].sort());
+    }
+
+    /** Editor de permissões (preset + campos individuais + whitelist de comandos). Devolve { el, get, setPerms }. */
+    function createPermissionEditor(initial) {
+      const root = document.createElement("div");
+      root.innerHTML = `
+        <label class="perm-label">Modelo</label>
+        <select class="login-input perm-preset">
+          ${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}">${escapeHtml(p.label)} — ${escapeHtml(p.desc)}</option>`).join("")}
+          <option value="custom">Personalizado</option>
+        </select>
+        <div class="perm-grid">
+          <label><input type="checkbox" data-perm="viewConsole" /> Ver o console</label>
+          <label><input type="checkbox" data-perm="start" /> Ligar o servidor</label>
+          <label><input type="checkbox" data-perm="stop" /> Desligar o servidor</label>
+          <label><input type="checkbox" data-perm="restart" /> Reiniciar o servidor</label>
+        </div>
+        <label class="perm-label">Comandos no console</label>
+        <select class="login-input perm-cmd-mode">
+          <option value="none">Nenhum</option>
+          <option value="allowlist">Somente os desta lista</option>
+          <option value="all">Todos</option>
+        </select>
+        <div class="perm-allowlist-wrap" hidden>
+          <textarea class="login-input perm-allowlist" rows="3" placeholder="Um por linha (ou separados por vírgula). Ex:&#10;say&#10;kick&#10;time set"></textarea>
+          <p class="perm-hint">Cada item libera o comando e o que vem depois: "time set" libera "time set day", mas não "time add 5". O comando "stop" só funciona com "Desligar" marcado.</p>
+        </div>`;
+
+      const presetSel = root.querySelector(".perm-preset");
+      const modeSel = root.querySelector(".perm-cmd-mode");
+      const listWrap = root.querySelector(".perm-allowlist-wrap");
+      const listArea = root.querySelector(".perm-allowlist");
+      const checks = [...root.querySelectorAll("input[data-perm]")];
+
+      function parseAllowlist() {
+        return [...new Set(listArea.value.split(/[\n,]/).map(normalizeEntry).filter(Boolean))];
+      }
+      function get() {
+        const perms = { commands: { mode: modeSel.value, allowlist: modeSel.value === "allowlist" ? parseAllowlist() : [] } };
+        for (const c of checks) perms[c.dataset.perm] = c.checked;
+        return perms;
+      }
+      function setPerms(p) {
+        for (const c of checks) c.checked = !!p[c.dataset.perm];
+        modeSel.value = p.commands.mode;
+        listArea.value = p.commands.allowlist.join("\n");
+        listWrap.hidden = p.commands.mode !== "allowlist";
+        syncPreset();
+      }
+      function syncPreset() {
+        const current = get();
+        const match = Object.entries(PRESETS).find(([, pr]) => samePerms(pr.perms, current));
+        presetSel.value = match ? match[0] : "custom";
+      }
+      presetSel.addEventListener("change", () => {
+        if (presetSel.value !== "custom") setPerms(PRESETS[presetSel.value].perms);
+      });
+      modeSel.addEventListener("change", () => { listWrap.hidden = modeSel.value !== "allowlist"; syncPreset(); });
+      root.addEventListener("input", (e) => { if (e.target !== presetSel) syncPreset(); });
+
+      setPerms(initial ?? PRESETS.viewer.perms);
+      return { el: root, get, setPerms };
     }
 
     // ---- Passo 1: login ----
@@ -251,42 +501,162 @@
     });
     el("btn-change-device").addEventListener("click", () => {
       closeSocket();
+      closeShareModal();
       loadDevices();
     });
 
-    // ---- Passo 2: escolher dispositivo ----
+    // ---- Convite por link (?convite=TOKEN) ----
+    // O token também vai pro sessionStorage: o login por OAuth/link mágico
+    // volta pra esta mesma URL, mas assim sobrevive a qualquer redirecionamento
+    // que perca a query string.
 
-    async function loadDevices() {
-      const { data, error } = await supabase
-        .from("panel_devices")
-        .select("id, device_name, last_seen_at")
-        .order("last_seen_at", { ascending: false, nullsFirst: false });
-
-      showStep("devices");
-      const list = el("device-list");
-      const empty = el("device-empty");
-      list.innerHTML = "";
-
-      if (error || !data || data.length === 0) {
-        empty.hidden = false;
-        return;
-      }
-      empty.hidden = true;
-
-      for (const device of data) {
-        const row = document.createElement("div");
-        row.className = "device-item";
-        const seen = device.last_seen_at
-          ? `Visto por último em ${new Date(device.last_seen_at).toLocaleString("pt-BR")}`
-          : "Nunca conectou ainda";
-        row.innerHTML = `<div><div class="name">${escapeHtml(device.device_name)}</div><div class="seen">${seen}</div></div><div>›</div>`;
-        row.addEventListener("click", () => openDevice(device));
-        list.appendChild(row);
-      }
+    function readInviteFromUrl() {
+      const token = new URLSearchParams(location.search).get("convite");
+      if (token) { try { sessionStorage.setItem(INVITE_KEY, token); } catch {} }
+      return token;
+    }
+    function pendingInviteToken() {
+      try { return sessionStorage.getItem(INVITE_KEY); } catch { return null; }
+    }
+    function clearInvite() {
+      try { sessionStorage.removeItem(INVITE_KEY); } catch {}
+      if (new URLSearchParams(location.search).has("convite")) history.replaceState(null, "", location.pathname);
     }
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    async function showInvite(token) {
+      let r;
+      try { r = await api(`/invites/preview?token=${encodeURIComponent(token)}`); } catch { return; }
+      if (!r.ok) {
+        clearInvite();
+        await loadDevices(r.message || "Não foi possível abrir este convite.", true);
+        return;
+      }
+      const info = r.data;
+      if (info.isOwner || info.alreadyMember) {
+        clearInvite();
+        await loadDevices(info.isOwner ? "Esse convite é para um computador que já é seu." : "Você já tem acesso a este computador.");
+        return;
+      }
+      el("invite-title").innerHTML = `<strong>${escapeHtml(info.ownerLabel)}</strong> quer compartilhar o computador <strong>${escapeHtml(info.deviceName)}</strong> com você.`;
+      el("invite-perms").textContent = `Você poderá: ${summarizePermissions(info.permissions)}`;
+      showStep("invite");
+      el("btn-invite-accept").onclick = async () => {
+        el("btn-invite-accept").disabled = true;
+        let res;
+        try { res = await api("/invites/accept", { method: "POST", body: { token } }); } catch { el("btn-invite-accept").disabled = false; return; }
+        el("btn-invite-accept").disabled = false;
+        clearInvite();
+        await loadDevices(res.ok ? `Convite aceito! "${res.data?.deviceName ?? "O computador"}" já aparece na sua lista.` : (res.message || "Não foi possível aceitar o convite."), !res.ok);
+      };
+      el("btn-invite-decline").onclick = async () => { clearInvite(); await loadDevices(); };
+    }
+
+    async function afterLogin() {
+      const token = pendingInviteToken();
+      if (token) await showInvite(token);
+      else await loadDevices();
+    }
+
+    // ---- Passo 2: escolher dispositivo ----
+
+    async function loadDevices(notice, noticeIsError = false) {
+      showStep("devices");
+      const noticeEl = el("device-notice");
+      noticeEl.hidden = !notice;
+      noticeEl.textContent = notice || "";
+      noticeEl.classList.toggle("is-error", noticeIsError);
+
+      const sections = el("device-sections");
+      const empty = el("device-empty");
+      sections.innerHTML = "";
+      empty.hidden = true;
+
+      let r;
+      try { r = await api("/devices"); } catch { return; }
+      if (!r.ok) {
+        noticeEl.hidden = false;
+        noticeEl.classList.add("is-error");
+        noticeEl.textContent = r.message || "Não foi possível carregar seus computadores.";
+        return;
+      }
+      const { owned = [], shared = [], pendingInvites = [] } = r.data;
+      if (owned.length + shared.length + pendingInvites.length === 0) { empty.hidden = false; return; }
+
+      const addSection = (title) => {
+        const h = document.createElement("div");
+        h.className = "device-section-title";
+        h.textContent = title;
+        const list = document.createElement("div");
+        list.className = "device-list";
+        sections.appendChild(h);
+        sections.appendChild(list);
+        return list;
+      };
+      const seenText = (d) => d.lastSeenAt ? `Visto por último em ${new Date(d.lastSeenAt).toLocaleString("pt-BR")}` : "Nunca conectou ainda";
+
+      if (pendingInvites.length) {
+        const list = addSection("Convites para você");
+        for (const inv of pendingInvites) {
+          const row = document.createElement("div");
+          row.className = "device-item is-static";
+          row.innerHTML = `
+            <div>
+              <div class="name">${escapeHtml(inv.deviceName)}</div>
+              <div class="seen">Convite de ${escapeHtml(inv.invitedBy)}</div>
+              <div class="perms">${escapeHtml(summarizePermissions(inv.permissions))}</div>
+            </div>
+            <div class="row-actions">
+              <button type="button" class="btn-mini" data-act="accept">Aceitar</button>
+              <button type="button" class="btn-mini btn-mini-danger" data-act="decline">Recusar</button>
+            </div>`;
+          row.querySelector('[data-act="accept"]').addEventListener("click", async (e) => {
+            e.target.disabled = true;
+            const res = await api("/invites/accept", { method: "POST", body: { inviteId: inv.id } }).catch(() => null);
+            await loadDevices(res?.ok ? "Convite aceito!" : (res?.message || "Não foi possível aceitar o convite."), !res?.ok);
+          });
+          row.querySelector('[data-act="decline"]').addEventListener("click", async (e) => {
+            e.target.disabled = true;
+            await api("/invites/decline", { method: "POST", body: { inviteId: inv.id } }).catch(() => null);
+            await loadDevices();
+          });
+          list.appendChild(row);
+        }
+      }
+
+      if (owned.length) {
+        const list = addSection("Meus computadores");
+        for (const d of owned) {
+          const row = document.createElement("div");
+          row.className = "device-item";
+          row.innerHTML = `<div><div class="name">${escapeHtml(d.deviceName)}</div><div class="seen">${seenText(d)}</div></div><div>›</div>`;
+          row.addEventListener("click", () => openDevice({ id: d.id, deviceName: d.deviceName, isOwner: true }));
+          list.appendChild(row);
+        }
+      }
+
+      if (shared.length) {
+        const list = addSection("Compartilhados comigo");
+        for (const d of shared) {
+          const row = document.createElement("div");
+          row.className = "device-item";
+          row.innerHTML = `
+            <div>
+              <div class="name">${escapeHtml(d.deviceName)}</div>
+              <div class="seen">De ${escapeHtml(d.ownerLabel)} · ${seenText(d)}</div>
+              <div class="perms">${escapeHtml(summarizePermissions(d.permissions))}</div>
+            </div>
+            <div class="row-actions"><button type="button" class="link-btn" data-act="leave">Sair</button><span>›</span></div>`;
+          row.addEventListener("click", () => openDevice({ id: d.id, deviceName: d.deviceName, isOwner: false }));
+          row.querySelector('[data-act="leave"]').addEventListener("click", async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Deixar de ter acesso a "${d.deviceName}"? Para voltar, será preciso um novo convite.`)) return;
+            const { data: { session } } = await supabase.auth.getSession();
+            const res = await api(`/devices/${d.id}/members/${session.user.id}`, { method: "DELETE" }).catch(() => null);
+            await loadDevices(res?.ok ? "Você saiu deste computador." : (res?.message || "Não foi possível sair."), !res?.ok);
+          });
+          list.appendChild(row);
+        }
+      }
     }
 
     // ---- Passo 3+4: conectar no dispositivo escolhido ----
@@ -296,6 +666,10 @@
     let reconnectTimer = null;
     let currentDevice = null;
     let manuallyClosed = false;
+    // { isOwner, permissions } enviado pelo DO logo ao conectar. Só decide o
+    // que aparece habilitado — a checagem de verdade está no servidor.
+    let currentAccess = null;
+    let lastServers = [];
 
     function closeSocket() {
       manuallyClosed = true;
@@ -308,7 +682,7 @@
       manuallyClosed = false;
       reconnectAttempt = 0;
       currentDevice = device;
-      el("device-name-label").textContent = device.device_name;
+      el("device-name-label").textContent = device.deviceName;
       resetPanelView();
       showStep("panel");
       connect();
@@ -327,10 +701,13 @@
       el("stat-server-name").textContent = "—";
       el("stat-resources").textContent = "—";
       lastServerRunning = false;
+      lastServers = [];
+      currentAccess = null;
       el("server-list").innerHTML = "";
       el("server-list-empty").hidden = true;
       el("console").innerHTML = "";
       pendingStartServerId = null;
+      applyAccess();
     }
 
     function appendConsoleLine(text, { isError = false } = {}) {
@@ -343,7 +720,36 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    // ---- Fase 2: comandos (parar/reiniciar/iniciar/console) ----
+    // ---- Permissões na tela ----
+
+    function can(action) {
+      const p = currentAccess?.permissions;
+      if (!p) return false;
+      return !!p[action];
+    }
+
+    function applyAccess() {
+      const p = currentAccess?.permissions;
+      el("access-badge").hidden = !currentAccess || currentAccess.isOwner;
+      el("btn-share").hidden = !(currentAccess?.isOwner);
+
+      const showConsole = !!p?.viewConsole;
+      el("console").hidden = !showConsole;
+      el("console-denied").hidden = showConsole || !currentAccess;
+
+      const mode = p?.commands.mode ?? "none";
+      el("console-command-form").hidden = mode === "none";
+      const hint = el("console-hint");
+      if (mode === "allowlist") {
+        hint.textContent = `Comandos liberados para você: ${p.commands.allowlist.join(", ")}`;
+        hint.hidden = false;
+      } else {
+        hint.hidden = true;
+      }
+      renderServerList();
+    }
+
+    // ---- Comandos (parar/reiniciar/iniciar/console) ----
 
     function sendToAgent(payload) {
       if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -353,11 +759,12 @@
       socket.send(JSON.stringify(payload));
     }
 
-    // Reiniciar e "trocar pra outro servidor enquanto um está rodando" usam
-    // o mesmo mecanismo: pede pra parar, e só manda o start_server quando a
-    // próxima mensagem de status confirmar serverRunning=false (ver
-    // handleMessage). Sem isso, um start logo em seguida do stop seria
-    // recusado pelo backend (regra de "só um processo MC por vez").
+    // Trocar pra outro servidor enquanto um está rodando: pede pra parar, e
+    // só manda o start_server quando a próxima mensagem de status confirmar
+    // serverRunning=false (ver handleMessage). Sem isso, um start logo em
+    // seguida do stop seria recusado pelo backend (regra de "só um processo
+    // MC por vez"). "Reiniciar" NÃO usa isso: é uma mensagem só
+    // (restart_server) e o próprio servidor de relay faz a sequência.
     let pendingStartServerId = null;
 
     function requestStartServer(serverId, { stopFirst = false } = {}) {
@@ -371,7 +778,7 @@
 
     el("server-list").addEventListener("click", (e) => {
       const btn = e.target.closest("button[data-action]");
-      if (!btn) return;
+      if (!btn || btn.disabled) return;
       const { action, serverId } = btn.dataset;
 
       if (action === "stop") {
@@ -379,7 +786,7 @@
         sendToAgent({ type: "stop_server" });
       } else if (action === "restart") {
         if (!confirm("Isso vai reiniciar o servidor — jogadores conectados serão desconectados. Continuar?")) return;
-        requestStartServer(serverId, { stopFirst: true });
+        sendToAgent({ type: "restart_server", serverId });
       } else if (action === "start") {
         const stopFirst = btn.dataset.stopFirst === "true";
         if (stopFirst && !confirm("Outro servidor está rodando agora. Isso vai pará-lo para iniciar este. Continuar?")) return;
@@ -411,6 +818,13 @@
       }
     }
 
+    /** Sai do painel de volta pra lista de computadores, com um aviso (acesso removido, assinatura do dono expirada...). */
+    async function leaveDeviceWithMessage(message) {
+      closeSocket();
+      closeShareModal();
+      await loadDevices(message, true);
+    }
+
     async function connect() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session?.access_token) { showStep("login"); return; }
@@ -423,7 +837,16 @@
           body: JSON.stringify({ deviceId: currentDevice.id }),
         });
         const json = await resp.json().catch(() => null);
-        if (!resp.ok || !json?.data?.ticket) throw new Error(json?.message || `HTTP ${resp.status}`);
+        if (!resp.ok || !json?.data?.ticket) {
+          // Erro "de verdade" (sem acesso, dono sem Plus...) — insistir com
+          // backoff não adianta, volta pra lista com o motivo. Só falha de
+          // rede/servidor (5xx, 429) continua tentando sozinha.
+          if ([401, 402, 403, 404].includes(resp.status)) {
+            await leaveDeviceWithMessage(json?.message || "Não foi possível acessar este computador.");
+            return;
+          }
+          throw new Error(json?.message || `HTTP ${resp.status}`);
+        }
         ticket = json.data.ticket;
       } catch (err) {
         scheduleReconnect();
@@ -433,7 +856,22 @@
       socket = new WebSocket(`${WS_BASE}/${currentDevice.id}?role=panel&ticket=${encodeURIComponent(ticket)}`);
       socket.addEventListener("open", () => { reconnectAttempt = 0; });
       socket.addEventListener("message", (event) => handleMessage(event.data));
-      socket.addEventListener("close", () => { setAgentStatus(false); if (!manuallyClosed) scheduleReconnect(); });
+      socket.addEventListener("close", (event) => {
+        setAgentStatus(false);
+        if (manuallyClosed) return;
+        if (event.code === 4001 && event.reason === "access-removed") {
+          leaveDeviceWithMessage("Seu acesso a este computador foi removido.");
+          return;
+        }
+        if (event.code === 4001) {
+          // Permissões alteradas pelo dono: reconecta na hora com as novas.
+          showToast("Suas permissões neste computador foram atualizadas.");
+          reconnectAttempt = 0;
+          connect();
+          return;
+        }
+        scheduleReconnect();
+      });
       socket.addEventListener("error", () => { try { socket.close(); } catch {} });
     }
 
@@ -444,9 +882,47 @@
       reconnectTimer = setTimeout(connect, wait);
     }
 
+    function renderServerList() {
+      const container = el("server-list");
+      const empty = el("server-list-empty");
+      container.innerHTML = "";
+      empty.hidden = lastServers.length > 0;
+      const anyRunning = lastServers.some((s) => s.status === "running");
+      const noPerm = 'disabled title="Você não tem permissão para isso"';
+      for (const s of lastServers) {
+        const row = document.createElement("div");
+        row.className = "panel-server-row";
+        const running = s.status === "running";
+        // Trocar de servidor com outro rodando = desligar um + ligar o outro,
+        // então exige as duas permissões.
+        const canStart = anyRunning ? can("start") && can("stop") : can("start");
+        const actionsHtml = running
+          ? `<button type="button" class="btn-mini btn-mini-danger" data-action="stop" ${can("stop") ? "" : noPerm}>Parar</button>
+             <button type="button" class="btn-mini" data-action="restart" data-server-id="${escapeHtml(s.id)}" ${can("restart") ? "" : noPerm}>Reiniciar</button>`
+          : `<button type="button" class="btn-mini" data-action="start" data-server-id="${escapeHtml(s.id)}" data-stop-first="${anyRunning}" ${canStart ? "" : noPerm}>Iniciar</button>`;
+        row.innerHTML = `
+          <div>
+            <div style="font-weight:600;">${escapeHtml(s.name)}</div>
+            <div style="font-size:12px;color:var(--text-muted);">Minecraft ${escapeHtml(s.version)} · ${escapeHtml(s.serverType)}</div>
+          </div>
+          <div class="actions">
+            <span class="status-pill${running ? "" : " is-offline"}"><span class="blip"></span>${running ? "Rodando" : "Parado"}</span>
+            ${actionsHtml}
+          </div>
+        `;
+        container.appendChild(row);
+      }
+    }
+
     function handleMessage(raw) {
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
+
+      if (msg.type === "access") {
+        currentAccess = { isOwner: !!msg.isOwner, permissions: msg.permissions };
+        applyAccess();
+        return;
+      }
 
       if (msg.type === "agent_connected") { setAgentStatus(true); return; }
       if (msg.type === "agent_disconnected") { setAgentStatus(false); return; }
@@ -483,53 +959,218 @@
       }
 
       if (msg.type === "error") {
+        // Também vira aviso solto: quem não pode ver o console não veria
+        // o motivo de uma ação negada só na linha do console.
         appendConsoleLine(`⚠ ${msg.message}`, { isError: true });
+        showToast(msg.message, true);
         return;
       }
 
       if (msg.type === "server_list") {
-        const container = el("server-list");
-        const empty = el("server-list-empty");
-        container.innerHTML = "";
-        const list = msg.servers || [];
-        empty.hidden = list.length > 0;
-        const anyRunning = list.some((s) => s.status === "running");
-        for (const s of list) {
-          const row = document.createElement("div");
-          row.className = "panel-server-row";
-          const running = s.status === "running";
-          const actionsHtml = running
-            ? `<button type="button" class="btn-mini btn-mini-danger" data-action="stop">Parar</button>
-               <button type="button" class="btn-mini" data-action="restart" data-server-id="${escapeHtml(s.id)}">Reiniciar</button>`
-            : `<button type="button" class="btn-mini" data-action="start" data-server-id="${escapeHtml(s.id)}" data-stop-first="${anyRunning}">Iniciar</button>`;
-          row.innerHTML = `
-            <div>
-              <div style="font-weight:600;">${escapeHtml(s.name)}</div>
-              <div style="font-size:12px;color:var(--text-muted);">Minecraft ${escapeHtml(s.version)} · ${escapeHtml(s.serverType)}</div>
+        lastServers = msg.servers || [];
+        renderServerList();
+      }
+    }
+
+    // ---- Compartilhar acesso (só o dono) ----
+
+    let inviteEditor = null;
+    let inviteKind = "email";
+
+    function closeShareModal() {
+      el("share-modal").hidden = true;
+    }
+
+    async function copyText(text) {
+      try { await navigator.clipboard.writeText(text); showToast("Copiado!"); }
+      catch { window.prompt("Copie o link:", text); }
+    }
+
+    function inviteUrl(token) {
+      return `${location.origin}${location.pathname}?convite=${encodeURIComponent(token)}`;
+    }
+
+    function setInviteKind(kind) {
+      inviteKind = kind;
+      for (const b of el("invite-kind").querySelectorAll("button")) b.classList.toggle("is-active", b.dataset.kind === kind);
+      el("invite-email-fields").hidden = kind !== "email";
+      el("invite-link-fields").hidden = kind !== "link";
+      el("btn-send-invite").textContent = kind === "email" ? "Enviar convite" : "Gerar link";
+    }
+
+    el("invite-kind").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-kind]");
+      if (b) setInviteKind(b.dataset.kind);
+    });
+
+    function showShareResult(html, isError = false) {
+      const box = el("share-result");
+      box.innerHTML = `<div class="notice${isError ? " is-error" : ""}">${html}</div>`;
+      box.hidden = false;
+      return box;
+    }
+
+    el("btn-share").addEventListener("click", async () => {
+      inviteEditor = createPermissionEditor(PRESETS.viewer.perms);
+      const slot = el("invite-editor-slot");
+      slot.innerHTML = "";
+      slot.appendChild(inviteEditor.el);
+      el("invite-email").value = "";
+      el("share-result").hidden = true;
+      setInviteKind("email");
+      el("share-modal").hidden = false;
+      await refreshShareLists();
+    });
+    el("share-close").addEventListener("click", closeShareModal);
+    el("share-modal").addEventListener("click", (e) => { if (e.target === el("share-modal")) closeShareModal(); });
+
+    el("btn-send-invite").addEventListener("click", async () => {
+      const permissions = inviteEditor.get();
+      if (permissions.commands.mode === "allowlist" && permissions.commands.allowlist.length === 0) {
+        showShareResult("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\".", true);
+        return;
+      }
+      const body = { kind: inviteKind, permissions };
+      if (inviteKind === "email") {
+        body.email = el("invite-email").value.trim();
+        if (!body.email) { showShareResult("Informe o e-mail da conta.", true); return; }
+      } else {
+        body.singleUse = el("invite-single-use").checked;
+        body.expiresInHours = Number(el("invite-expiry").value);
+      }
+
+      const btn = el("btn-send-invite");
+      btn.disabled = true;
+      let r;
+      try { r = await api(`/devices/${currentDevice.id}/invites`, { method: "POST", body }); }
+      catch { r = { ok: false, message: "Sem conexão. Tente de novo." }; }
+      btn.disabled = false;
+
+      if (!r.ok) { showShareResult(escapeHtml(r.message || "Não foi possível criar o convite."), true); return; }
+      if (inviteKind === "email") {
+        el("invite-email").value = "";
+        showShareResult(escapeHtml(r.message));
+      } else {
+        const url = inviteUrl(r.data.token);
+        const box = showShareResult("Link criado. Envie para quem você quer convidar:");
+        const wrap = document.createElement("div");
+        wrap.className = "link-box";
+        wrap.innerHTML = `<input type="text" class="login-input" readonly value="${escapeHtml(url)}" /><button type="button" class="btn-mini">Copiar</button>`;
+        wrap.querySelector("input").addEventListener("focus", (e) => e.target.select());
+        wrap.querySelector("button").addEventListener("click", () => copyText(url));
+        box.querySelector(".notice").appendChild(wrap);
+      }
+      await refreshShareLists();
+    });
+
+    async function refreshShareLists() {
+      const membersBox = el("share-members");
+      const invitesBox = el("share-invites");
+      let r;
+      try { r = await api(`/devices/${currentDevice.id}/members`); } catch { return; }
+      if (!r.ok) {
+        membersBox.innerHTML = `<p class="panel-empty-note">${escapeHtml(r.message || "Não foi possível carregar.")}</p>`;
+        invitesBox.innerHTML = "";
+        return;
+      }
+      const { members = [], invites = [] } = r.data;
+
+      membersBox.innerHTML = "";
+      if (members.length === 0) membersBox.innerHTML = '<p class="panel-empty-note">Ninguém além de você tem acesso ainda.</p>';
+      for (const m of members) {
+        const row = document.createElement("div");
+        row.className = "share-row";
+        row.innerHTML = `
+          <div class="top">
+            <div class="who">${escapeHtml(m.name || m.email || "Conta")}${m.name && m.email ? `<small>${escapeHtml(m.email)}</small>` : ""}</div>
+            <div style="display:flex;gap:8px;">
+              <button type="button" class="btn-mini" data-act="edit">Editar permissões</button>
+              <button type="button" class="btn-mini btn-mini-danger" data-act="remove">Remover</button>
             </div>
-            <div class="actions">
-              <span class="status-pill${running ? "" : " is-offline"}"><span class="blip"></span>${running ? "Rodando" : "Parado"}</span>
-              ${actionsHtml}
+          </div>
+          <div class="perms">${escapeHtml(summarizePermissions(m.permissions))}</div>
+          <div class="editor-slot" hidden></div>`;
+
+        const slot = row.querySelector(".editor-slot");
+        row.querySelector('[data-act="edit"]').addEventListener("click", () => {
+          if (!slot.hidden) { slot.hidden = true; slot.innerHTML = ""; return; }
+          const editor = createPermissionEditor(m.permissions ?? PRESETS.viewer.perms);
+          slot.innerHTML = "";
+          slot.appendChild(editor.el);
+          const save = document.createElement("button");
+          save.type = "button";
+          save.className = "btn btn-primary";
+          save.style.marginTop = "14px";
+          save.textContent = "Salvar permissões";
+          save.addEventListener("click", async () => {
+            const perms = editor.get();
+            if (perms.commands.mode === "allowlist" && perms.commands.allowlist.length === 0) {
+              showToast("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\".", true);
+              return;
+            }
+            save.disabled = true;
+            const res = await api(`/devices/${currentDevice.id}/members/${m.userId}`, { method: "PATCH", body: { permissions: perms } }).catch(() => null);
+            save.disabled = false;
+            if (res?.ok) { showToast("Permissões atualizadas."); await refreshShareLists(); }
+            else showToast(res?.message || "Não foi possível salvar.", true);
+          });
+          slot.appendChild(save);
+          slot.hidden = false;
+        });
+        row.querySelector('[data-act="remove"]').addEventListener("click", async () => {
+          if (!confirm(`Remover o acesso de ${m.name || m.email || "esta conta"}? A pessoa será desconectada agora.`)) return;
+          const res = await api(`/devices/${currentDevice.id}/members/${m.userId}`, { method: "DELETE" }).catch(() => null);
+          if (res?.ok) { showToast("Acesso removido."); await refreshShareLists(); }
+          else showToast(res?.message || "Não foi possível remover.", true);
+        });
+        membersBox.appendChild(row);
+      }
+
+      invitesBox.innerHTML = "";
+      if (invites.length === 0) invitesBox.innerHTML = '<p class="panel-empty-note">Nenhum convite pendente.</p>';
+      for (const inv of invites) {
+        const row = document.createElement("div");
+        row.className = "share-row";
+        const title = inv.kind === "email"
+          ? `Por e-mail: ${escapeHtml(inv.target ?? "")}`
+          : `Link (${inv.singleUse ? "uso único" : `${inv.uses} uso(s)`})`;
+        row.innerHTML = `
+          <div class="top">
+            <div class="who">${title}<small>Vale até ${escapeHtml(new Date(inv.expiresAt).toLocaleString("pt-BR"))}</small></div>
+            <div style="display:flex;gap:8px;">
+              ${inv.kind === "link" ? '<button type="button" class="btn-mini" data-act="copy">Copiar link</button>' : ""}
+              <button type="button" class="btn-mini btn-mini-danger" data-act="revoke">Cancelar</button>
             </div>
-          `;
-          container.appendChild(row);
-        }
+          </div>
+          <div class="perms">${escapeHtml(summarizePermissions(inv.permissions))}</div>`;
+        const copyBtn = row.querySelector('[data-act="copy"]');
+        if (copyBtn) copyBtn.addEventListener("click", () => copyText(inviteUrl(inv.token)));
+        row.querySelector('[data-act="revoke"]').addEventListener("click", async () => {
+          const res = await api(`/devices/${currentDevice.id}/invites/${inv.id}`, { method: "DELETE" }).catch(() => null);
+          if (res?.ok) await refreshShareLists();
+          else showToast(res?.message || "Não foi possível cancelar.", true);
+        });
+        invitesBox.appendChild(row);
       }
     }
 
     // ---- Boot ----
 
+    const initialInvite = readInviteFromUrl();
     supabase.auth.getSession().then(({ data }) => {
-      if (data.session) loadDevices();
-      else showStep("login");
+      if (data.session) afterLogin();
+      else {
+        showStep("login");
+        if (initialInvite || pendingInviteToken()) showStatus("Você recebeu um convite para acessar um computador. Faça login para aceitá-lo.");
+      }
     });
     supabase.auth.onAuthStateChange((event, session) => {
       // SIGNED_IN pode reaparecer sozinho (ex: navegador reafirmando a
       // sessão ao voltar o foco da aba) mesmo sem o usuário ter feito nada —
       // só reage a isso enquanto ainda está na tela de login, pra não
       // interromper quem já está no painel conectado.
-      if (event === "SIGNED_IN" && session && currentStep === "login") loadDevices();
-      if (event === "SIGNED_OUT") { closeSocket(); showStep("login"); }
+      if (event === "SIGNED_IN" && session && currentStep === "login") afterLogin();
+      if (event === "SIGNED_OUT") { closeSocket(); closeShareModal(); showStep("login"); }
     });
   </script>
 </body>

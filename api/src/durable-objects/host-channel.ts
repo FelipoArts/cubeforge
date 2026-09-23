@@ -6,7 +6,7 @@
 // via WebSocket Hibernation API (o isolate pode ser evacuado da memória
 // entre mensagens sem derrubar a conexão do cliente) e roteia mensagens
 // entre ela e quantas conexões de painel web (papel "panel") estiverem
-// abertas para o mesmo dispositivo.
+// abertas para o mesmo dispositivo — do dono e de contas convidadas.
 //
 // Protocolo (JSON por mensagem WS, ver espelho em src-tauri/src/panel_agent.rs):
 //   agent -> relay -> painel(is):
@@ -19,8 +19,26 @@
 //       (Fase 3 — só enviada quando o agent já tem uma amostra, ver build_metrics_message)
 //   relay -> painel (sem vir do agent):
 //     { type: "agent_connected" } | { type: "agent_disconnected" }
-//   painel -> relay -> agent (Fase 2):
-//     { type: "command", command } | { type: "stop_server" } | { type: "start_server", serverId }
+//     { type: "access", isOwner, permissions } — logo ao conectar: o que ESTA
+//       conexão pode fazer (a UI usa só pra esconder/desabilitar botões; quem
+//       de fato barra é este DO, a cada mensagem — ver handlePanelMessage)
+//     { type: "error", message } — ação negada por falta de permissão
+//   painel -> relay:
+//     { type: "command", command } | { type: "stop_server" }
+//     | { type: "start_server", serverId } | { type: "restart_server", serverId }
+//   relay -> agent (o que efetivamente chega ao app desktop):
+//     as mensagens acima, RECONSTRUÍDAS depois de autorizadas (nada que o
+//     painel mande a mais passa) e com `by` (nome de quem pediu) preenchido
+//     aqui — o painel nunca escolhe o próprio `by`. "restart_server" nunca
+//     chega ao agent: o DO a executa como stop_server -> (espera status
+//     serverRunning=false) -> start_server, pra que "reiniciar" seja uma
+//     permissão de verdade e não dê pra usar o meio-caminho pra só desligar.
+//
+// Permissões (acesso compartilhado): o dono tem tudo; membros têm o que o
+// dono definiu (api/src/panel-access.ts). O Worker grava as permissões do
+// membro no ticket; aqui elas são guardadas em ctx.storage por usuário
+// (`perms:<userId>`) — não no attachment do WebSocket, que tem limite de 2KB
+// e uma whitelist de comandos grande estouraria isso.
 //
 // O agent só empurra `status`/`server_list` por conta própria ao CONECTAR,
 // em mudanças de estado do Minecraft, e logo depois de processar um
@@ -39,19 +57,47 @@
 //     quem conecta é o processo Rust, não um navegador, então não tem a
 //     limitação acima). Validado contra panel_devices via service role.
 //   - panel: query `?ticket=<uuid>`, de uso único, emitido por
-//     POST /api/v1/panel/ws-ticket (index.ts) e consumido aqui.
+//     POST /api/v1/panel/ws-ticket (panel-members.ts) e consumido aqui.
 // ============================================================
 
 import { SUPABASE_URL, userHasActiveSubscription, type SupabaseEnv } from '../supabase';
+import { authorizePanelMessage, normalizePermissions, OWNER_PERMISSIONS, type PanelPermissions } from '../panel-access';
 
 interface Env extends SupabaseEnv {}
 
 const TICKET_TTL_MS = 30_000;
 const LOG_HISTORY_KEY = 'log_history';
 const LOG_HISTORY_MAX = 200;
+const RESTART_KEY = 'pending_restart';
+const RESTART_TTL_MS = 90_000;
+const MAX_PANEL_MESSAGE_CHARS = 4096;
+
+const NO_PERMISSIONS: PanelPermissions = {
+  viewConsole: false,
+  start: false,
+  stop: false,
+  restart: false,
+  commands: { mode: 'none', allowlist: [] },
+};
 
 interface PendingTicket {
   userId: string;
+  name: string;
+  isOwner: boolean;
+  permissions: PanelPermissions | null;
+  expiresAt: number;
+}
+
+/** Guardado no próprio WebSocket (serializeAttachment, máx. 2KB) — só identidade, nunca as permissões (ver comentário no topo). */
+interface PanelAttachment {
+  userId: string;
+  name: string;
+  isOwner: boolean;
+}
+
+interface PendingRestart {
+  serverId: string;
+  by: string;
   expiresAt: number;
 }
 
@@ -68,7 +114,10 @@ export class HostChannel {
     const url = new URL(request.url);
 
     if (request.method === 'POST' && url.pathname === '/mint-ticket') {
-      return this.handleMintTicket();
+      return this.handleMintTicket(request);
+    }
+    if (request.method === 'POST' && url.pathname === '/kick') {
+      return this.handleKick(request);
     }
 
     if (request.headers.get('Upgrade') === 'websocket') {
@@ -79,24 +128,61 @@ export class HostChannel {
   }
 
   /** Chamado só pelo próprio Worker (nunca exposto fora dele — Durable Objects não têm URL pública própria). */
-  private async handleMintTicket(): Promise<Response> {
+  private async handleMintTicket(request: Request): Promise<Response> {
+    let body: any;
+    try { body = await request.json(); } catch { return new Response('JSON inválido.', { status: 400 }); }
+    if (typeof body?.userId !== 'string' || !body.userId) return new Response('userId ausente.', { status: 400 });
+
+    const isOwner = body.isOwner === true;
+    const permissions = isOwner ? null : normalizePermissions(body.permissions);
+    if (!isOwner && !permissions) return new Response('Permissões inválidas.', { status: 400 });
+
     const ticket = crypto.randomUUID();
-    const pending: PendingTicket = { userId: '', expiresAt: Date.now() + TICKET_TTL_MS };
-    // O userId já foi validado pelo Worker (dono do deviceId) antes de chegar
-    // aqui — o ticket só precisa provar "alguém que passou por aquela
-    // validação, há poucos segundos, pediu para conectar nesta DO específica".
-    // Guardado em ctx.storage (não em memória) porque a DO pode ser evacuada
-    // entre o mint e o uso do ticket.
+    const pending: PendingTicket = {
+      userId: body.userId,
+      name: typeof body.name === 'string' && body.name ? body.name.slice(0, 80) : 'Alguém',
+      isOwner,
+      permissions,
+      expiresAt: Date.now() + TICKET_TTL_MS,
+    };
+    // O usuário e as permissões já foram validados pelo Worker (dono ou
+    // membro do dispositivo, com Plus do dono ativo) antes de chegar aqui —
+    // o ticket só carrega isso adiante pra conexão. Guardado em ctx.storage
+    // (não em memória) porque a DO pode ser evacuada entre o mint e o uso.
     await this.ctx.storage.put(`ticket:${ticket}`, pending);
     return new Response(JSON.stringify({ ticket }), { headers: { 'Content-Type': 'application/json' } });
   }
 
-  private async consumeTicket(ticket: string): Promise<boolean> {
+  private async consumeTicket(ticket: string): Promise<PendingTicket | null> {
     const key = `ticket:${ticket}`;
     const pending = await this.ctx.storage.get<PendingTicket>(key);
     await this.ctx.storage.delete(key); // uso único, válido ou não
-    if (!pending) return false;
-    return Date.now() < pending.expiresAt;
+    if (!pending || Date.now() >= pending.expiresAt) return null;
+    return pending;
+  }
+
+  /**
+   * Derruba as conexões de painel de um membro — depois de mudar as
+   * permissões dele (reconecta já com as novas) ou de removê-lo (o Worker
+   * passa a negar o ticket, então ele não volta).
+   */
+  private async handleKick(request: Request): Promise<Response> {
+    let body: any;
+    try { body = await request.json(); } catch { return new Response('JSON inválido.', { status: 400 }); }
+    if (typeof body?.userId !== 'string' || !body.userId) return new Response('userId ausente.', { status: 400 });
+    const removed = body.removed === true;
+
+    for (const ws of this.ctx.getWebSockets(`user:${body.userId}`)) {
+      try { ws.close(4001, removed ? 'access-removed' : 'access-changed'); } catch { /* já fechando */ }
+    }
+    if (removed) await this.ctx.storage.delete(`perms:${body.userId}`);
+    return new Response(null, { status: 204 });
+  }
+
+  private async permsFor(att: PanelAttachment): Promise<PanelPermissions> {
+    if (att.isOwner) return OWNER_PERMISSIONS;
+    const stored = await this.ctx.storage.get<unknown>(`perms:${att.userId}`);
+    return normalizePermissions(stored) ?? NO_PERMISSIONS;
   }
 
   /**
@@ -163,21 +249,32 @@ export class HostChannel {
       }
       this.ctx.acceptWebSocket(server, ['agent']);
       void this.touchLastSeen(deviceId);
-      this.broadcastToPanels({ type: 'agent_connected' });
+      void this.broadcastToPanels({ type: 'agent_connected' });
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (role === 'panel') {
       const ticket = url.searchParams.get('ticket');
-      if (!ticket || !(await this.consumeTicket(ticket))) {
+      const pending = ticket ? await this.consumeTicket(ticket) : null;
+      if (!pending) {
         return new Response('Ticket inválido ou expirado.', { status: 401 });
       }
 
+      // Permissões de membro ficam em storage por usuário (ver comentário no topo).
+      if (!pending.isOwner && pending.permissions) {
+        await this.ctx.storage.put(`perms:${pending.userId}`, pending.permissions);
+      }
+      const perms = pending.isOwner ? OWNER_PERMISSIONS : (pending.permissions ?? NO_PERMISSIONS);
+
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      this.ctx.acceptWebSocket(server, ['panel']);
+      this.ctx.acceptWebSocket(server, ['panel', `user:${pending.userId}`]);
+      const attachment: PanelAttachment = { userId: pending.userId, name: pending.name, isOwner: pending.isOwner };
+      server.serializeAttachment(attachment);
+
       const agentConnected = this.ctx.getWebSockets('agent').length > 0;
       try {
+        server.send(JSON.stringify({ type: 'access', isOwner: pending.isOwner, permissions: perms }));
         server.send(JSON.stringify({ type: agentConnected ? 'agent_connected' : 'agent_disconnected' }));
         // O agent só empurra `status`/`server_list` por conta própria quando
         // CONECTA (ou numa mudança de estado do Minecraft) — um painel que
@@ -193,7 +290,9 @@ export class HostChannel {
           ]);
           if (lastStatus) server.send(lastStatus);
           if (lastServerList) server.send(lastServerList);
-          for (const line of logHistory ?? []) server.send(line);
+          if (perms.viewConsole) {
+            for (const line of logHistory ?? []) server.send(line);
+          }
         }
       } catch { /* conexão pode já ter caído antes deste send */ }
       return new Response(null, { status: 101, webSocket: client });
@@ -202,9 +301,25 @@ export class HostChannel {
     return new Response('role precisa ser "agent" ou "panel".', { status: 400 });
   }
 
-  private broadcastToPanels(message: unknown): void {
+  /**
+   * Manda `message` pra todos os painéis abertos. `consoleOnly` pula quem não
+   * tem a permissão de ver o console (log_line e erros de comando podem
+   * conter o que outros digitaram/o que o servidor imprimiu).
+   */
+  private async broadcastToPanels(message: unknown, opts: { consoleOnly?: boolean } = {}): Promise<void> {
     const body = JSON.stringify(message);
+    const canSeeConsole = new Map<string, boolean>();
     for (const ws of this.ctx.getWebSockets('panel')) {
+      if (opts.consoleOnly) {
+        const att = ws.deserializeAttachment() as PanelAttachment | null;
+        if (!att) continue;
+        let allowed = canSeeConsole.get(att.userId);
+        if (allowed === undefined) {
+          allowed = (await this.permsFor(att)).viewConsole;
+          canSeeConsole.set(att.userId, allowed);
+        }
+        if (!allowed) continue;
+      }
       try { ws.send(body); } catch { /* painel pode ter caído entre a listagem e o send */ }
     }
   }
@@ -217,13 +332,7 @@ export class HostChannel {
    * (pra o console do painel não voltar vazio a cada F5/segunda aba — antes
    * disso, log_line nunca era cacheado, só repassado ao vivo).
    */
-  private async cacheAgentSnapshot(raw: string): Promise<void> {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return;
-    }
+  private async cacheAgentSnapshot(parsed: any, raw: string): Promise<void> {
     if (parsed?.type === 'status' || parsed?.type === 'server_list') {
       await this.ctx.storage.put(`last:${parsed.type}`, raw);
       return;
@@ -239,39 +348,97 @@ export class HostChannel {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const tags = this.ctx.getTags(ws);
     if (tags.includes('agent')) {
-      // Log/status/lista de servidores do app desktop -> todos os painéis abertos.
-      if (typeof message === 'string') {
-        await this.cacheAgentSnapshot(message);
-        this.broadcastToPanels(JSON.parse(message));
-      } else {
-        this.broadcastToPanels(message);
+      // Log/status/lista de servidores do app desktop -> painéis abertos.
+      if (typeof message !== 'string') return;
+      let parsed: any;
+      try { parsed = JSON.parse(message); } catch { return; }
+      await this.cacheAgentSnapshot(parsed, message);
+      await this.broadcastToPanels(parsed, { consoleOnly: parsed?.type === 'log_line' || parsed?.type === 'error' });
+      if (parsed?.type === 'status' && parsed.serverRunning === false) {
+        await this.maybeCompleteRestart(ws);
       }
       return;
     }
     if (tags.includes('panel')) {
-      // Comando do painel -> o único agente conectado (Fase 2 — já roteado
-      // desde já, mesmo que a UI do painel ainda não emita nada aqui).
-      const agents = this.ctx.getWebSockets('agent');
-      if (agents.length > 0) {
-        try { agents[0].send(message); } catch { /* ignora — agente pode ter caído */ }
-      } else {
-        try { ws.send(JSON.stringify({ type: 'agent_disconnected' })); } catch { /* já fechou */ }
-      }
+      await this.handlePanelMessage(ws, message);
     }
+  }
+
+  private sendError(ws: WebSocket, message: string): void {
+    try { ws.send(JSON.stringify({ type: 'error', message })); } catch { /* já fechou */ }
+  }
+
+  /**
+   * Único caminho de mensagem painel -> agent, e onde as permissões são
+   * aplicadas (ver authorizePanelMessage). Nada é repassado "como veio".
+   */
+  private async handlePanelMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== 'string' || message.length > MAX_PANEL_MESSAGE_CHARS) return;
+    let parsed: unknown;
+    try { parsed = JSON.parse(message); } catch { return; }
+
+    const att = ws.deserializeAttachment() as PanelAttachment | null;
+    if (!att) { try { ws.close(1008, 'sem identidade'); } catch { /* */ } return; }
+
+    const decision = authorizePanelMessage(await this.permsFor(att), parsed);
+    if (!decision.ok) {
+      this.sendError(ws, decision.reason);
+      return;
+    }
+
+    const agent = this.ctx.getWebSockets('agent')[0];
+    if (!agent) {
+      try { ws.send(JSON.stringify({ type: 'agent_disconnected' })); } catch { /* já fechou */ }
+      return;
+    }
+
+    const forward = decision.forward;
+    if (forward.type === 'restart_server') {
+      await this.beginRestart(ws, agent, forward.serverId, att.name);
+      return;
+    }
+    try { agent.send(JSON.stringify({ ...forward, by: att.name })); } catch { /* agente pode ter caído */ }
+  }
+
+  /**
+   * "Reiniciar" atômico: manda parar agora e só manda iniciar quando o agent
+   * confirmar (status serverRunning=false) — ver maybeCompleteRestart.
+   */
+  private async beginRestart(ws: WebSocket, agent: WebSocket, serverId: string, by: string): Promise<void> {
+    let running = false;
+    try {
+      const raw = await this.ctx.storage.get<string>('last:status');
+      running = raw ? JSON.parse(raw).serverRunning === true : false;
+    } catch { /* trata como parado */ }
+    if (!running) {
+      this.sendError(ws, 'O servidor não está rodando — use "Iniciar".');
+      return;
+    }
+    const pending: PendingRestart = { serverId, by, expiresAt: Date.now() + RESTART_TTL_MS };
+    await this.ctx.storage.put(RESTART_KEY, pending);
+    try { agent.send(JSON.stringify({ type: 'stop_server', by })); } catch { /* agente pode ter caído */ }
+  }
+
+  private async maybeCompleteRestart(agent: WebSocket): Promise<void> {
+    const pending = await this.ctx.storage.get<PendingRestart>(RESTART_KEY);
+    if (!pending) return;
+    await this.ctx.storage.delete(RESTART_KEY); // uma vez só
+    if (Date.now() > pending.expiresAt) return;
+    try { agent.send(JSON.stringify({ type: 'start_server', serverId: pending.serverId, by: pending.by })); } catch { /* agente pode ter caído */ }
   }
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
-      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY]);
-      this.broadcastToPanels({ type: 'agent_disconnected' });
+      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY, RESTART_KEY]);
+      await this.broadcastToPanels({ type: 'agent_disconnected' });
     }
     try { ws.close(); } catch { /* já fechado */ }
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     if (this.ctx.getTags(ws).includes('agent')) {
-      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY]);
-      this.broadcastToPanels({ type: 'agent_disconnected' });
+      await this.ctx.storage.delete(['last:status', 'last:server_list', LOG_HISTORY_KEY, RESTART_KEY]);
+      await this.broadcastToPanels({ type: 'agent_disconnected' });
     }
   }
 }
