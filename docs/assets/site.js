@@ -85,7 +85,35 @@ async function loadLatestRelease() {
   }
 }
 
+// Botão do cabeçalho: "Entrar" (leva ao login do painel) ou, se já houver sessão do
+// Supabase salva neste navegador (criada pelo login do /painel/), "Painel".
+// Só lê o localStorage — não carrega o supabase-js nas páginas de marketing.
+const SUPABASE_SESSION_KEY = "sb-rtfxcyvymlxebvemgwaj-auth-token";
+
+function hasSavedSession() {
+  try {
+    const raw = localStorage.getItem(SUPABASE_SESSION_KEY);
+    if (!raw) return false;
+    const session = JSON.parse(raw);
+    // access_token expirado ainda conta: o supabase-js renova com o refresh_token ao abrir o painel.
+    return !!(session && (session.refresh_token || session.access_token));
+  } catch {
+    return false;
+  }
+}
+
+function setupAuthLink() {
+  const links = document.querySelectorAll("[data-auth-link]");
+  if (!links.length) return;
+  const label = hasSavedSession() ? "Painel" : "Entrar";
+  links.forEach((a) => {
+    // window.i18n vem de assets/i18n.js; sem ele, fica em pt-BR.
+    a.textContent = window.i18n ? window.i18n.t(label) : label;
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  setupAuthLink();
   setupNavToggle();
   setupScrollReveal();
   loadLatestRelease();
