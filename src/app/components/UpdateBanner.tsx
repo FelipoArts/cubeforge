@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Download, RotateCw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUpdaterStore } from "@/app/updater";
+import { useT } from "@/i18n";
 
 // ============================================================
 // UpdateBanner
@@ -14,6 +15,7 @@ import { useUpdaterStore } from "@/app/updater";
 // ============================================================
 
 export function UpdateBanner() {
+  const { t } = useT();
   const phase = useUpdaterStore((s) => s.phase);
   const version = useUpdaterStore((s) => s.version);
   const progress = useUpdaterStore((s) => s.progress);
@@ -39,20 +41,20 @@ export function UpdateBanner() {
             <div className="flex-1 min-w-0">
               {phase === "available" && (
                 <p className="text-xs font-medium text-theme-primary">
-                  Nova versão disponível{version ? ` (v${version})` : ""}.
+                  {t("update.available", { version: version ? ` (v${version})` : "" })}
                 </p>
               )}
               {phase === "downloading" && (
                 <p className="text-xs font-medium text-theme-primary">
-                  Baixando atualização... {progress}%
+                  {t("update.downloading", { progress })}
                 </p>
               )}
               {phase === "ready" && (
-                <p className="text-xs font-medium text-theme-primary">Reiniciando...</p>
+                <p className="text-xs font-medium text-theme-primary">{t("update.restarting")}</p>
               )}
               {phase === "error" && (
                 <p className="text-xs font-medium text-theme-primary">
-                  Falha ao atualizar. Tente novamente mais tarde.
+                  {t("update.failed")}
                 </p>
               )}
             </div>
@@ -63,7 +65,7 @@ export function UpdateBanner() {
                 onClick={installAndRestart}
                 className="text-xs font-bold px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors cursor-pointer flex-shrink-0"
               >
-                Atualizar e reiniciar
+                {t("update.install")}
               </button>
             )}
 
@@ -76,7 +78,7 @@ export function UpdateBanner() {
                 type="button"
                 onClick={dismiss}
                 className="p-1 rounded-lg hover:bg-theme-muted text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer flex-shrink-0"
-                title="Dispensar"
+                title={t("diag.dismiss")}
               >
                 <X className="w-3.5 h-3.5" />
               </button>

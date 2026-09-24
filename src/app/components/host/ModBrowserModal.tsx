@@ -28,6 +28,7 @@ import {
   type MissingDependency,
   type ModrinthInstallProgress,
 } from "@/lib/modrinth";
+import { useT, formatNumber } from "@/i18n";
 
 // ============================================================
 // ModBrowserModal
@@ -52,6 +53,7 @@ interface ModBrowserModalProps {
 type View = "search" | "detail";
 
 export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVersion, onInstalled }: ModBrowserModalProps) {
+  const { t } = useT();
   useLockBodyScroll(isOpen);
 
   const loaderInfo = loaderForServerType(serverType);
@@ -112,7 +114,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
       setTotalHits(result.totalHits);
     } catch (err) {
       console.error("[Modrinth] Falha na busca:", err);
-      setSearchError("Não foi possível buscar na Modrinth agora. Tente novamente em instantes.");
+      setSearchError(t("modbrowser.searchFailed"));
     } finally {
       setSearching(false);
     }
@@ -133,7 +135,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
       if (compatible.length > 0) setSelectedVersionId(compatible[0].id);
     } catch (err) {
       console.error("[Modrinth] Falha ao buscar versões:", err);
-      setInstallError("Não foi possível carregar as versões deste item.");
+      setInstallError(t("modbrowser.versionsFailed"));
     } finally {
       setLoadingVersions(false);
     }
@@ -188,9 +190,9 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
         if (depVersions.length === 0) {
           pushDiagnostic({
             level: "warning",
-            source: "Mods",
-            title: `Dependência não disponível: ${dep.title}`,
-            message: `Não encontramos uma versão de "${dep.title}" compatível com esta versão do Minecraft/loader. Instale-a manualmente se necessário.`,
+            source: t("modbrowser.source"),
+            title: t("modbrowser.depUnavailable.title", { name: dep.title }),
+            message: t("modbrowser.depUnavailable.message", { name: dep.title }),
           });
           continue;
         }
@@ -211,7 +213,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
       console.error("[Modrinth] Falha ao instalar:", err);
       setInstallProgress(null);
       setInstallError(String(err));
-      pushDiagnostic({ level: "error", source: "Mods", title: `Erro ao instalar ${itemsLabel}`, message: String(err) });
+      pushDiagnostic({ level: "error", source: t("modbrowser.source"), title: t("modbrowser.installFailed", { item: itemsLabel }), message: String(err) });
     }
   };
 
@@ -247,7 +249,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                   <PackagePlus className="text-indigo-700 dark:text-indigo-300 w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-xl font-bold text-theme-primary">Buscar Mods Online</h3>
+                  <h3 className="text-xl font-bold text-theme-primary">{t("modbrowser.title")}</h3>
                   <p className="text-[11px] text-theme-secondary">
                     {loaderInfo.loader.charAt(0).toUpperCase() + loaderInfo.loader.slice(1)} · Minecraft {mcVersion} · via Modrinth
                   </p>
@@ -277,23 +279,22 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                       className="h-full bg-indigo-600 rounded-full"
                     />
                   </div>
-                  <div className="text-right text-[10px] font-bold text-theme-secondary">{installProgress.percent}% concluído</div>
+                  <div className="text-right text-[10px] font-bold text-theme-secondary">{t("modpack.installing", { percent: installProgress.percent })}</div>
                 </div>
               </div>
             ) : reachable === false ? (
               <div className="py-12 flex flex-col items-center gap-3 text-center">
                 <WifiOff className="w-8 h-8 text-theme-secondary" />
-                <p className="text-sm font-semibold text-theme-primary">Sem conexão com a Modrinth</p>
+                <p className="text-sm font-semibold text-theme-primary">{t("modbrowser.offline.title")}</p>
                 <p className="text-xs text-theme-secondary max-w-sm">
-                  Não conseguimos alcançar a Modrinth agora. Verifique sua internet e tente novamente — a gestão dos mods
-                  já instalados continua funcionando normalmente.
+                  {t("modbrowser.offline.body")}
                 </p>
                 <button
                   type="button"
                   onClick={() => checkModrinthReachable().then(setReachable)}
                   className="h-9 px-4 bg-theme-muted hover:bg-theme-card border border-theme-card rounded-xl text-xs font-bold text-theme-secondary hover:text-indigo-600 transition-colors cursor-pointer"
                 >
-                  Tentar novamente
+                  {t("modbrowser.retry")}
                 </button>
               </div>
             ) : reachable === null ? (
@@ -313,7 +314,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                     type="text"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    placeholder={`Buscar ${itemsLabel}s (ex: Sodium, WorldEdit...)`}
+                    placeholder={t("modbrowser.searchPlaceholder", { item: itemsLabel })}
                     className="flex-1 h-11 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm font-semibold text-theme-primary bg-transparent"
                     autoFocus
                   />
@@ -334,7 +335,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                       {searching ? (
                         <Loader2 className="w-5 h-5 animate-spin mx-auto" />
                       ) : (
-                        <>Busque um {itemsLabel} compatível com este servidor.</>
+                        <>{t("modbrowser.searchHint", { item: itemsLabel })}</>
                       )}
                     </div>
                   ) : (
@@ -359,7 +360,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                             <p className="text-[11px] text-theme-secondary truncate">{hit.description}</p>
                           </div>
                           <div className="text-[10px] font-bold text-theme-secondary flex-shrink-0">
-                            {hit.downloads.toLocaleString("pt-BR")} downloads
+                            {t("modbrowser.downloads", { count: formatNumber(hit.downloads) })}
                           </div>
                         </button>
                       ))}
@@ -370,7 +371,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                           disabled={searching}
                           className="w-full h-9 rounded-xl text-xs font-bold text-theme-secondary hover:text-indigo-600 hover:bg-theme-muted transition-colors cursor-pointer disabled:opacity-50"
                         >
-                          {searching ? "Carregando..." : "Carregar mais"}
+                          {searching ? t("modbrowser.loading") : t("modbrowser.loadMore")}
                         </button>
                       )}
                     </>
@@ -385,7 +386,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                     onClick={resetToSearch}
                     className="flex items-center gap-1.5 text-xs font-bold text-theme-secondary hover:text-indigo-600 transition-colors cursor-pointer w-fit"
                   >
-                    <ArrowLeft className="w-3.5 h-3.5" /> Voltar à busca
+                    <ArrowLeft className="w-3.5 h-3.5" /> {t("modbrowser.back")}
                   </button>
 
                   <div className="flex items-center gap-3">
@@ -407,9 +408,9 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                     <div className="py-8 flex flex-col items-center gap-2 text-center">
                       <CheckCircle2 className="w-8 h-8 text-emerald-500" />
                       <p className="text-sm font-bold text-theme-primary">
-                        {selectedProject.title} instalado com sucesso.
+                        {t("modbrowser.installedOk", { name: selectedProject.title })}
                       </p>
-                      <p className="text-xs text-theme-secondary">Reinicie o servidor para aplicar as mudanças.</p>
+                      <p className="text-xs text-theme-secondary">{t("modbrowser.restartHint")}</p>
                     </div>
                   ) : loadingVersions ? (
                     <div className="py-8 flex justify-center">
@@ -418,12 +419,12 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                   ) : versions.length === 0 ? (
                     <div className="p-4 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl text-xs flex items-center gap-2.5">
                       <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                      Nenhuma versão compatível com Minecraft {mcVersion} + {loaderInfo.loader} foi encontrada para este {itemsLabel}.
+                      {t("modbrowser.noCompatible", { mc: mcVersion, loader: loaderInfo.loader, item: itemsLabel })}
                     </div>
                   ) : (
                     <>
                       <div className="space-y-1.5">
-                        <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão</label>
+                        <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("modbrowser.version")}</label>
                         <select
                           value={selectedVersionId}
                           onChange={(e) => setSelectedVersionId(e.target.value)}
@@ -439,12 +440,12 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
 
                       {loadingDeps ? (
                         <div className="flex items-center gap-2 text-xs text-theme-secondary">
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checando dependências...
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" /> {t("modbrowser.checkingDeps")}
                         </div>
                       ) : missingDeps.length > 0 ? (
                         <div className="space-y-2">
                           <p className="text-xs font-bold text-theme-secondary uppercase tracking-wide">
-                            Dependências não detectadas
+                            {t("modbrowser.missingDeps")}
                           </p>
                           <div className="space-y-1.5">
                             {missingDeps.map((dep) => (
@@ -463,8 +464,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                             ))}
                           </div>
                           <p className="text-[11px] text-theme-secondary italic">
-                            Não detectamos essas dependências entre os mods instalados por este navegador — se você já as
-                            instalou manualmente, pode desmarcar.
+                            {t("modbrowser.missingDepsHint")}
                           </p>
                         </div>
                       ) : null}
@@ -481,7 +481,7 @@ export function ModBrowserModal({ isOpen, onClose, serverDir, serverType, mcVers
                         disabled={!selectedVersion}
                         className="h-11 px-5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl text-sm font-bold flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-40 cursor-pointer shadow-md shadow-theme-shadow"
                       >
-                        <Download className="w-4 h-4" /> Instalar
+                        <Download className="w-4 h-4" /> {t("modbrowser.install")}
                       </button>
                     </>
                   )}

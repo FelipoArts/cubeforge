@@ -1,5 +1,6 @@
 import { resolveSupabaseUserId, userHasActiveSubscription, SUPABASE_URL } from './supabase';
 import { handlePanelAccessRoute, handlePanelWsTicket, type PanelResult } from './panel-members';
+import { localizeResponse } from './i18n';
 export { HostChannel } from './durable-objects/host-channel';
 
 const LEASE_DURATION_MS = 90_000;  // 90s lease
@@ -1235,6 +1236,12 @@ async function handlePanelWebSocket(deviceId: string, req: Request, env: Env): P
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    // Traduz o campo `message` para inglês quando o cliente manda Accept-Language: en (ver i18n.ts).
+    return localizeResponse(req, await handleRequest(req, env));
+  },
+};
+
+async function handleRequest(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url); const m = req.method; const p = url.pathname;
     const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CubeCase-Version' };
     if (m === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
@@ -1389,5 +1396,4 @@ export default {
 
       return json(fail(ResponseCodes.NOT_FOUND, 'Endpoint não encontrado.', { path: p, method: m }), 404, cors);
     } catch (e) { console.error('Unhandled:', e); return json(fail(ResponseCodes.INTERNAL_ERROR, 'Erro interno.', { error: String(e) }), 500, cors); }
-  },
-};
+}

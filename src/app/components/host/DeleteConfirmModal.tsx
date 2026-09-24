@@ -4,6 +4,7 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle } from "lucide-react";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { useT } from "@/i18n";
 
 // ============================================================
 // DeleteConfirmModal
@@ -25,6 +26,7 @@ export function DeleteConfirmModal({
   onConfirm,
   isImported = false,
 }: DeleteConfirmModalProps) {
+  const { t, rich } = useT();
   const [confirmInput, setConfirmInput] = useState("");
 
   useLockBodyScroll(!!serverName);
@@ -61,20 +63,20 @@ export function DeleteConfirmModal({
               <div className="w-8 h-8 bg-rose-50 rounded-lg flex items-center justify-center">
                 <AlertTriangle className="text-rose-500 w-5 h-5" />
               </div>
-              <h3 className="text-xl font-bold text-theme-primary">Excluir Servidor</h3>
+              <h3 className="text-xl font-bold text-theme-primary">{t("host.delete.title")}</h3>
             </div>
 
             <div className="space-y-4">
               <p className="text-sm text-theme-secondary leading-relaxed">
                 {isImported ? (
-                  <>Tem certeza que deseja remover o servidor <strong className="text-theme-primary">"{serverName}"</strong> da sua lista? Os arquivos originais na pasta não serão deletados.</>
+                  <>{rich("host.delete.importedMsg", { name: <strong className="text-theme-primary">"{serverName}"</strong> })}</>
                 ) : (
-                  <>Tem certeza que deseja excluir permanentemente o servidor <strong className="text-theme-primary">"{serverName}"</strong>? Todos os mundos, configurações e dados serão perdidos. Esta ação não pode ser desfeita.</>
+                  <>{rich("host.delete.msg", { name: <strong className="text-theme-primary">"{serverName}"</strong> })}</>
                 )}
               </p>
               <div className="space-y-1.5">
                 <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">
-                  Digite o nome do servidor para confirmar
+                  {t("host.delete.typeName")}
                 </label>
                 <input
                   type="text"
@@ -92,14 +94,14 @@ export function DeleteConfirmModal({
                 onClick={handleClose}
                 className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold"
               >
-                Cancelar
+                {t("common.cancel")}
               </button>
               <button
                 onClick={handleConfirm}
                 disabled={confirmInput !== serverName}
                 className="px-6 h-12 bg-rose-500 text-white rounded-2xl hover:bg-rose-600 transition-colors text-sm font-semibold shadow-md shadow-theme-shadow disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                Excluir Permanentemente
+                {t("host.delete.confirm")}
               </button>
             </div>
           </motion.div>

@@ -4,6 +4,7 @@ import { remove } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 import { getJavaVersion } from "@/lib/server";
 import { getJREPath, isJREInstalled, installJRE, type DownloadProgress } from "@/lib/jre";
+import { t } from "@/i18n";
 
 // ============================================================
 // clientSetup — instalação automática do mod loader no CLIENTE do
@@ -61,10 +62,10 @@ export async function findInstalledFabricVersion(mcVersion: string): Promise<str
 
 async function getLatestFabricInstallerVersion(): Promise<string> {
   const res = await fetch("https://meta.fabricmc.net/v2/versions/installer");
-  if (!res.ok) throw new Error(`Falha ao consultar o instalador do Fabric (HTTP ${res.status}).`);
+  if (!res.ok) throw new Error(t("client.fabricInstallerHttp", { status: res.status }));
   const versions = await res.json() as FabricInstallerVersion[];
   const chosen = versions.find(v => v.stable) ?? versions[0];
-  if (!chosen) throw new Error("Nenhuma versão do instalador do Fabric disponível no momento.");
+  if (!chosen) throw new Error(t("client.fabricNoInstaller"));
   return chosen.version;
 }
 
@@ -84,7 +85,7 @@ export async function installFabricClient(
 ): Promise<string> {
   const already = await findInstalledFabricVersion(mcVersion);
   if (already) {
-    onProgress({ status: "Fabric já instalado.", percent: 100 });
+    onProgress({ status: t("client.fabricInstalled"), percent: 100 });
     return already;
   }
 
@@ -159,7 +160,7 @@ export async function installForgeClient(
 
   const already = await findInstalledForgeVersion(forgeVersion);
   if (already) {
-    onProgress({ status: `${label} já instalado.`, percent: 100 });
+    onProgress({ status: t("client.alreadyInstalled", { label }), percent: 100 });
     return already;
   }
 

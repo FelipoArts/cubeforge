@@ -22,6 +22,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import { onOpenUrl, getCurrent } from "@tauri-apps/plugin-deep-link";
 import { supabase } from "@/lib/supabaseClient";
 import { useAppStore, type AuthUser } from "@/app/store";
+import { getLocale } from "@/i18n";
 
 const LOGIN_URL = "https://cubicase.net/entrar/";
 const REQUIRE_AUTH_TIMEOUT_MS = 5 * 60_000;
@@ -124,7 +125,8 @@ export function requireAuth(): Promise<AuthUser> {
       });
 
       try {
-        await open(LOGIN_URL);
+        // ?lang faz a página de login abrir no idioma escolhido no app (ver docs/assets/i18n.js).
+        await open(`${LOGIN_URL}?lang=${getLocale() === "en" ? "en" : "pt"}`);
       } catch (err) {
         clearTimeout(timer);
         sub.subscription.unsubscribe();

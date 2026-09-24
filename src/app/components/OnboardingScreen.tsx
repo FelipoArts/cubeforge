@@ -3,6 +3,8 @@
 import { motion } from "framer-motion";
 import { Monitor, Globe, ArrowRight } from "lucide-react";
 import { useTheme } from "next-themes";
+import { useT } from "@/i18n";
+import { LanguageSelector } from "@/app/components/LanguageSelector";
 
 // ============================================================
 // OnboardingScreen
@@ -22,6 +24,7 @@ interface OnboardingScreenProps {
 
 export function OnboardingScreen({ mounted, onChoose }: OnboardingScreenProps) {
   const { resolvedTheme } = useTheme();
+  const { t } = useT();
 
   return (
     <div className="min-h-screen bg-theme-bg transition-colors duration-300 flex items-center justify-center p-6">
@@ -38,9 +41,9 @@ export function OnboardingScreen({ mounted, onChoose }: OnboardingScreenProps) {
             className="h-10 mx-auto"
           />
           <div className="space-y-1.5">
-            <h1 className="text-2xl font-bold text-theme-primary">Bem-vindo ao Cubicase</h1>
+            <h1 className="text-2xl font-bold text-theme-primary">{t("onboarding.welcome")}</h1>
             <p className="text-sm text-theme-secondary">
-              O que você quer fazer? Dá pra mudar isso depois em Configurações.
+              {t("onboarding.subtitle")}
             </p>
           </div>
         </div>
@@ -55,11 +58,11 @@ export function OnboardingScreen({ mounted, onChoose }: OnboardingScreenProps) {
               <Monitor className="w-6 h-6 text-indigo-600" />
             </div>
             <h2 className="text-base font-bold text-theme-primary flex items-center gap-1.5">
-              Hospedar um servidor
+              {t("onboarding.host.title")}
               <ArrowRight className="w-4 h-4 opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all text-indigo-600" />
             </h2>
             <p className="text-xs text-theme-secondary mt-1.5 leading-relaxed">
-              Crie e gerencie seu próprio servidor Minecraft, e convide seus amigos pra jogar.
+              {t("onboarding.host.desc")}
             </p>
           </button>
 
@@ -72,14 +75,16 @@ export function OnboardingScreen({ mounted, onChoose }: OnboardingScreenProps) {
               <Globe className="w-6 h-6 text-indigo-600" />
             </div>
             <h2 className="text-base font-bold text-theme-primary flex items-center gap-1.5">
-              Conectar a um servidor
+              {t("onboarding.guest.title")}
               <ArrowRight className="w-4 h-4 opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all text-indigo-600" />
             </h2>
             <p className="text-xs text-theme-secondary mt-1.5 leading-relaxed">
-              Entre no servidor de um amigo usando o código que ele te passou.
+              {t("onboarding.guest.desc")}
             </p>
           </button>
         </div>
+
+        <LanguageSelector compact />
       </motion.div>
     </div>
   );

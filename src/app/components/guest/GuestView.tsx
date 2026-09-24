@@ -37,6 +37,7 @@ import {
 import { planModSync, runModSync, planLocalModSync, runLocalModSync, INITIAL_PREP_STATE, type PrepState } from "@/lib/modSync";
 import { connectAddressFor } from "@/lib/connectAddress";
 import { ModSyncModal } from "./ModSyncModal";
+import { useT, t as tn, getLocale, type TKey } from "@/i18n";
 
 /** Tipos de servidor cobertos pelo fluxo "Jogar" (abrir o launcher já pronto). */
 const PLAYABLE_SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
@@ -67,6 +68,7 @@ export function GuestView({
   onConnect,
   onDisconnect,
 }: GuestViewProps) {
+  const { t, rich, locale } = useT();
   const {
     knownServers,
     addKnownServer,
@@ -148,7 +150,7 @@ export function GuestView({
     if ((server.serverType === "forge" || server.serverType === "neoforge") && !server.forgeVersion) {
       patchPrepState(server.shortCode, {
         phase: "error",
-        errorMessage: `Não sabemos qual versão do ${loaderLabel(server.serverType)} esse servidor usa — abra o Minecraft manualmente e conecte em ${connectAddressFor(server, minecraftPort)}.`,
+        errorMessage: tn("guest.prep.unknownLoaderVersion", { loader: loaderLabel(server.serverType), address: connectAddressFor(server, minecraftPort) }),
       });
       return;
     }
@@ -157,7 +159,7 @@ export function GuestView({
     if (server.isOwnServer && !localInfo) {
       patchPrepState(server.shortCode, {
         phase: "error",
-        errorMessage: "Não encontramos a pasta deste servidor no seu computador — ele pode ter sido removido.",
+        errorMessage: tn("guest.prep.folderMissing"),
       });
       return;
     }
@@ -173,10 +175,10 @@ export function GuestView({
 
         if (server.serverType === "fabric") {
           const already = await findInstalledFabricVersion(server.version);
-          loaderNote = already ? null : "Instalar o Fabric no seu Minecraft (ainda não instalado).";
+          loaderNote = already ? null : tn("guest.prep.installFabric");
         } else {
           const already = server.forgeVersion ? await findInstalledForgeVersion(server.forgeVersion) : null;
-          loaderNote = already ? null : `Instalar o ${loaderLabel(server.serverType)} ${server.forgeVersion} no seu Minecraft (ainda não instalado).`;
+          loaderNote = already ? null : tn("guest.prep.installLoader", { loader: loaderLabel(server.serverType), version: server.forgeVersion ?? "" });
         }
 
         plan = localInfo
@@ -205,7 +207,7 @@ export function GuestView({
     gameDir: string | null,
     extra: Partial<PrepState> = {}
   ) => {
-    patchPrepState(server.shortCode, { stageMessage: "Selecionando o perfil no launcher...", stagePercent: 92 });
+    patchPrepState(server.shortCode, { stageMessage: tn("guest.prep.selectingProfile"), stagePercent: 92 });
     try {
       const prepResult = await invoke<string>("prepare_launcher_profile", {
         versionId,
@@ -215,7 +217,7 @@ export function GuestView({
       if (prepResult === "not_found") {
         patchPrepState(server.shortCode, {
           phase: "error",
-          errorMessage: `Não encontramos sua instalação do Minecraft — abra o jogo e conecte em ${connectAddressFor(server, minecraftPort)} manualmente.`,
+          errorMessage: tn("guest.prep.minecraftNotFound", { address: connectAddressFor(server, minecraftPort) }),
         });
         return;
       }
@@ -249,7 +251,7 @@ export function GuestView({
     const current = prepStates[server.shortCode];
     if (!current) return;
 
-    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: "Preparando...", stagePercent: 0 });
+    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: tn("guest.prep.preparing"), stagePercent: 0 });
 
     try {
       let versionId = server.version ?? "";
@@ -308,7 +310,7 @@ export function GuestView({
     if (!current) return;
 
     const reset = current.modEntries.map(e => (e.status === "failed" ? { ...e, status: "pending" as const, error: undefined } : e));
-    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: "Tentando de novo os mods que falharam...", stagePercent: 50, modEntries: reset });
+    patchPrepState(server.shortCode, { phase: "syncing", stageMessage: tn("guest.prep.retrying"), stagePercent: 50, modEntries: reset });
 
     const toRetry = reset.filter(e => e.status === "pending");
     const localInfo = server.isOwnServer ? getLocalServerInfo(server.shortCode) : null;
@@ -383,7 +385,7 @@ export function GuestView({
           name: server.name,
           version: server.version || "1.20.1",
           serverType: server.serverType || "vanilla",
-          description: server.description || `Servidor Minecraft ${server.version || "1.20.1"}`,
+          description: server.description || tn("guest.defaultDescription", { version: server.version || "1.20.1" }),
           status: "offline",
           minecraftStatus: null,
           port: 25565,
@@ -505,12 +507,12 @@ export function GuestView({
     setWakingShortCode(server.shortCode);
     setWakeError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/servers/${server.shortCode}/wake`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/api/v1/servers/${server.shortCode}/wake`, { method: "POST", headers: { "Accept-Language": getLocale() } });
       if (!res.ok) {
         const body = await res.json().catch(() => null);
         const message = res.status === 429
-          ? "Pedido de despertar já enviado recentemente. Aguarde alguns segundos e tente de novo."
-          : (body?.message || `Não foi possível acordar o servidor (HTTP ${res.status}).`);
+          ? tn("guest.wake.rateLimited")
+          : (body?.message || tn("guest.wake.failed", { status: res.status }));
         throw new Error(message);
       }
 
@@ -521,7 +523,7 @@ export function GuestView({
         attempts += 1;
         if (attempts > MAX_ATTEMPTS) {
           setWakingShortCode(null);
-          setWakeError({ shortCode: server.shortCode, message: "O servidor demorou demais pra responder. Tente de novo." });
+          setWakeError({ shortCode: server.shortCode, message: tn("guest.wake.timeout") });
           return;
         }
         try {
@@ -568,7 +570,7 @@ export function GuestView({
         name: server.name,
         version: server.version,
         serverType: server.serverType || "vanilla",
-        description: server.description || `Servidor Minecraft ${server.version}`,
+        description: server.description || tn("guest.defaultDescription", { version: server.version }),
         status: networkStatus,
         minecraftStatus: session.minecraftStatus ?? null,
         port: session.port || 25565,
@@ -594,13 +596,13 @@ export function GuestView({
   const handleAddServer = async () => {
     const code = inviteCodeInput.replace("CF-", "").trim().toUpperCase();
     if (!code) {
-      setAddError("Insira um código de convite.");
+      setAddError(tn("guest.add.enterCode"));
       return;
     }
 
     // Verificar se já existe
     if (knownServers.find(s => s.shortCode === code)) {
-      setAddError("Este servidor já está na sua biblioteca.");
+      setAddError(tn("guest.add.duplicate"));
       return;
     }
 
@@ -612,8 +614,8 @@ export function GuestView({
     if (!result.ok) {
       setAddError(
         result.reason === "not_found"
-          ? "Servidor não encontrado. Verifique o código e tente novamente."
-          : "Não foi possível conectar à API Central. Verifique sua conexão com a internet."
+          ? tn("guest.add.notFound")
+          : tn("guest.add.apiDown")
       );
       return;
     }
@@ -665,15 +667,15 @@ export function GuestView({
       setIsAdding(false);
       if (!result.ok) {
         const message = result.reason === "not_found"
-          ? "Convite inválido ou expirado. Verifique o link e tente novamente."
-          : "Não foi possível conectar à API Central. Verifique sua conexão com a internet.";
+          ? tn("guest.invite.expired")
+          : tn("guest.add.apiDown");
         setAddError(message);
-        pushDiagnostic({ level: "warning", source: "Convite", title: "Não foi possível entrar pelo convite", message, detail: `CF-${code}` });
+        pushDiagnostic({ level: "warning", source: tn("diag.source.invite"), title: tn("guest.invite.failed.title"), message, detail: `CF-${code}` });
         return;
       }
       setShowAddModal(false);
       setInviteCodeInput("");
-      pushDiagnostic({ level: "info", source: "Convite", title: "Servidor adicionado", message: `"${result.server.name}" foi adicionado à sua biblioteca pelo link de convite.` });
+      pushDiagnostic({ level: "info", source: tn("diag.source.invite"), title: tn("guest.invite.added.title"), message: tn("guest.invite.added.message", { name: result.server.name }) });
       handleConnect(result.server);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -702,15 +704,15 @@ export function GuestView({
   };
 
   const formatLastSeen = (iso: string | null, nowMs: number): string => {
-    if (!iso) return "Nunca";
+    if (!iso) return t("guest.time.never");
     const diff = nowMs - new Date(iso).getTime();
     const minutes = Math.floor(diff / 60000);
-    if (minutes < 1) return "Agora mesmo";
-    if (minutes < 60) return `Há ${minutes} min`;
+    if (minutes < 1) return t("guest.time.justNow");
+    if (minutes < 60) return t("guest.time.minutesAgo", { count: minutes });
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `Há ${hours}h`;
+    if (hours < 24) return t("guest.time.hoursAgo", { count: hours });
     const days = Math.floor(hours / 24);
-    return `Há ${days}d`;
+    return t("guest.time.daysAgo", { count: days });
   };
 
   // Tempo online desde a última vez que o status transicionou para "online"
@@ -731,43 +733,45 @@ export function GuestView({
   // o servidor sem usar a malha do CubeForge, acessível só por IP local/LAN ou
   // outra VPN). Por isso o badge combina os dois em 4 estados em vez de repetir
   // o "Offline" genérico sempre que falta qualquer uma das duas partes.
-  const getDisplayStatus = (server: KnownServer): { color: string; textClass: string; label: string } => {
+  const getDisplayStatus = (server: KnownServer): { color: string; textClass: string; label: string; labelKey: TKey } => {
     const networkOnline = server.status === "online";
     const mc = server.minecraftStatus;
     const mcOnline = mc === "online";
+    // labelKey identifica o estado (a UI compara por ele, nunca pelo texto traduzido).
+    const build = (labelKey: TKey, color: string, textClass: string) => ({ color, textClass, label: t(labelKey), labelKey });
 
     if (networkOnline && mcOnline) {
-      return { color: "bg-emerald-500", textClass: "text-emerald-600 dark:text-emerald-400", label: "Online" };
+      return build("guest.status.online", "bg-emerald-500", "text-emerald-600 dark:text-emerald-400");
     }
     if (networkOnline) {
       // Rede pronta, mas o processo Java não está de pé.
-      const label =
-        mc === "starting" ? "Servidor iniciando" :
-        mc === "stopping" ? "Servidor encerrando" :
-        mc === "crashed" ? "Servidor com erro" :
-        "Servidor desligado";
-      return {
-        color: mc === "crashed" ? "bg-rose-500" : "bg-amber-500",
-        textClass: mc === "crashed" ? "text-rose-600 dark:text-rose-400" : "text-amber-600 dark:text-amber-400",
-        label,
-      };
+      const labelKey: TKey =
+        mc === "starting" ? "guest.status.starting" :
+        mc === "stopping" ? "guest.status.stopping" :
+        mc === "crashed" ? "guest.status.crashed" :
+        "guest.status.stopped";
+      return build(
+        labelKey,
+        mc === "crashed" ? "bg-rose-500" : "bg-amber-500",
+        mc === "crashed" ? "text-rose-600 dark:text-rose-400" : "text-amber-600 dark:text-amber-400",
+      );
     }
     if (mcOnline) {
       // Minecraft rodando, mas sem a rede mesh do CubeForge — só acessível
       // diretamente (IP local/LAN) ou por outra VPN, não pelo "Conectar" daqui.
-      return { color: "bg-sky-500", textClass: "text-sky-600 dark:text-sky-400", label: "Rodando sem rede mesh" };
+      return build("guest.status.noMesh", "bg-sky-500", "text-sky-600 dark:text-sky-400");
     }
     if (mc === "crashed") {
       // Sem rede E o Minecraft crashou — mantém consistente com o botão de ação
       // abaixo, que já trata esse caso separadamente do "Offline" genérico.
-      return { color: "bg-rose-500", textClass: "text-rose-600 dark:text-rose-400", label: "Servidor com erro" };
+      return build("guest.status.crashed", "bg-rose-500", "text-rose-600 dark:text-rose-400");
     }
     if (mc === "sleeping") {
       // Wake-on-demand armado: rede mesh de propósito desligada até alguém
       // pedir pra entrar (ver botão "Acordar servidor" abaixo).
-      return { color: "bg-indigo-400", textClass: "text-indigo-500 dark:text-indigo-400", label: "Em espera" };
+      return build("guest.status.sleeping", "bg-indigo-400", "text-indigo-500 dark:text-indigo-400");
     }
-    return { color: "bg-slate-400", textClass: "text-theme-secondary", label: "Offline" };
+    return build("guest.status.offline", "bg-slate-400", "text-theme-secondary");
   };
 
   const isConnecting = netStatus === "connecting";
@@ -798,9 +802,9 @@ export function GuestView({
         onClick={() => handlePrepareAndPlay(server)}
         disabled={busy}
         className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
-        title="Abre o Minecraft já configurado (loader, mods e versão certos) e conectado neste servidor local."
+        title={t("guest.playTitle")}
       >
-        <Play className="w-3.5 h-3.5 fill-current" /> Jogar
+        <Play className="w-3.5 h-3.5 fill-current" /> {t("guest.play")}
       </button>
     );
   };
@@ -812,12 +816,12 @@ export function GuestView({
         <div className="space-y-1">
           <h2 className="text-3xl font-bold text-theme-primary flex items-center gap-3">
             <Globe className="w-7 h-7 text-indigo-600" />
-            Servidores Conhecidos
+            {t("guest.title")}
           </h2>
           <p className="text-theme-secondary text-sm">
             {knownServers.length === 0
-              ? "Adicione servidores usando o código de convite para começar."
-              : `${knownServers.length} servidor${knownServers.length !== 1 ? "es" : ""} na sua biblioteca`}
+              ? t("guest.emptyPrompt")
+              : t("guest.count", { count: knownServers.length })}
           </p>
         </div>
 
@@ -826,14 +830,14 @@ export function GuestView({
           {isOfflineMode && (
             <div className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/30 rounded-xl text-[10px] font-bold text-amber-600 dark:text-amber-400">
               <WifiOff className="w-3 h-3" />
-              Offline
+              {t("guest.status.offline")}
             </div>
           )}
 
           {/* Última atualização */}
           {lastRefreshTime && (
             <span className="text-[10px] text-theme-secondary font-mono">
-              {lastRefreshTime.toLocaleTimeString()}
+              {lastRefreshTime.toLocaleTimeString(locale)}
             </span>
           )}
 
@@ -843,7 +847,7 @@ export function GuestView({
             onClick={() => refreshAllServers()}
             disabled={isRefreshing}
             className="p-2 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors disabled:opacity-50 cursor-pointer"
-            title="Atualizar status"
+            title={t("guest.refresh")}
           >
             <RefreshCw className={cn("w-4 h-4", isRefreshing && "animate-spin")} />
           </button>
@@ -855,7 +859,7 @@ export function GuestView({
             className="h-11 px-5 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all text-sm font-bold flex items-center gap-2 shadow-md shadow-theme-shadow active:scale-95 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            Adicionar Servidor
+            {t("guest.addServer")}
           </button>
         </div>
       </div>
@@ -865,8 +869,7 @@ export function GuestView({
         <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-2xl flex items-center gap-3 text-xs">
           <WifiOff className="w-4 h-4 text-amber-500 flex-shrink-0" />
           <span>
-            Sem conexão com a API Central. As informações podem estar desatualizadas.
-            Os status exibidos são do último snapshot salvo.
+            {t("guest.offlineBanner")}
           </span>
         </div>
       )}
@@ -882,10 +885,9 @@ export function GuestView({
             <Globe className="w-10 h-10 text-indigo-600" />
           </div>
           <div className="space-y-2">
-            <h3 className="text-xl font-bold text-theme-primary">Sua Biblioteca está vazia</h3>
+            <h3 className="text-xl font-bold text-theme-primary">{t("guest.empty.title")}</h3>
             <p className="text-theme-secondary text-sm max-w-md mx-auto leading-relaxed">
-              Adicione servidores usando o código de convite compartilhado pelos hosts.
-              Você só precisa do código uma única vez — depois disso, o servidor fica salvo aqui.
+              {t("guest.empty.body")}
             </p>
           </div>
           <button
@@ -894,7 +896,7 @@ export function GuestView({
             className="h-12 px-8 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all text-sm font-bold flex items-center gap-2 mx-auto shadow-md shadow-theme-shadow active:scale-95 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            Adicionar Primeiro Servidor
+            {t("guest.empty.button")}
           </button>
         </motion.div>
       ) : (
@@ -933,13 +935,13 @@ export function GuestView({
                       "text-[10px] font-bold uppercase tracking-wider",
                       stale ? "text-theme-secondary" : display.textClass
                     )} title={
-                      stale ? "Não foi possível confirmar o status recentemente com a API Central" :
-                      display.label === "Rodando sem rede mesh" ? "O Minecraft está de pé, mas o host não ligou a rede mesh do CubeForge — só dá pra acessar pelo IP local (LAN) ou outra VPN." :
+                      stale ? t("guest.status.staleTitle") :
+                      display.labelKey === "guest.status.noMesh" ? t("guest.status.noMeshTitle") :
                       undefined
                     }>
                       {/* Status desatualizado: não sabemos mais se ainda é verdade, então
                           não afirmamos online/offline — só que não está confirmado. */}
-                      {stale ? "Não confirmado" : display.label}
+                      {stale ? t("guest.status.unconfirmed") : display.label}
                     </span>
                   </div>
 
@@ -947,7 +949,7 @@ export function GuestView({
                     {/* Badge "Meu Servidor" */}
                     {server.isOwnServer && (
                       <span className="text-[9px] font-bold text-indigo-600 uppercase tracking-wider bg-indigo-100 dark:bg-indigo-900/30 px-2 py-0.5 rounded-full">
-                        Meu
+                        {t("guest.badge.own")}
                       </span>
                     )}
                     {/* Badge de tipo com cor */}
@@ -985,13 +987,13 @@ export function GuestView({
                   {server.currentPlayers !== undefined && server.minecraftStatus === "online" && (
                     <span className="flex items-center gap-1">
                       <Users className="w-3 h-3" />
-                      {server.currentPlayers}/{server.maxPlayers} jogadores
+                      {t("guest.players", { current: server.currentPlayers, max: server.maxPlayers })}
                     </span>
                   )}
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
                     {mcOnline && !stale
-                      ? `Online há ${formatUptime(server.onlineSince)}`
+                      ? t("guest.onlineFor", { time: formatUptime(server.onlineSince) })
                       : formatLastSeen(server.lastSeenOnline, now)}
                   </span>
                 </div>
@@ -1014,12 +1016,10 @@ export function GuestView({
                     </div>
                     <div>
                       <h4 className="text-sm font-bold text-emerald-700 dark:text-emerald-300">
-                        {isOnline ? "Conectado" : "Conectando..."}
+                        {isOnline ? t("guest.connected") : t("guest.connecting")}
                       </h4>
                       <p className="text-[11px] text-theme-secondary mt-0.5 leading-relaxed">
-                        Conecte-se em{" "}
-                        <strong className="text-theme-primary font-mono">{connectAddress}</strong>{" "}
-                        no seu Minecraft
+                        {rich("guest.connectAt", { address: <strong className="text-theme-primary font-mono">{connectAddress}</strong> })}
                       </p>
                     </div>
                     <button
@@ -1028,7 +1028,7 @@ export function GuestView({
                       className="flex items-center gap-1.5 text-[11px] font-bold text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer"
                     >
                       {copied === connectAddress ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                      {copied === connectAddress ? "Copiado!" : "Copiar endereço"}
+                      {copied === connectAddress ? t("guest.copied") : t("guest.copyAddress")}
                     </button>
                   </div>
                   ) : (
@@ -1041,7 +1041,7 @@ export function GuestView({
                       type="button"
                       onClick={() => copyToClipboard(connectAddress)}
                       className="p-1.5 hover:bg-theme-card rounded-lg text-indigo-600 hover:text-indigo-800 dark:hover:text-indigo-400 transition-colors cursor-pointer shrink-0"
-                      title="Copiar endereço de conexão"
+                      title={t("guest.copyAddressTitle")}
                     >
                       {copied === connectAddress ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
@@ -1059,7 +1059,7 @@ export function GuestView({
                       onClick={() => handleDisconnect()}
                       className="h-10 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-rose-50 dark:bg-rose-900/20 text-rose-600 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/30"
                     >
-                      <X className="w-3.5 h-3.5" /> Desconectar
+                      <X className="w-3.5 h-3.5" /> {t("guest.disconnect")}
                     </button>
                     {PLAYABLE_SERVER_TYPES.has(server.serverType) && (
                       <button
@@ -1068,7 +1068,7 @@ export function GuestView({
                         disabled={prepModalFor === server.shortCode && prepStates[server.shortCode]?.phase !== "error" && prepStates[server.shortCode]?.phase !== "done"}
                         className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
                       >
-                        <Play className="w-3.5 h-3.5 fill-current" /> Preparar e Jogar
+                        <Play className="w-3.5 h-3.5 fill-current" /> {t("guest.prepareAndPlay")}
                       </button>
                     )}
                   </>
@@ -1078,7 +1078,7 @@ export function GuestView({
                   // e impedir uma tentativa de conexão baseada em dado potencialmente obsoleto.
                   <div className="flex-1 h-10 rounded-xl bg-theme-muted border border-theme-card flex items-center justify-center gap-1.5 text-[10px] font-bold text-theme-secondary">
                     <WifiOff className="w-3 h-3" />
-                    Status desatualizado
+                    {t("guest.status.stale")}
                   </div>
                 ) : server.status === "online" ? (
                   server.isOwnServer ? (
@@ -1096,7 +1096,7 @@ export function GuestView({
                       disabled={isConnecting}
                       className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
                     >
-                      <Play className="w-3.5 h-3.5 fill-current" /> Conectar
+                      <Play className="w-3.5 h-3.5 fill-current" /> {t("guest.connect")}
                     </button>
                   ) : (
                     <button
@@ -1105,7 +1105,7 @@ export function GuestView({
                       disabled={isConnecting}
                       className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 disabled:opacity-50 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-theme-shadow"
                     >
-                      <Zap className="w-3.5 h-3.5 fill-current" /> Conectar
+                      <Zap className="w-3.5 h-3.5 fill-current" /> {t("guest.connect")}
                     </button>
                   )
                 ) : server.minecraftStatus === "sleeping" ? (
@@ -1117,7 +1117,7 @@ export function GuestView({
                   ) : wakingShortCode === server.shortCode ? (
                     <div className="flex-1 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-indigo-500">
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Acordando, aguarde...
+                      {t("guest.wake.waking")}
                     </div>
                   ) : (
                     <button
@@ -1125,7 +1125,7 @@ export function GuestView({
                       onClick={() => handleWakeServer(server)}
                       className="flex-1 h-10 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-theme-shadow"
                     >
-                      <Zap className="w-3.5 h-3.5 fill-current" /> Acordar servidor
+                      <Zap className="w-3.5 h-3.5 fill-current" /> {t("guest.wake.button")}
                     </button>
                   )
                 ) : server.minecraftStatus === "online" ? (
@@ -1138,21 +1138,21 @@ export function GuestView({
                     // por aqui — só via IP local (LAN) ou outra VPN que o host esteja usando.
                     <div
                       className="flex-1 h-10 rounded-xl bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-sky-600 dark:text-sky-400"
-                      title="O host ligou o servidor, mas não a rede mesh do CubeForge. Só dá pra entrar pelo IP local (LAN) ou outra VPN."
+                      title={t("guest.noMeshTitle")}
                     >
                       <Server className="w-3 h-3" />
-                      Sem rede mesh
+                      {t("guest.noMesh")}
                     </div>
                   )
                 ) : server.minecraftStatus === "crashed" ? (
                   <div className="flex-1 h-10 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/30 flex items-center justify-center gap-1.5 text-[10px] font-bold text-rose-500">
                     <AlertTriangle className="w-3 h-3" />
-                    Servidor com erro
+                    {t("guest.status.crashed")}
                   </div>
                 ) : (
                   <div className="flex-1 h-10 rounded-xl bg-theme-muted border border-theme-card flex items-center justify-center gap-1.5 text-[10px] font-bold text-theme-secondary">
                     <WifiOff className="w-3 h-3" />
-                    Offline
+                    {t("guest.status.offline")}
                   </div>
                 )}
 
@@ -1161,7 +1161,7 @@ export function GuestView({
                   type="button"
                   onClick={() => copyToClipboard(`CF-${server.shortCode}`)}
                   className="p-2.5 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer"
-                  title="Copiar código do servidor"
+                  title={t("guest.copyCode")}
                 >
                   {copied === `CF-${server.shortCode}` ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 </button>
@@ -1171,7 +1171,7 @@ export function GuestView({
                   type="button"
                   onClick={() => handleRemoveServer(server.shortCode)}
                   className="p-2.5 hover:bg-rose-50 dark:hover:bg-rose-900/20 rounded-xl text-theme-secondary hover:text-rose-500 transition-colors cursor-pointer"
-                  title="Remover da biblioteca"
+                  title={t("guest.remove")}
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
@@ -1228,7 +1228,7 @@ export function GuestView({
                   <div className="w-8 h-8 bg-indigo-100 dark:bg-indigo-800/40 rounded-lg flex items-center justify-center">
                     <Plus className="text-indigo-700 dark:text-indigo-300 w-5 h-5" />
                   </div>
-                  <h3 className="text-xl font-bold text-theme-primary">Adicionar Servidor</h3>
+                  <h3 className="text-xl font-bold text-theme-primary">{t("guest.modal.title")}</h3>
                 </div>
                 {!isAdding && (
                   <button
@@ -1244,7 +1244,7 @@ export function GuestView({
               <div className="space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">
-                    Código de Convite
+                    {t("guest.modal.code")}
                   </label>
                   <input
                     type="text"
@@ -1272,7 +1272,7 @@ export function GuestView({
                 </div>
 
                 <p className="text-[10px] text-theme-secondary italic leading-relaxed">
-                  Peça ao host para compartilhar o código do servidor. Você só precisa dele uma vez — depois disso, o servidor fica salvo na sua biblioteca.
+                  {t("guest.modal.hint")}
                 </p>
               </div>
 
@@ -1283,7 +1283,7 @@ export function GuestView({
                   disabled={isAdding}
                   className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold disabled:opacity-50 cursor-pointer"
                 >
-                  Cancelar
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -1292,9 +1292,9 @@ export function GuestView({
                   className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-theme-shadow cursor-pointer"
                 >
                   {isAdding ? (
-                    <><Loader2 className="w-4 h-4 animate-spin" /> Verificando...</>
+                    <><Loader2 className="w-4 h-4 animate-spin" /> {t("guest.modal.verifying")}</>
                   ) : (
-                    <><Plus className="w-4 h-4" /> Adicionar</>
+                    <><Plus className="w-4 h-4" /> {t("guest.modal.add")}</>
                   )}
                 </button>
               </div>

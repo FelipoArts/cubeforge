@@ -4,6 +4,7 @@ import { useTheme } from "next-themes";
 import { useState, useEffect } from "react";
 import { Sun, Moon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useT } from "@/i18n";
 
 // ============================================================
 // ThemeToggle
@@ -14,6 +15,7 @@ import { cn } from "@/lib/utils";
 
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme();
+  const { t } = useT();
   const [mounted, setMounted] = useState(false);
 
   // Evita mismatch de hidratação SSR
@@ -37,7 +39,7 @@ export function ThemeToggle() {
           ? "bg-indigo-900/60 border border-indigo-700/30"
           : "bg-indigo-100 border border-indigo-200"
       )}
-      title={isDark ? "Mudar para modo claro" : "Mudar para modo escuro"}
+      title={isDark ? t("theme.toLight") : t("theme.toDark")}
     >
       {/* Ícone do Sol (lado direito) */}
       <Sun

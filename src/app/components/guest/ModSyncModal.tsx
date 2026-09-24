@@ -5,6 +5,7 @@ import { X, Loader2, CheckCircle2, XCircle, AlertTriangle, Download, Server, Pla
 import { cn } from "@/lib/utils";
 import type { ModSyncEntry, PrepState } from "@/lib/modSync";
 import { formatBytes } from "@/lib/modSync";
+import { useT } from "@/i18n";
 
 // ============================================================
 // ModSyncModal — confirmação + progresso + relatório final do fluxo
@@ -49,6 +50,7 @@ export function ModSyncModal({
   onContinueAnyway,
   onOpenMinecraft,
 }: ModSyncModalProps) {
+  const { t } = useT();
   const { phase, modEntries } = state;
   const failedEntries = modEntries.filter((e) => e.status === "failed");
   const okCount = modEntries.filter((e) => e.status === "ok").length;
@@ -57,6 +59,19 @@ export function ModSyncModal({
   const isLocalSync = modEntries.some((e) => e.source === "local");
   const canClose = phase === "confirm" || phase === "error" || phase === "done";
   const showFailureFooter = failedEntries.length > 0 && !state.acceptedPartial;
+
+  // Texto do passo "baixar/copiar N mods" + de onde vêm (Modrinth / host / pasta local).
+  const sizeLabel = formatBytes(state.totalBytesToDownload);
+  const where = isLocalSync ? t("modsync.step.whereFolder") : t("modsync.step.whereHost");
+  const downloadSummary =
+    t(isLocalSync ? "modsync.step.copy" : "modsync.step.download", { count: modEntries.length, size: sizeLabel }) +
+    (modrinthCount > 0 && meshCount > 0
+      ? t("modsync.step.mixed", { modrinth: modrinthCount, mesh: meshCount, where })
+      : modrinthCount > 0
+        ? t("modsync.step.onlyModrinth")
+        : meshCount > 0
+          ? t(isLocalSync ? "modsync.step.onlyLocal" : "modsync.step.onlyHost")
+          : "");
 
   return (
     <AnimatePresence>
@@ -82,7 +97,7 @@ export function ModSyncModal({
               <div className="w-8 h-8 bg-indigo-100 dark:bg-indigo-800/40 rounded-lg flex items-center justify-center shrink-0">
                 <Download className="text-indigo-700 dark:text-indigo-300 w-4 h-4" />
               </div>
-              <h3 className="text-lg font-bold text-theme-primary truncate">Preparar {serverName}</h3>
+              <h3 className="text-lg font-bold text-theme-primary truncate">{t("modsync.title", { name: serverName })}</h3>
             </div>
             {canClose && (
               <button
@@ -99,7 +114,7 @@ export function ModSyncModal({
           {phase === "checking" && (
             <div className="flex flex-col items-center gap-3 py-6 text-center">
               <Loader2 className="w-8 h-8 text-indigo-500 animate-spin" />
-              <p className="text-sm text-theme-secondary">Checando o que já está instalado e o que o servidor precisa...</p>
+              <p className="text-sm text-theme-secondary">{t("modsync.checking")}</p>
             </div>
           )}
 
@@ -108,14 +123,14 @@ export function ModSyncModal({
             <div className="space-y-4">
               <div className="flex items-start gap-2.5 p-3 bg-theme-warning border border-theme-warning rounded-2xl text-xs text-amber-800 dark:text-amber-200">
                 <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-                <span>{state.errorMessage ?? "Não foi possível preparar este servidor."}</span>
+                <span>{state.errorMessage ?? t("modsync.prepareFailed")}</span>
               </div>
               <div className="flex justify-end gap-3 pt-2 border-t border-theme-card">
                 <button type="button" onClick={onCancel} className="px-5 h-11 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer">
-                  Fechar
+                  {t("common.close")}
                 </button>
                 <button type="button" onClick={onRetryAll} className="px-5 h-11 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold cursor-pointer">
-                  Tentar de novo
+                  {t("modsync.retry")}
                 </button>
               </div>
             </div>
@@ -125,11 +140,11 @@ export function ModSyncModal({
           {phase === "confirm" && (
             <div className="space-y-4">
               <div className="space-y-2 text-sm text-theme-secondary">
-                <p className="font-semibold text-theme-primary">Isso vai:</p>
+                <p className="font-semibold text-theme-primary">{t("modsync.willDo")}</p>
                 <ul className="space-y-1.5 pl-1">
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500 shrink-0 mt-0.5" />
-                    <span>Selecionar o perfil certo no Minecraft Launcher.</span>
+                    <span>{t("modsync.step.profile")}</span>
                   </li>
                   {state.loaderNote && (
                     <li className="flex items-start gap-2">
@@ -141,38 +156,31 @@ export function ModSyncModal({
                     <li className="flex items-start gap-2">
                       <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500 shrink-0 mt-0.5" />
                       <span>
-                        {isLocalSync ? "Copiar" : "Baixar"} {modEntries.length} mod{modEntries.length !== 1 ? "s" : ""} (≈{formatBytes(state.totalBytesToDownload)})
-                        {modrinthCount > 0 && meshCount > 0 && (
-                          <> — {modrinthCount} direto do Modrinth, {meshCount} {isLocalSync ? "direto da pasta do servidor" : "pelo próprio host"}</>
-                        )}
-                        {modrinthCount > 0 && meshCount === 0 && <> — direto do Modrinth</>}
-                        {modrinthCount === 0 && meshCount > 0 && (
-                          <> — {isLocalSync ? "direto da pasta do servidor no seu computador" : "direto do host (não encontrados em catálogo público)"}</>
-                        )}
+                        {downloadSummary}
                       </span>
                     </li>
                   ) : (
                     state.alreadyInstalledCount > 0 && (
                       <li className="flex items-start gap-2">
                         <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
-                        <span>Todos os {state.alreadyInstalledCount} mods já estão instalados e verificados.</span>
+                        <span>{t("modsync.step.allInstalled", { count: state.alreadyInstalledCount })}</span>
                       </li>
                     )
                   )}
                   {state.instanceModsDir !== "" && (
                     <li className="flex items-start gap-2">
                       <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500 shrink-0 mt-0.5" />
-                      <span>Isolar tudo numa pasta própria deste servidor — não afeta outros.</span>
+                      <span>{t("modsync.step.isolate")}</span>
                     </li>
                   )}
                 </ul>
               </div>
               <div className="flex justify-end gap-3 pt-2 border-t border-theme-card">
                 <button type="button" onClick={onCancel} className="px-5 h-11 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer">
-                  Cancelar
+                  {t("common.cancel")}
                 </button>
                 <button type="button" onClick={onConfirm} className="px-5 h-11 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold cursor-pointer">
-                  Preparar agora
+                  {t("modsync.prepareNow")}
                 </button>
               </div>
             </div>
@@ -200,7 +208,7 @@ export function ModSyncModal({
                         {entry.filename}
                       </span>
                       <span className="text-[10px] text-theme-secondary shrink-0">
-                        {entry.status === "ok" ? "ok" : entry.status === "downloading" ? (entry.source === "modrinth" ? "Modrinth..." : entry.source === "local" ? "copiando..." : "host...") : entry.status === "failed" ? "falhou" : ""}
+                        {entry.status === "ok" ? t("modsync.entry.ok") : entry.status === "downloading" ? (entry.source === "modrinth" ? t("modsync.entry.modrinth") : entry.source === "local" ? t("modsync.entry.copying") : t("modsync.entry.host")) : entry.status === "failed" ? t("modsync.entry.failed") : ""}
                       </span>
                     </div>
                   ))}
@@ -217,8 +225,8 @@ export function ModSyncModal({
                   <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>
                     {modEntries.length > 0
-                      ? `${okCount}/${modEntries.length} mods instalados e verificados. Pronto pra jogar!`
-                      : "Tudo certo. Pronto pra jogar!"}
+                      ? t("modsync.done.allOk", { ok: okCount, total: modEntries.length })
+                      : t("modsync.done.allGood")}
                   </span>
                 </div>
               ) : (
@@ -226,8 +234,7 @@ export function ModSyncModal({
                   <div className="flex items-start gap-2.5 p-3 bg-theme-warning border border-theme-warning rounded-2xl text-sm text-amber-800 dark:text-amber-200">
                     <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                     <span>
-                      {okCount}/{modEntries.length} mods instalados. {failedEntries.length} não deram certo
-                      {state.acceptedPartial ? " — você optou por continuar mesmo assim, o servidor pode rejeitar a conexão ou o jogo pode travar por mod faltando:" : ":"}
+                      {t(state.acceptedPartial ? "modsync.done.partialAccepted" : "modsync.done.partial", { ok: okCount, total: modEntries.length, failed: failedEntries.length })}
                     </span>
                   </div>
                   <div className="space-y-1 max-h-40 overflow-y-auto pl-1">
@@ -235,7 +242,7 @@ export function ModSyncModal({
                       <div key={entry.filename} className="flex items-start gap-2 text-xs">
                         <Server className="w-3 h-3 text-rose-500 shrink-0 mt-0.5" />
                         <span className="text-theme-secondary">
-                          <span className="font-semibold text-theme-primary">{entry.filename}</span> — {entry.error ?? "falha desconhecida"}
+                          <span className="font-semibold text-theme-primary">{entry.filename}</span> — {entry.error ?? t("modsync.done.unknownFailure")}
                         </span>
                       </div>
                     ))}
@@ -247,26 +254,26 @@ export function ModSyncModal({
                 {showFailureFooter ? (
                   <>
                     <button type="button" onClick={onCancel} className="px-4 h-10 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-xs font-semibold cursor-pointer">
-                      Cancelar
+                      {t("common.cancel")}
                     </button>
                     <button type="button" onClick={onContinueAnyway} className="px-4 h-10 rounded-2xl border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors text-xs font-semibold cursor-pointer">
-                      Continuar mesmo assim
+                      {t("modsync.done.continueAnyway")}
                     </button>
                     <button type="button" onClick={onRetryFailedOnly} className="px-4 h-10 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-xs font-semibold cursor-pointer">
-                      Tentar de novo ({failedEntries.length})
+                      {t("modsync.retryCount", { count: failedEntries.length })}
                     </button>
                   </>
                 ) : (
                   <>
                     <button type="button" onClick={onCancel} className="px-4 h-10 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-xs font-semibold cursor-pointer">
-                      Fechar
+                      {t("common.close")}
                     </button>
                     <button
                       type="button"
                       onClick={onOpenMinecraft}
                       className="px-5 h-10 bg-emerald-600 text-white rounded-2xl hover:bg-emerald-700 transition-colors text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                     >
-                      <Play className="w-3.5 h-3.5 fill-current" /> Abrir Minecraft
+                      <Play className="w-3.5 h-3.5 fill-current" /> {t("modsync.done.openMinecraft")}
                     </button>
                   </>
                 )}

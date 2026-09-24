@@ -14,6 +14,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { pushDiagnostic } from "@/app/diagnostics";
+import { t } from "@/i18n";
 
 interface BackupInfo {
   file_name: string;
@@ -28,11 +29,9 @@ export interface AutoBackupOptions {
   retentionCount: number;
 }
 
-const REASON_LABELS: Record<AutoBackupReason, string> = {
-  stop: "servidor parado",
-  crash: "crash do servidor",
-  "safety-net": "sessão longa em andamento",
-};
+// Função (não constante) para respeitar o idioma no momento do backup.
+const reasonLabel = (reason: AutoBackupReason): string =>
+  t(reason === "stop" ? "backup.reason.stop" : reason === "crash" ? "backup.reason.crash" : "backup.reason.safetyNet");
 
 // Último `world_last_modified` que já gerou um backup, por servidor — em
 // memória, só dura a sessão do app (reiniciar o app no máximo gera um
@@ -70,17 +69,17 @@ export async function maybeBackupWorld(
       lastBackedUpMtime.set(serverDir, currentMtime);
       pushDiagnostic({
         level: "info",
-        source: "Backup",
-        title: "Backup automático criado",
-        message: `Backup do mundo gerado (${REASON_LABELS[reason]}).`,
+        source: t("backup.source"),
+        title: t("backup.created.title"),
+        message: t("backup.created.message", { reason: reasonLabel(reason) }),
       });
     } catch (err) {
       // Best-effort: em crash o mundo pode estar num estado ruim pra zipar,
       // não é um erro que mereça alarmar o usuário como "error".
       pushDiagnostic({
         level: "warning",
-        source: "Backup",
-        title: "Não foi possível criar o backup automático",
+        source: t("backup.source"),
+        title: t("backup.failed.title"),
         message: String(err),
       });
       return;

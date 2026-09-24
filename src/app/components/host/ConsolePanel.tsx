@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Terminal, Activity, Send } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useT } from "@/i18n";
 
 // ============================================================
 // ConsolePanel
@@ -27,6 +28,7 @@ export function ConsolePanel({
   onSendCommand,
   onClearLogs,
 }: ConsolePanelProps) {
+  const { t } = useT();
   const [activeTab, setActiveTab] = useState<"minecraft" | "network">("minecraft");
   const [mcCommand, setMcCommand] = useState("");
   const mcLogsEndRef = useRef<HTMLDivElement>(null);
@@ -98,7 +100,7 @@ export function ConsolePanel({
                 : "text-slate-500 hover:text-slate-300"
             )}
           >
-            <Terminal className="w-3.5 h-3.5" /> Minecraft Console
+            <Terminal className="w-3.5 h-3.5" /> {t("console.tab.minecraft")}
           </button>
           <button
             type="button"
@@ -110,7 +112,7 @@ export function ConsolePanel({
                 : "text-slate-500 hover:text-slate-300"
             )}
           >
-            <Activity className="w-3.5 h-3.5" /> Rede Mesh
+            <Activity className="w-3.5 h-3.5" /> {t("console.tab.network")}
           </button>
         </div>
         <button
@@ -118,7 +120,7 @@ export function ConsolePanel({
           onClick={() => onClearLogs(activeTab)}
           className="text-[10px] text-slate-500 hover:text-slate-300 font-bold uppercase transition-colors cursor-pointer"
         >
-          Limpar
+          {t("console.clear")}
         </button>
       </div>
 
@@ -130,7 +132,7 @@ export function ConsolePanel({
       >
         {activeTab === "minecraft" ? (
           mcLogs.length === 0 ? (
-            <p className="text-slate-600 italic">Console do Minecraft inativo. Inicie o servidor Minecraft para monitorar.</p>
+            <p className="text-slate-600 italic">{t("console.emptyMc")}</p>
           ) : (
             mcLogs.map((log, idx) => {
               const isErr = log.includes("[ERR]") || log.includes("ERROR") || log.includes("[Cubicase ERR]");
@@ -147,7 +149,7 @@ export function ConsolePanel({
           )
         ) : (
           networkLogs.length === 0 ? (
-            <p className="text-slate-600 italic">Nenhum log de rede gerado. Inicie o túnel para monitorar.</p>
+            <p className="text-slate-600 italic">{t("console.emptyNet")}</p>
           ) : (
             networkLogs.map((log, idx) => {
               const isErr = log.startsWith("[ERR]");
@@ -175,8 +177,8 @@ export function ConsolePanel({
             type="text"
             placeholder={
               serverStatus === "online"
-                ? "Digite um comando para o Minecraft (ex: op Player, say Olá)..."
-                : "O console aceita comandos apenas quando o servidor está ONLINE"
+                ? t("console.placeholderOnline")
+                : t("console.placeholderOffline")
             }
             value={mcCommand}
             onChange={(e) => setMcCommand(e.target.value)}

@@ -201,7 +201,7 @@ impl ApiTransport for HttpTransport {
                 }
                 return Err(ApiError {
                     code: "HTTP_ERROR".into(),
-                    message: format!("Falha na requisição: {}", e),
+                    message: tr!("api.requestFailed", error = e),
                     technical_id: format!("http_{}", generate_uuid().split('-').next().unwrap_or("0000")),
                     status_code: 0,
                 });
@@ -218,7 +218,7 @@ impl ApiTransport for HttpTransport {
                 metrics.failure_total += 1;
                 return Err(ApiError {
                     code: "PARSE_ERROR".into(),
-                    message: format!("Falha ao parsear resposta: {}", e),
+                    message: tr!("api.parseFailed", error = e),
                     technical_id: format!("parse_{}", generate_uuid().split('-').next().unwrap_or("0000")),
                     status_code: status,
                 });
@@ -320,7 +320,7 @@ impl ApiClient {
                 Ok(response) => {
                     let data = response.data.ok_or_else(|| ApiError {
                         code: "MISSING_DATA".into(),
-                        message: "Resposta da API não contém 'data'".into(),
+                        message: tr!("api.noData"),
                         technical_id: format!("data_{}", generate_uuid().split('-').next().unwrap_or("0000")),
                         status_code: 200,
                     })?;
@@ -328,7 +328,7 @@ impl ApiClient {
                     return serde_json::from_value::<ConnectionSessionResponse>(data)
                         .map_err(|e| ApiError {
                             code: "DESERIALIZE_ERROR".into(),
-                            message: format!("Falha ao desserializar sessão: {}", e),
+                            message: tr!("api.sessionDeserialize", error = e),
                             technical_id: format!("deser_{}", generate_uuid().split('-').next().unwrap_or("0000")),
                             status_code: 200,
                         });
@@ -496,7 +496,7 @@ impl ApiClient {
         let response = self.transport.send(req).await?;
         response.data.ok_or_else(|| ApiError {
             code: "MISSING_DATA".into(),
-            message: "Resposta não contém 'data'".into(),
+            message: tr!("api.noDataShort"),
             technical_id: format!("data_{}", generate_uuid().split('-').next().unwrap_or("0000")),
             status_code: 200,
         })

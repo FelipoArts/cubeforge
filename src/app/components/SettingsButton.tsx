@@ -3,6 +3,7 @@
 import React from "react";
 import { Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useT } from "@/i18n";
 
 // ============================================================
 // SettingsButton
@@ -16,6 +17,7 @@ interface SettingsButtonProps {
 }
 
 export default function SettingsButton({ serverDir, onConfig }: SettingsButtonProps) {
+  const { t } = useT();
   const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
     onConfig(serverDir);
@@ -28,7 +30,7 @@ export default function SettingsButton({ serverDir, onConfig }: SettingsButtonPr
         "p-1.5 hover:bg-indigo-50 text-indigo-600 rounded-lg transition-colors cursor-pointer",
         "pointer-events-auto"
       )}
-      title="Configurações do Servidor"
+      title={t("serverSettings.button")}
     >
       <Settings className="w-4 h-4" />
     </button>

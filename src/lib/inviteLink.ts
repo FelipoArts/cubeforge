@@ -16,12 +16,13 @@
 
 import { fetch } from "@tauri-apps/plugin-http";
 import { supabase } from "@/lib/supabaseClient";
+import { getLocale, t } from "@/i18n";
 
 const API_BASE = "https://cubeforge-api.cubeforge.workers.dev";
 export const INVITE_LINK_DOMAIN = "play.cubicase.net";
 
 /** Mesma regra do Worker (SLUG_REGEX) — checagem só pra feedback imediato, não é a fonte da verdade. */
-export const SLUG_FORMAT_HINT = "3 a 32 letras minúsculas, números ou hífen, sem hífen nas pontas.";
+export const slugFormatHint = () => t("invite.slugHint");
 const SLUG_REGEX = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/;
 
 export function isValidSlugFormat(slug: string): boolean {
@@ -53,19 +54,20 @@ export async function getServerSlug(shortCode: string): Promise<string | null> {
 
 async function authedSlugFetch(shortCode: string, method: "PUT" | "DELETE", body?: unknown): Promise<ApiEnvelope<{ slug?: string; url?: string }>> {
   const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.access_token) throw new Error("Não autenticado.");
+  if (!session?.access_token) throw new Error(t("err.notAuthenticated"));
 
   const res = await fetch(`${API_BASE}/api/v1/servers/${shortCode}/slug`, {
     method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${session.access_token}`,
+      "Accept-Language": getLocale(),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const json = (await res.json().catch(() => null)) as ApiEnvelope<{ slug?: string; url?: string }> | null;
   if (!res.ok || !json?.success) {
-    throw new Error(json?.message || `Falha na operação (HTTP ${res.status}).`);
+    throw new Error(json?.message || t("err.operationFailed", { status: res.status }));
   }
   return json;
 }

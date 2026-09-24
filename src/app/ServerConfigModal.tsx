@@ -16,7 +16,7 @@ import {
   isValidSlugFormat,
   inviteLinkUrl,
   defaultSlugFor,
-  SLUG_FORMAT_HINT,
+  slugFormatHint,
 } from '@/lib/inviteLink';
 import {
   getServerConnectName,
@@ -26,8 +26,9 @@ import {
   connectAddressFor,
   defaultConnectNameFor,
   CONNECT_NAME_DOMAIN,
-  CONNECT_NAME_FORMAT_HINT,
+  connectNameFormatHint,
 } from '@/lib/connectAddress';
+import { useT } from '@/i18n';
 
 interface ServerConfigModalProps {
   /** Full filesystem path to the server directory */
@@ -42,6 +43,7 @@ interface ServerConfigModalProps {
 }
 
 export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSaved, serverStatus }: ServerConfigModalProps) {
+  const { t } = useT();
   const [motd, setMotd] = useState('');
   const [gamemode, setGamemode] = useState('survival');
   const [difficulty, setDifficulty] = useState('easy');
@@ -134,7 +136,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
     if (!shortCode) return;
     const slug = slugInput.trim().toLowerCase();
     if (!isValidSlugFormat(slug)) {
-      setSlugError(`Link inválido — ${SLUG_FORMAT_HINT}`);
+      setSlugError(t("config.slugInvalid", { hint: slugFormatHint() }));
       return;
     }
     setSlugSubmitting(true);
@@ -144,7 +146,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setCustomSlug(saved);
       setSlugInput(saved);
     } catch (err: any) {
-      setSlugError(err?.message || 'Não foi possível salvar o link.');
+      setSlugError(err?.message || t('config.slug.saveFailed'));
     } finally {
       setSlugSubmitting(false);
     }
@@ -159,7 +161,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setCustomSlug(null);
       setSlugInput(defaultSlugFor(shortCode));
     } catch (err: any) {
-      setSlugError(err?.message || 'Não foi possível remover o link.');
+      setSlugError(err?.message || t('config.slug.removeFailed'));
     } finally {
       setSlugSubmitting(false);
     }
@@ -177,7 +179,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
     if (!shortCode) return;
     const name = connectNameInput.trim().toLowerCase();
     if (!isValidConnectNameFormat(name)) {
-      setConnectNameError(`Endereço inválido — ${CONNECT_NAME_FORMAT_HINT}`);
+      setConnectNameError(t("config.connectNameInvalid", { hint: connectNameFormatHint() }));
       return;
     }
     setConnectNameSubmitting(true);
@@ -187,7 +189,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setCustomConnectName(saved);
       setConnectNameInput(saved);
     } catch (err: any) {
-      setConnectNameError(err?.message || 'Não foi possível salvar o endereço.');
+      setConnectNameError(err?.message || t('config.connect.saveFailed'));
     } finally {
       setConnectNameSubmitting(false);
     }
@@ -202,7 +204,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setCustomConnectName(null);
       setConnectNameInput(defaultConnectNameFor(shortCode));
     } catch (err: any) {
-      setConnectNameError(err?.message || 'Não foi possível remover o endereço.');
+      setConnectNameError(err?.message || t('config.connect.removeFailed'));
     } finally {
       setConnectNameSubmitting(false);
     }
@@ -282,7 +284,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
         console.error('Failed to read server properties:', e);
         // Sem os valores reais, o formulário ficaria com defaults genéricos —
         // bloquear "Salvar" para não sobrescrever o server.properties real com lixo.
-        setLoadError(`Não foi possível carregar as configurações atuais do servidor: ${e}`);
+        setLoadError(t('config.loadFailed', { error: String(e) }));
       }
     })();
   }, [isOpen, serverDir]);
@@ -292,7 +294,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
 
     // Validate server port
     if (serverPort < 1024 || serverPort > 65535) {
-      setPortError('A porta deve estar entre 1024 e 65535.');
+      setPortError(t('config.portRange'));
       return;
     }
     setPortError('');
@@ -344,15 +346,15 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       onClose();
     } catch (e) {
       console.error('Failed to write server properties:', e);
-      setSaveError(`Falha ao salvar as configurações: ${e}`);
+      setSaveError(t('config.saveFailed', { error: String(e) }));
     }
   };
 
   const handlePickIcon = async () => {
     const selected = await open({
       multiple: false,
-      title: 'Selecione a imagem do ícone do servidor',
-      filters: [{ name: 'Imagem', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'] }],
+      title: t('config.icon.dialogTitle'),
+      filters: [{ name: t('config.icon.filterName'), extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'] }],
     });
     if (!selected) return;
     setIconError('');
@@ -363,7 +365,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setIconDataUrl(icon);
     } catch (e) {
       console.error('Failed to set server icon:', e);
-      setIconError(`Não foi possível definir o ícone: ${e}`);
+      setIconError(t('config.icon.setFailed', { error: String(e) }));
     } finally {
       setIconSaving(false);
     }
@@ -377,7 +379,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
       setIconDataUrl(null);
     } catch (e) {
       console.error('Failed to remove server icon:', e);
-      setIconError(`Não foi possível remover o ícone: ${e}`);
+      setIconError(t('config.icon.removeFailed', { error: String(e) }));
     } finally {
       setIconSaving(false);
     }
@@ -407,8 +409,8 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
           >
             <div className="p-8 pb-0 flex-shrink-0">
               <div className="flex items-center justify-between">
-                <h3 className="text-xl font-bold text-theme-primary">Configurações do Servidor</h3>
-                <button type="button" onClick={onClose} className="p-1.5 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer" title="Cancelar">
+                <h3 className="text-xl font-bold text-theme-primary">{t("serverSettings.button")}</h3>
+                <button type="button" onClick={onClose} className="p-1.5 hover:bg-theme-muted rounded-xl text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer" title={t("common.cancel")}>
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -419,7 +421,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 <div className="p-4 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
                   <AlertTriangle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
                   <div>
-                    <span className="font-bold">Não foi possível carregar as configurações reais deste servidor.</span> Os campos abaixo NÃO refletem a configuração atual — salvar agora sobrescreveria o servidor com valores incorretos, então o formulário foi bloqueado. Feche e tente novamente.
+                    <span className="font-bold">{t("config.loadError.title")}</span> {t("config.loadError.body")}
                     <div className="mt-1 text-xs opacity-80">{loadError}</div>
                   </div>
                 </div>
@@ -436,7 +438,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 <div className="p-4 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-2xl flex items-start gap-3 text-sm mb-4">
                   <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
                   <div>
-                    <span className="font-bold">Servidor em execução.</span> As configurações só podem ser alteradas com o servidor Minecraft parado. Pare o servidor antes de modificar as propriedades.
+                    <span className="font-bold">{t("config.running.title")}</span> {t("config.running.body")}
                   </div>
                 </div>
               )}
@@ -446,10 +448,10 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
               {shortCode && (
                 <div className="mb-4 p-4 bg-theme-muted border border-theme-card rounded-2xl space-y-2.5">
                   <label className="flex items-center gap-1.5 text-sm font-medium text-theme-primary">
-                    <LinkIcon className="w-4 h-4" /> Link de convite
+                    <LinkIcon className="w-4 h-4" /> {t("config.slug.title")}
                   </label>
                   {slugLoading ? (
-                    <p className="text-[10px] text-theme-secondary">Carregando...</p>
+                    <p className="text-[10px] text-theme-secondary">{t("config.loading")}</p>
                   ) : (
                     <>
                       <div className="flex gap-2">
@@ -470,14 +472,14 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                             disabled={slugSubmitting || !slugInput.trim() || slugInput.trim() === (customSlug ?? defaultSlug)}
                             className="h-11 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer flex-shrink-0"
                           >
-                            {slugSubmitting ? "Salvando..." : "Salvar"}
+                            {slugSubmitting ? t("config.saving") : t("config.save")}
                           </button>
                         )}
                         <button
                           type="button"
                           onClick={handleCopyInviteLink}
                           className="h-11 px-3 bg-theme-card border border-theme-card hover:bg-theme-muted text-theme-primary rounded-xl transition-colors cursor-pointer flex-shrink-0 flex items-center gap-1.5 text-xs font-semibold"
-                          title="Copiar link"
+                          title={t("config.copyLink")}
                         >
                           {slugCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                         </button>
@@ -485,8 +487,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
 
                       {!subscriptionActive ? (
                         <p className="text-[10px] text-theme-secondary">
-                          Esse é o link grátis do seu servidor (baseado no código de convite). Assine o
-                          Cubicase Plus (Configurações → Assinatura) pra trocar por um endereço à sua escolha.
+                          {t("config.slug.freeSubscribe")}
                         </p>
                       ) : customSlug ? (
                         <button
@@ -495,11 +496,11 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                           disabled={slugSubmitting}
                           className="text-xs font-semibold text-rose-500 hover:text-rose-600 disabled:opacity-50 transition-colors cursor-pointer"
                         >
-                          Remover personalização (volta pro link baseado no código)
+                          {t("config.slug.reset")}
                         </button>
                       ) : (
                         <p className="text-[10px] text-theme-secondary">
-                          Esse é o link grátis do seu servidor. Escolha um endereço personalizado e clique em Salvar.
+                          {t("config.slug.freeChoose")}
                         </p>
                       )}
                     </>
@@ -515,10 +516,10 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
               {shortCode && (
                 <div className="mb-4 p-4 bg-theme-muted border border-theme-card rounded-2xl space-y-2.5">
                   <label className="flex items-center gap-1.5 text-sm font-medium text-theme-primary">
-                    <Gamepad2 className="w-4 h-4" /> Endereço no Minecraft
+                    <Gamepad2 className="w-4 h-4" /> {t("config.connect.title")}
                   </label>
                   {connectNameLoading ? (
-                    <p className="text-[10px] text-theme-secondary">Carregando...</p>
+                    <p className="text-[10px] text-theme-secondary">{t("config.loading")}</p>
                   ) : (
                     <>
                       <div className="flex gap-2">
@@ -539,14 +540,14 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                             disabled={connectNameSubmitting || !connectNameInput.trim() || connectNameInput.trim() === (customConnectName ?? defaultConnectName)}
                             className="h-11 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer flex-shrink-0"
                           >
-                            {connectNameSubmitting ? "Salvando..." : "Salvar"}
+                            {connectNameSubmitting ? t("config.saving") : t("config.save")}
                           </button>
                         )}
                         <button
                           type="button"
                           onClick={handleCopyConnectAddress}
                           className="h-11 px-3 bg-theme-card border border-theme-card hover:bg-theme-muted text-theme-primary rounded-xl transition-colors cursor-pointer flex-shrink-0 flex items-center gap-1.5 text-xs font-semibold"
-                          title="Copiar endereço"
+                          title={t("config.copyAddress")}
                         >
                           {connectNameCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                         </button>
@@ -554,9 +555,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
 
                       {!subscriptionActive ? (
                         <p className="text-[10px] text-theme-secondary">
-                          Esse é o endereço grátis do seu servidor (baseado no código de convite) — só funciona
-                          enquanto o convidado está conectado pelo app. Assine o Cubicase Plus (Configurações →
-                          Assinatura) pra trocar por um endereço à sua escolha.
+                          {t("config.connect.freeSubscribe")}
                         </p>
                       ) : customConnectName ? (
                         <button
@@ -565,11 +564,11 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                           disabled={connectNameSubmitting}
                           className="text-xs font-semibold text-rose-500 hover:text-rose-600 disabled:opacity-50 transition-colors cursor-pointer"
                         >
-                          Remover personalização (volta pro endereço baseado no código)
+                          {t("config.connect.reset")}
                         </button>
                       ) : (
                         <p className="text-[10px] text-theme-secondary">
-                          Esse é o endereço grátis do seu servidor. Escolha um nome personalizado e clique em Salvar.
+                          {t("config.connect.freeChoose")}
                         </p>
                       )}
                     </>
@@ -581,11 +580,11 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
               <form className="space-y-4 pb-4" onSubmit={e => { e.preventDefault(); handleSave(); }}>
                 {/* Ícone do Servidor */}
                 <div>
-                  <label className="block text-sm font-medium text-theme-primary mb-1">Ícone do Servidor</label>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.icon.title")}</label>
                   <div className="flex items-center gap-4">
                     <div className="w-16 h-16 rounded-xl overflow-hidden border border-theme-card bg-theme-muted flex items-center justify-center flex-shrink-0">
                       {iconDataUrl ? (
-                        <img src={iconDataUrl} alt="Ícone do servidor" className="w-full h-full object-cover" />
+                        <img src={iconDataUrl} alt={t("config.icon.alt")} className="w-full h-full object-cover" />
                       ) : (
                         <ImageIcon className="w-6 h-6 text-theme-secondary" />
                       )}
@@ -598,7 +597,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                           disabled={iconSaving}
                           className="px-4 h-9 rounded-xl bg-theme-muted hover:bg-theme-card text-theme-primary text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                         >
-                          {iconDataUrl ? 'Trocar Imagem' : 'Escolher Imagem'}
+                          {iconDataUrl ? t('config.icon.change') : t('config.icon.choose')}
                         </button>
                         {iconDataUrl && (
                           <button
@@ -607,13 +606,13 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                             disabled={iconSaving}
                             className="px-4 h-9 rounded-xl text-rose-500 hover:bg-theme-danger text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                           >
-                            Remover
+                            {t("config.icon.remove")}
                           </button>
                         )}
                       </div>
                       <p className="text-[10px] text-theme-secondary">
-                        Aparece na lista de servidores do Minecraft de qualquer jogador. Imagens não-quadradas são recortadas ao centro e redimensionadas para 64×64.
-                        {isServerRunning && ' Se o servidor estiver em execução, reinicie para o novo ícone valer.'}
+                        {t("config.icon.hint")}
+                        {isServerRunning && ` ${t("config.icon.restartHint")}`}
                       </p>
                     </div>
                   </div>
@@ -625,7 +624,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 </div>
                 {/* MOTD */}
                 <div>
-                  <label className="block text-sm font-medium text-theme-primary mb-1">Mensagem do Dia (motd)</label>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.motd")}</label>
                   <input
                     type="text"
                     value={motd}
@@ -637,31 +636,31 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 {/* Gamemode & Difficulty */}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Modo de Jogo</label>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.gamemode")}</label>
                     <select
                       value={gamemode}
                       onChange={e => setGamemode(e.target.value)}
                       disabled={formDisabled || hardcore}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <option value="survival">Sobrevivência</option>
-                      <option value="creative">Criativo</option>
-                      <option value="adventure">Aventura</option>
-                      <option value="spectator">Espectador</option>
+                      <option value="survival">{t("config.gamemode.survival")}</option>
+                      <option value="creative">{t("config.gamemode.creative")}</option>
+                      <option value="adventure">{t("config.gamemode.adventure")}</option>
+                      <option value="spectator">{t("config.gamemode.spectator")}</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Dificuldade</label>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.difficulty")}</label>
                     <select
                       value={difficulty}
                       onChange={e => setDifficulty(e.target.value)}
                       disabled={formDisabled || hardcore}
                       className="w-full rounded-2xl border border-theme-card bg-theme-card px-3 py-2 text-theme-primary focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <option value="peaceful">Pacífico</option>
-                      <option value="easy">Fácil</option>
+                      <option value="peaceful">{t("config.difficulty.peaceful")}</option>
+                      <option value="easy">{t("config.difficulty.easy")}</option>
                       <option value="normal">Normal</option>
-                      <option value="hard">Difícil</option>
+                      <option value="hard">{t("config.difficulty.hard")}</option>
                     </select>
                   </div>
                 </div>
@@ -682,11 +681,11 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                       disabled={formDisabled}
                       className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
                     />
-                    <span className="text-sm text-theme-primary">Hardcore</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.hardcore")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={whitelist} onChange={e => setWhitelist(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Lista de Aprovados</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.whitelist")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={pvp} onChange={e => setPvp(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
@@ -694,37 +693,37 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={allowFlight} onChange={e => setAllowFlight(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Permitir Voo</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.allowFlight")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={allowNether} onChange={e => setAllowNether(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Permitir Nether</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.allowNether")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={spawnMonsters} onChange={e => setSpawnMonsters(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Gerar Monstros</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.spawnMonsters")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={spawnAnimals} onChange={e => setSpawnAnimals(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Gerar Animais</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.spawnAnimals")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={spawnNpcs} onChange={e => setSpawnNpcs(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Gerar Aldeões</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.spawnNpcs")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={onlineMode} onChange={e => setOnlineMode(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Modo Online</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.onlineMode")}</span>
                   </label>
                   <label className="inline-flex items-center space-x-2">
                     <input type="checkbox" checked={enforceSecureProfile} onChange={e => setEnforceSecureProfile(e.target.checked)} disabled={formDisabled} className="form-checkbox h-5 w-5 text-indigo-600 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed" />
-                    <span className="text-sm text-theme-primary">Perfil Seguro</span>
+                    <span className="text-sm text-theme-primary">{t("config.toggle.secureProfile")}</span>
                   </label>
                 </div>
                 {/* Numeric fields */}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Máx. Jogadores</label>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.maxPlayers")}</label>
                     <input
                       type="number"
                       min={1}
@@ -736,7 +735,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Porta do Servidor</label>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.port")}</label>
                     <input
                       type="number"
                       value={serverPort}
@@ -759,18 +758,18 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Semente do Mundo</label>
+                    <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.seed")}</label>
                     <div className="w-full rounded-2xl border border-theme-card bg-theme-muted px-3 py-2 text-theme-secondary text-sm font-mono truncate">
-                      {currentSeed || <span className="italic">Aleatória</span>}
+                      {currentSeed || <span className="italic">{t("config.seed.random")}</span>}
                     </div>
                     <p className="mt-1 text-[10px] text-theme-secondary">
-                      Só pode ser escolhida na criação do servidor — o mundo já existe, então mudar isso aqui não teria efeito.
+                      {t("config.seed.hint")}
                     </p>
                   </div>
                 </div>
                 {/* View Distance Slider */}
                 <div>
-                  <label className="block text-sm font-medium text-theme-primary mb-1">Distância de Visão</label>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.viewDistance")}</label>
                   <div className="flex items-center space-x-4">
                     <input
                       type="range"
@@ -787,7 +786,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                 </div>
                 {/* RAM Allocation Slider */}
                 <div>
-                  <label className="block text-sm font-medium text-theme-primary mb-1">Memória RAM Alocada</label>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">{t("config.ram")}</label>
                   <div className="flex items-center space-x-4">
                     <input
                       type="range"
@@ -802,14 +801,14 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                     <span className="w-16 text-center font-medium text-theme-primary font-mono">{allocatedRam} GB</span>
                   </div>
                   <div className="flex justify-between text-[10px] text-theme-secondary mt-1">
-                    <span>Mín: 2 GB</span>
-                    <span>Total no PC: {totalSystemRam} GB</span>
+                    <span>{t("config.ramMin")}</span>
+                    <span>{t("config.ramTotal", { total: totalSystemRam })}</span>
                   </div>
                   {allocatedRam < 3 && (
                     <div className="mt-2 p-2.5 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 text-[10px] rounded-xl flex items-start gap-2">
                       <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0 mt-0.5" />
                       <span>
-                        <strong>Atenção:</strong> Menos de 3 GB de RAM pode causar lentidão ou travamentos no servidor, especialmente com muitos jogadores ou mods.
+                        <strong>{t("config.ram.warnLabel")}</strong> {t("config.ram.warnLow")}
                       </span>
                     </div>
                   )}
@@ -817,7 +816,7 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
                     <div className="mt-2 p-2.5 bg-theme-danger border border-theme-danger text-rose-800 dark:text-rose-200 text-[10px] rounded-xl flex items-start gap-2">
                       <AlertTriangle className="w-3.5 h-3.5 text-rose-500 flex-shrink-0 mt-0.5" />
                       <span>
-                        <strong>Perigo:</strong> Deixar menos de 2 GB livres para o sistema operacional pode travar o Windows ou corromper dados. Reduza a RAM alocada.
+                        <strong>{t("config.ram.dangerLabel")}</strong> {t("config.ram.dangerHigh")}
                       </span>
                     </div>
                   )}
@@ -829,10 +828,10 @@ export function ServerConfigModal({ serverDir, shortCode, isOpen, onClose, onSav
             <div className="p-8 pt-0 flex-shrink-0">
               <div className="flex justify-end space-x-3 pt-4 border-t border-theme-card">
                 <button type="button" onClick={onClose} className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer">
-                  Cancelar
+                  {t("common.cancel")}
                 </button>
                 <button type="submit" disabled={formDisabled} onClick={handleSave} className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-theme-shadow cursor-pointer">
-                  <Check className="w-4 h-4" /> Salvar
+                  <Check className="w-4 h-4" /> {t("config.save")}
                 </button>
               </div>
             </div>

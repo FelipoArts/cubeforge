@@ -12,6 +12,8 @@
 // de Diagnósticos a cada linha — deve ser recriado a cada novo start.
 // ============================================================
 
+import { t } from "@/i18n";
+
 export interface LagDiagnostic {
   level: "warning" | "error";
   title: string;
@@ -56,8 +58,8 @@ export function createLagMonitor(options: LagMonitorOptions = {}) {
       lastPushedAt = now;
       return {
         level: "error",
-        title: "Servidor travando (Watchdog)",
-        message: "O Minecraft detectou uma trava grave no processamento — algum mod ou plugin pode estar preso em um loop. Se isso se repetir, o servidor pode cair sozinho em breve. Veja o console para ver qual mod aparece perto do aviso.",
+        title: t("lag.watchdog.title"),
+        message: t("lag.watchdog.message"),
       };
     }
 
@@ -78,13 +80,13 @@ export function createLagMonitor(options: LagMonitorOptions = {}) {
     return severe
       ? {
           level: "error",
-          title: "Lag severo no servidor",
-          message: `O servidor está bem atrasado (${ms}ms atrás do esperado) e pode travar em breve. Costuma ser causado por mods pesados, muitas entidades/jogadores, ou hardware insuficiente para a configuração atual.`,
+          title: t("lag.severe.title"),
+          message: t("lag.severe.message", { ms }),
         }
       : {
           level: "warning",
-          title: "Servidor com lag",
-          message: `O servidor está tendo dificuldade de acompanhar o ritmo do jogo (aconteceu ${count}x no último minuto). Costuma ser causado por mods pesados, geração de terreno em excesso, ou pouca RAM/CPU disponível.`,
+          title: t("lag.mild.title"),
+          message: t("lag.mild.message", { count }),
         };
   }
 

@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { pushDiagnostic } from "@/app/diagnostics";
+import { t } from "@/i18n";
 
 // ============================================================
 // Auto-atualização
@@ -50,10 +51,10 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
       set({ phase: "idle" });
       pushDiagnostic({
         level: "info",
-        title: "Verificação de atualização falhou",
-        message: "Não foi possível checar por novas versões agora.",
+        title: t("update.checkFailed.title"),
+        message: t("update.checkFailed.message"),
         detail: String(e),
-        source: "Atualização",
+        source: t("update.source"),
       });
     }
   },
@@ -81,10 +82,10 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
       set({ phase: "error" });
       pushDiagnostic({
         level: "warning",
-        title: "Falha ao instalar atualização",
-        message: "Não foi possível baixar ou instalar a nova versão. Tente novamente mais tarde.",
+        title: t("update.installFailed.title"),
+        message: t("update.installFailed.message"),
         detail: String(e),
-        source: "Atualização",
+        source: t("update.source"),
       });
     }
   },
