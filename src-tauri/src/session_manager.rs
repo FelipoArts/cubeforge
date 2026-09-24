@@ -183,10 +183,7 @@ impl SessionManager {
             (SessionStatus::Stopped, SessionStatus::Creating) => Ok(()),
             
             // Transições INVÁLIDAS
-            _ => Err(format!(
-                "Transição inválida: {:?} → {:?}",
-                from, to
-            )),
+            _ => Err(tr!("session.invalidTransition", from = format!("{:?}", from), to = format!("{:?}", to))),
         }
     }
 
@@ -204,13 +201,13 @@ impl SessionManager {
                 || state.status == SessionStatus::Online
                 || state.status == SessionStatus::Degraded
             {
-                return Err("Já existe uma operação em andamento. Pare a sessão atual antes de iniciar outra.".into());
+                return Err(tr!("session.busy"));
             }
         }
 
         // Transição: CANCELLED → CREATING
         Self::validate_transition(&SessionStatus::Cancelled, &SessionStatus::Creating)
-            .map_err(|e| format!("Erro interno: {}", e))?;
+            .map_err(|e| tr!("session.internal", error = e))?;
 
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -321,7 +318,7 @@ impl SessionManager {
                 // Se falhar ao notificar mesmo após as tentativas, entra em DEGRADED
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.status = SessionStatus::Degraded;
-                return Err(format!("Sidecar online, mas API falhou: {}", last_err));
+                return Err(tr!("session.sidecarApiFailed", error = last_err));
             }
         }
 
@@ -430,7 +427,7 @@ impl SessionManager {
             metrics.insert("currentPlayers".into(), serde_json::json!(players));
 
             self.api.send_heartbeat(&sid, Some(metrics)).await
-                .map_err(|e| format!("Heartbeat falhou: {}", e))?;
+                .map_err(|e| tr!("session.heartbeatFailed", error = e))?;
 
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.heartbeat_count += 1;

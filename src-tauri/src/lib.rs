@@ -9,7 +9,7 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 use std::collections::HashMap;
 use tauri::{Manager, Emitter};
-use tauri::menu::MenuBuilder;
+use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -21,6 +21,9 @@ use sysinfo::{System, Pid};
 // decide o provedor (Tailscale via tsnet) e minta credenciais de curta duração
 // por sessão; o desktop só executa (ver ProviderManager) e reporta ciclo de
 // vida (SessionManager).
+#[macro_use]
+mod i18n;
+mod i18n_messages;
 mod api_client;
 mod session_manager;
 mod provider_manager;
@@ -263,33 +266,24 @@ struct NetworkLogPayload {
 }
 
 /// Traduz o código de erro estruturado emitido pelo sidecar Go (ver main.go,
-/// função fatalWithCode) para um título/mensagem amigáveis em PT-BR.
+/// para um título/mensagem amigáveis no idioma atual do app (ver i18n.rs).
 fn map_sidecar_error_code(code: &str, detail: &str) -> (String, String) {
     match code {
         "config_missing" | "config_read_failed" | "config_decode_failed" => (
-            "Configuração de rede inválida".to_string(),
-            "Não foi possível ler a configuração da rede mesh. Tente reiniciar o app; se persistir, reinstale o Cubicase.".to_string(),
+            tr!("sidecar.config.title"),
+            tr!("sidecar.config.message"),
         ),
-        "mesh_auth_failed" => (
-            "Falha de autenticação na rede mesh".to_string(),
-            "Não foi possível autenticar na rede mesh (Tailscale). Verifique sua conexão com a internet e tente novamente.".to_string(),
-        ),
-        "no_ip_assigned" => (
-            "Nenhum IP atribuído pela rede mesh".to_string(),
-            "A rede mesh não atribuiu um endereço para este dispositivo. Tente reconectar em alguns instantes.".to_string(),
-        ),
-        "listen_mesh_failed" => (
-            "Falha ao abrir a porta na rede mesh".to_string(),
-            "Não foi possível abrir a porta do servidor na rede mesh. Tente reconectar; se persistir, pode haver conflito de hostname na malha.".to_string(),
-        ),
+        "mesh_auth_failed" => (tr!("sidecar.auth.title"), tr!("sidecar.auth.message")),
+        "no_ip_assigned" => (tr!("sidecar.noIp.title"), tr!("sidecar.noIp.message")),
+        "listen_mesh_failed" => (tr!("sidecar.listenMesh.title"), tr!("sidecar.listenMesh.message")),
         "listen_local_failed" => (
-            "Porta local já em uso".to_string(),
-            format!("Não foi possível abrir a porta local necessária para a conexão — provavelmente já está em uso por outro programa. Detalhe técnico: {}", detail),
+            tr!("sidecar.listenLocal.title"),
+            tr!("sidecar.listenLocal.message", detail = detail),
         ),
         other => (
-            "Erro inesperado na rede mesh".to_string(),
+            tr!("sidecar.other.title"),
             if detail.is_empty() {
-                format!("Código: {}", other)
+                tr!("sidecar.other.code", code = other)
             } else {
                 detail.to_string()
             },
@@ -303,18 +297,36 @@ fn map_sidecar_error_code(code: &str, detail: &str) -> (String, String) {
 fn map_sidecar_warning_code(code: &str, detail: &str) -> (String, String) {
     match code {
         "host_unreachable" => (
-            "Conexão com o host instável".to_string(),
-            "Não estamos conseguindo alcançar o host na rede mesh há um tempo — a conexão pode ter caído ou o host pode ter ficado offline. O túnel continua tentando se recuperar sozinho; se persistir, peça para o host verificar a rede mesh dele.".to_string(),
+            tr!("sidecar.hostUnreachable.title"),
+            tr!("sidecar.hostUnreachable.message"),
         ),
         other => (
-            "Aviso na rede mesh".to_string(),
+            tr!("sidecar.warn.title"),
             if detail.is_empty() {
-                format!("Código: {}", other)
+                tr!("sidecar.other.code", code = other)
             } else {
                 detail.to_string()
             },
         ),
     }
+}
+
+/// Itens do menu do tray, guardados para retraduzir quando o idioma muda.
+struct TrayMenuItems {
+  show: MenuItem<tauri::Wry>,
+  quit: MenuItem<tauri::Wry>,
+}
+
+/// Recebe do front o idioma efetivo (`pt-BR` | `en`) — na inicialização e a cada troca —
+/// e passa a devolver erros/diagnósticos/logs nesse idioma (ver i18n.rs).
+#[tauri::command]
+fn set_locale(app: tauri::AppHandle, locale: String) {
+  let applied = i18n::set_locale(&locale);
+  log_to_file(&app, &format!("[i18n] Idioma do backend: {:?}", applied));
+  if let Some(items) = app.try_state::<TrayMenuItems>() {
+    let _ = items.show.set_text(tr!("tray.show"));
+    let _ = items.quit.set_text(tr!("tray.quit"));
+  }
 }
 
 #[tauri::command]
@@ -336,11 +348,12 @@ async fn start_network_node(
     // Rede Mesh" como se sua própria rede ainda estivesse de pé.
     if let Some(active_mode) = state.active_network_mode.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if active_mode != mode {
-            let msg = format!(
-                "Esta instalação já está com a rede mesh ativa como \"{}\". Pare-a antes de conectar como \"{}\". Se quiser jogar no seu próprio servidor a partir deste mesmo computador, conecte direto em localhost:{} — não precisa (e não é suportado) usar o modo Convidado para isso.",
-                if active_mode == "host" { "Host" } else { "Convidado" },
-                if mode == "host" { "Host" } else { "Convidado" },
-                local_port,
+            let role_name = |m: &str| if m == "host" { tr!("net.role.host") } else { tr!("net.role.guest") };
+            let msg = tr!(
+                "net.roleConflict",
+                active = role_name(&active_mode),
+                requested = role_name(&mode),
+                port = local_port,
             );
             log_to_file(&app, &msg);
             return Err(msg);
@@ -373,23 +386,23 @@ async fn start_network_node(
 
         tauri::async_runtime::spawn(async move {
             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: "[mock-provider] Inicializando provedor de testes (Mock)...".to_string(),
+                message: tr!("net.mock.starting"),
                 is_error: false,
             });
             tokio::time::sleep(Duration::from_millis(600)).await;
 
             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: "[mock-provider] Autenticando nó virtual de rede mesh simulado...".to_string(),
+                message: tr!("net.mock.authenticating"),
                 is_error: false,
             });
             tokio::time::sleep(Duration::from_millis(800)).await;
 
             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: format!("[mock-provider] Nó registrado com IP virtual simulado: {}", fake_ip),
+                message: tr!("net.mock.registered", ip = fake_ip),
                 is_error: false,
             });
             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                message: format!("[mock-provider] Proxy reverso simulado escutando em localhost:{}", local_port),
+                message: tr!("net.mock.proxy", port = local_port),
                 is_error: false,
             });
 
@@ -412,7 +425,7 @@ async fn start_network_node(
 
     log_to_file(&app, "[start_network_node] Solicitando ConnectionSession à API central...");
     let session_resp = session_manager.start(&short_code, &mode, local_port).await.map_err(|e| {
-        let err_msg = format!("Não foi possível obter credenciais de rede: {}", e);
+        let err_msg = tr!("net.credentialsFailed", error = e);
         log_to_file(&app, &err_msg);
         err_msg
     })?;
@@ -590,7 +603,7 @@ async fn start_network_node(
                                 if let Some(code) = rec_val.get("recovered").and_then(|v| v.as_str()) {
                                     log_to_file(&app_clone, &format!("[Sidecar] Recuperado: {}", code));
                                     let _ = app_clone.emit("network-log", NetworkLogPayload {
-                                        message: "Conexão com o host da malha restabelecida.".to_string(),
+                                        message: tr!("net.hostReconnected"),
                                         is_error: false,
                                     });
                                 }
@@ -656,17 +669,17 @@ async fn start_network_node(
                         });
                         if was_requested {
                             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                                message: "Rede mesh desconectada.".to_string(),
+                                message: tr!("net.meshDisconnected"),
                                 is_error: false,
                             });
                         } else if let Some((title, _)) = known_cause {
                             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                                message: format!("Conexão de rede encerrada: {} (ver Central de Diagnósticos)", title),
+                                message: tr!("net.closed", title = title),
                                 is_error: false,
                             });
                         } else {
                             let _ = app_clone.emit("network-log", NetworkLogPayload {
-                                message: format!("Conexão de rede encerrada inesperadamente (Código: {:?})", payload.code),
+                                message: tr!("net.closedUnexpected", code = format!("{:?}", payload.code)),
                                 is_error: true,
                             });
                         }
@@ -756,12 +769,12 @@ async fn stop_network_node_internal(
 
     if was_mock_active {
         let _ = app.emit("network-log", NetworkLogPayload {
-            message: "[mock-provider] Finalizando sessão simulada...".to_string(),
+            message: tr!("net.mock.stopping"),
             is_error: false,
         });
         tokio::time::sleep(Duration::from_millis(200)).await; // Guard já foi liberado, seguro!
         let _ = app.emit("network-log", NetworkLogPayload {
-            message: "[mock-provider] Rede mesh simulada encerrada.".to_string(),
+            message: tr!("net.mock.stopped"),
             is_error: false,
         });
     }
@@ -877,7 +890,7 @@ fn add_minecraft_server_entry(app: tauri::AppHandle, name: String, address: Stri
     let path = dir.join("servers.dat");
 
     let mut blob = if path.exists() {
-        let bytes = std::fs::read(&path).map_err(|e| format!("Falha ao ler servers.dat: {}", e))?;
+        let bytes = std::fs::read(&path).map_err(|e| tr!("err.serversDatRead", error = e))?;
         // Um servers.dat corrompido não deve travar a conexão: tratamos como vazio.
         nbt::Blob::from_reader(&mut &bytes[..]).unwrap_or_else(|_| nbt::Blob::new())
     } else {
@@ -905,11 +918,11 @@ fn add_minecraft_server_entry(app: tauri::AppHandle, name: String, address: Stri
     servers.insert(0, nbt::Value::Compound(entry));
 
     blob.insert("servers", nbt::Value::List(servers))
-        .map_err(|e| format!("Falha ao montar servers.dat: {}", e))?;
+        .map_err(|e| tr!("err.serversDatBuild", error = e))?;
 
     let mut out: Vec<u8> = Vec::new();
-    blob.to_writer(&mut out).map_err(|e| format!("Falha ao serializar servers.dat: {}", e))?;
-    std::fs::write(&path, out).map_err(|e| format!("Falha ao gravar servers.dat: {}", e))?;
+    blob.to_writer(&mut out).map_err(|e| tr!("err.serversDatSerialize", error = e))?;
+    std::fs::write(&path, out).map_err(|e| tr!("err.serversDatWrite", error = e))?;
 
     Ok("added".to_string())
 }
@@ -930,7 +943,7 @@ fn find_installed_minecraft_versions(app: tauri::AppHandle) -> Result<Vec<String
     }
 
     let entries = std::fs::read_dir(&versions_dir)
-        .map_err(|e| format!("Falha ao listar versions/: {}", e))?;
+        .map_err(|e| tr!("err.listVersions", error = e))?;
     let mut versions = Vec::new();
     for entry in entries.flatten() {
         if entry.path().is_dir() {
@@ -981,7 +994,7 @@ fn prepare_launcher_profile(
 
     if let Some(ref gd) = game_dir {
         std::fs::create_dir_all(std::path::Path::new(gd).join("mods"))
-            .map_err(|e| format!("Falha ao criar a pasta da instância: {}", e))?;
+            .map_err(|e| tr!("err.instanceDir", error = e))?;
     }
 
     let mut touched_any = false;
@@ -993,20 +1006,20 @@ fn prepare_launcher_profile(
         }
         touched_any = true;
 
-        let bytes = std::fs::read(&path).map_err(|e| format!("Falha ao ler {}: {}", filename, e))?;
+        let bytes = std::fs::read(&path).map_err(|e| tr!("err.fileRead", file = filename, error = e))?;
         let mut root: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Falha ao interpretar {}: {}", filename, e))?;
+            .map_err(|e| tr!("err.fileParse", file = filename, error = e))?;
 
         let backup_path = dir.join(format!("{}.bak", filename));
         if !backup_path.exists() {
             std::fs::write(&backup_path, &bytes)
-                .map_err(|e| format!("Falha ao criar backup de {}: {}", filename, e))?;
+                .map_err(|e| tr!("err.fileBackup", file = filename, error = e))?;
         }
 
         let profiles = root
             .get_mut("profiles")
             .and_then(|p| p.as_object_mut())
-            .ok_or_else(|| format!("{} não tem um campo \"profiles\" válido", filename))?;
+            .ok_or_else(|| tr!("err.profilesInvalid", file = filename))?;
 
         let existing_key = profiles.iter().find_map(|(key, value)| {
             if value.get("lastVersionId").and_then(|v| v.as_str()) == Some(version_id.as_str()) {
@@ -1050,8 +1063,8 @@ fn prepare_launcher_profile(
         }
 
         let out = serde_json::to_vec_pretty(&root)
-            .map_err(|e| format!("Falha ao serializar {}: {}", filename, e))?;
-        std::fs::write(&path, out).map_err(|e| format!("Falha ao gravar {}: {}", filename, e))?;
+            .map_err(|e| tr!("err.fileSerialize", file = filename, error = e))?;
+        std::fs::write(&path, out).map_err(|e| tr!("err.fileWrite", file = filename, error = e))?;
     }
 
     if !touched_any {
@@ -1082,7 +1095,7 @@ fn open_minecraft_launcher() -> Result<(), String> {
         if let Some(exe) = classic_launcher {
             std::process::Command::new(&exe)
                 .spawn()
-                .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+                .map_err(|e| tr!("err.openLauncher", error = e))?;
             return Ok(());
         }
 
@@ -1096,17 +1109,17 @@ fn open_minecraft_launcher() -> Result<(), String> {
         std::process::Command::new("explorer.exe")
             .arg("shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!Minecraft")
             .spawn()
-            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+            .map_err(|e| tr!("err.openLauncher", error = e))?;
     } else if cfg!(target_os = "macos") {
         std::process::Command::new("open")
             .args(["-a", "Minecraft"])
             .spawn()
-            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+            .map_err(|e| tr!("err.openLauncher", error = e))?;
     } else {
         std::process::Command::new("flatpak")
             .args(["run", "com.mojang.Minecraft"])
             .spawn()
-            .map_err(|e| format!("Falha ao abrir o Minecraft Launcher: {}", e))?;
+            .map_err(|e| tr!("err.openLauncher", error = e))?;
     }
     Ok(())
 }
@@ -1138,7 +1151,7 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
         let result: Result<(), String> = async {
             let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
             if !response.status().is_success() {
-                return Err(format!("Falha no download: HTTP {}", response.status()));
+                return Err(tr!("err.downloadHttp", status = response.status()));
             }
             let bytes = response.bytes().await.map_err(|e| e.to_string())?;
 
@@ -1151,7 +1164,7 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
                 hasher.update(&bytes);
                 let actual = hasher.digest().to_string();
                 if !actual.eq_ignore_ascii_case(expected) {
-                    return Err(format!("Checksum SHA1 não confere (esperado {}, obtido {})", expected, actual));
+                    return Err(tr!("err.checksumSha1", expected = expected, actual = actual));
                 }
             }
             if let Some(expected) = &expected_sha256 {
@@ -1160,7 +1173,7 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
                 hasher.update(&bytes);
                 let actual = format!("{:x}", hasher.finalize());
                 if !actual.eq_ignore_ascii_case(expected) {
-                    return Err(format!("Checksum SHA256 não confere (esperado {}, obtido {})", expected, actual));
+                    return Err(tr!("err.checksumSha256", expected = expected, actual = actual));
                 }
             }
 
@@ -1182,7 +1195,7 @@ async fn download_server_jar(url: String, dest_path: String, expected_sha1: Opti
         }
     }
 
-    Err(format!("Falha ao baixar após {} tentativas: {}", MAX_ATTEMPTS, last_err))
+    Err(tr!("err.downloadAttempts", attempts = MAX_ATTEMPTS, error = last_err))
 }
 
 /// Extrai o zip da JRE (baixado via `download_server_jar`, já com verificação de
@@ -1201,9 +1214,9 @@ async fn extract_jre_zip(zip_path: String, extract_path: String) -> Result<(), S
     std::fs::create_dir_all(&extract_root).map_err(|e| e.to_string())?;
 
     let result: Result<(), String> = (|| {
-        let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+        let file = File::open(&zip_path).map_err(|e| tr!("err.openFile", error = e))?;
         let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+            .map_err(|e| tr!("err.invalidArchive", error = e))?;
 
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -1370,7 +1383,7 @@ async fn download_mod_file(url: String, dest_path: String, expected_sha1: Option
                 // zero na próxima tentativa — diferente de uma falha de rede
                 // no meio, onde o que já foi escrito continua confiável.
                 let _ = std::fs::remove_file(&dest_path);
-                last_err = "Checksum SHA1 não confere após o download.".to_string();
+                last_err = tr!("err.checksumSha1AfterDownload");
             }
             Err(e) => {
                 last_err = e;
@@ -1385,7 +1398,7 @@ async fn download_mod_file(url: String, dest_path: String, expected_sha1: Option
     }
 
     let _ = std::fs::remove_file(&dest_path);
-    Err(format!("Falha ao baixar mod após {} tentativas: {}", MAX_ATTEMPTS, last_err))
+    Err(tr!("err.modDownloadAttempts", attempts = MAX_ATTEMPTS, error = last_err))
 }
 
 #[derive(Serialize, Clone)]
@@ -1487,29 +1500,29 @@ fn detect_known_mc_error(line: &str) -> Option<(String, String, String)> {
     if line.contains("OutOfMemoryError") || line.contains("Could not reserve enough space") {
         return Some((
             "out_of_memory".to_string(),
-            "Sem memória suficiente (OutOfMemoryError)".to_string(),
-            "O servidor Minecraft ficou sem memória durante a execução. Tente aumentar a RAM alocada nas configurações do servidor, ou feche outros programas para liberar memória.".to_string(),
+            tr!("mc.oom.title"),
+            tr!("mc.oom.message"),
         ));
     }
     if line.contains("UnsupportedClassVersionError") {
         return Some((
             "java_version_incompatible".to_string(),
-            "Versão do Java incompatível".to_string(),
-            "A versão do Java instalada não é compatível com esta versão do Minecraft. Reinstale a JRE recomendada para este servidor nas configurações.".to_string(),
+            tr!("mc.javaVersion.title"),
+            tr!("mc.javaVersion.message"),
         ));
     }
     if line.contains("Address already in use") || line.contains("BindException") {
         return Some((
             "port_in_use".to_string(),
-            "Porta já em uso".to_string(),
-            "Não foi possível abrir a porta do servidor porque ela já está sendo usada por outro processo. Fecha o processo ou altere a porta do servidor nas configurações.".to_string(),
+            tr!("mc.portInUse.title"),
+            tr!("mc.portInUse.message"),
         ));
     }
     if line.contains("You need to agree to the EULA") {
         return Some((
             "eula_not_accepted".to_string(),
-            "EULA não aceito".to_string(),
-            "O arquivo eula.txt não está marcado como aceito. Isso normalmente é feito automaticamente pelo Cubicase — se persistir, abra a pasta do servidor e defina eula=true em eula.txt.".to_string(),
+            tr!("mc.eula.title"),
+            tr!("mc.eula.message"),
         ));
     }
     None
@@ -1672,10 +1685,7 @@ async fn start_minecraft_server(
                 break; // Nada escutando na porta — livre para iniciar.
             }
             if attempt == PORT_CHECK_ATTEMPTS {
-                let msg = format!(
-                    "A porta {} já está em uso por outro processo. Pare-o ou altere a porta do servidor antes de iniciar.",
-                    server_port
-                );
+                let msg = tr!("mc.portBusy", port = server_port);
                 log_to_file(&app, &format!("[MC] Porta ocupada após {} tentativas, abortando início: {}", PORT_CHECK_ATTEMPTS, msg));
                 return Err(msg);
             }
@@ -2186,7 +2196,7 @@ async fn run_forge_installer(
     // Extrair diretório do installer
     let server_dir = std::path::Path::new(&installer_path)
         .parent()
-        .ok_or_else(|| "Caminho do instalador inválido".to_string())?
+        .ok_or_else(|| tr!("mc.installerPath"))?
         .to_string_lossy()
         .to_string();
     
@@ -2260,19 +2270,19 @@ async fn run_forge_installer(
                 if start.elapsed() > timeout {
                     log_to_file(&app_wait, "[Forge-Installer] Timeout de 10 minutos excedido. Matando processo...");
                     let _ = child.kill();
-                    return Err("Instalador do Forge excedeu o tempo limite de 10 minutos.".to_string());
+                    return Err(tr!("mc.forgeTimeout"));
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
             Err(e) => {
                 log_to_file(&app_wait, &format!("[Forge-Installer] Erro ao aguardar: {}", e));
-                return Err(format!("Erro ao aguardar instalador do Forge: {}", e));
+                return Err(tr!("mc.forgeWait", error = e));
             }
         }
     };
     
     if !exit_status.success() {
-        let msg = format!("Instalador do Forge falhou com código: {:?}", exit_status.code());
+        let msg = tr!("mc.forgeFailed", code = format!("{:?}", exit_status.code()));
         log_to_file(&app, &msg);
         return Err(msg);
     }
@@ -2308,7 +2318,7 @@ async fn run_fabric_client_installer(
     log_to_file(&app, &format!("=== INSTALANDO FABRIC CLIENT (java={}, installer={}, mc={}) ===", java_path, installer_path, mc_version));
 
     let minecraft_dir = find_minecraft_dir(&app)
-        .ok_or_else(|| "Não encontramos sua instalação do Minecraft.".to_string())?;
+        .ok_or_else(|| tr!("mc.installNotFound"))?;
 
     let list_versions = |dir: &std::path::Path| -> std::collections::HashSet<String> {
         std::fs::read_dir(dir.join("versions"))
@@ -2383,19 +2393,19 @@ async fn run_fabric_client_installer(
                 if start.elapsed() > timeout {
                     log_to_file(&app_wait, "[Fabric-Installer] Timeout de 5 minutos excedido. Matando processo...");
                     let _ = child.kill();
-                    return Err("Instalador do Fabric excedeu o tempo limite de 5 minutos.".to_string());
+                    return Err(tr!("mc.fabricTimeout"));
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
             Err(e) => {
                 log_to_file(&app_wait, &format!("[Fabric-Installer] Erro ao aguardar: {}", e));
-                return Err(format!("Erro ao aguardar instalador do Fabric: {}", e));
+                return Err(tr!("mc.fabricWait", error = e));
             }
         }
     };
 
     if !exit_status.success() {
-        let msg = format!("Instalador do Fabric falhou com código: {:?}", exit_status.code());
+        let msg = tr!("mc.fabricFailed", code = format!("{:?}", exit_status.code()));
         log_to_file(&app, &msg);
         return Err(msg);
     }
@@ -2422,7 +2432,7 @@ async fn run_fabric_client_installer(
             Ok(v)
         }
         None => {
-            let msg = "O instalador do Fabric rodou, mas não encontramos a versão instalada em versions/.".to_string();
+            let msg = tr!("mc.fabricNoVersion");
             log_to_file(&app, &msg);
             Err(msg)
         }
@@ -2458,7 +2468,7 @@ async fn run_forge_client_installer(
     log_to_file(&app, &format!("=== INSTALANDO FORGE CLIENT (java={}, installer={}, mc={}, forge={}) ===", java_path, installer_path, mc_version, forge_version));
 
     let minecraft_dir = find_minecraft_dir(&app)
-        .ok_or_else(|| "Não encontramos sua instalação do Minecraft.".to_string())?;
+        .ok_or_else(|| tr!("mc.installNotFound"))?;
 
     let list_versions = |dir: &std::path::Path| -> std::collections::HashSet<String> {
         std::fs::read_dir(dir.join("versions"))
@@ -2527,22 +2537,19 @@ async fn run_forge_client_installer(
                 if start.elapsed() > timeout {
                     log_to_file(&app_wait, "[Forge-Client-Installer] Timeout de 10 minutos excedido. Matando processo...");
                     let _ = child.kill();
-                    return Err("Instalador do Forge excedeu o tempo limite de 10 minutos.".to_string());
+                    return Err(tr!("mc.forgeTimeout"));
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
             Err(e) => {
                 log_to_file(&app_wait, &format!("[Forge-Client-Installer] Erro ao aguardar: {}", e));
-                return Err(format!("Erro ao aguardar instalador do Forge: {}", e));
+                return Err(tr!("mc.forgeWait", error = e));
             }
         }
     };
 
     if !exit_status.success() {
-        let msg = format!(
-            "Instalador do Forge falhou com código: {:?}. Se você nunca abriu o Minecraft Launcher neste computador, abra-o pelo menos uma vez e tente de novo.",
-            exit_status.code()
-        );
+        let msg = tr!("mc.forgeFailedClient", code = format!("{:?}", exit_status.code()));
         log_to_file(&app, &msg);
         return Err(msg);
     }
@@ -2565,7 +2572,7 @@ async fn run_forge_client_installer(
             Ok(v)
         }
         None => {
-            let msg = "O instalador do Forge rodou, mas não encontramos a versão instalada em versions/.".to_string();
+            let msg = tr!("mc.forgeNoVersion");
             log_to_file(&app, &msg);
             Err(msg)
         }
@@ -2676,7 +2683,7 @@ async fn send_minecraft_command(
         stdin.flush().map_err(|e| e.to_string())?;
         Ok(())
     } else {
-        Err("Nenhum servidor Minecraft está em execução.".to_string())
+        Err(tr!("mc.notRunning"))
     }
 }
 
@@ -2837,11 +2844,11 @@ fn crop_and_resize_icon(img: image::DynamicImage) -> image::DynamicImage {
 #[tauri::command]
 async fn set_server_icon(server_dir: String, image_path: String) -> Result<(), String> {
     let img = image::open(&image_path)
-        .map_err(|e| format!("Não foi possível abrir a imagem: {}", e))?;
+        .map_err(|e| tr!("err.iconOpen", error = e))?;
     let icon = crop_and_resize_icon(img);
     let dest = PathBuf::from(&server_dir).join("server-icon.png");
     icon.save_with_format(&dest, image::ImageFormat::Png)
-        .map_err(|e| format!("Não foi possível salvar o ícone: {}", e))
+        .map_err(|e| tr!("err.iconSave", error = e))
 }
 
 /// Lê o server-icon.png atual (se existir) e retorna como data URL base64 para preview no frontend.
@@ -2984,7 +2991,7 @@ async fn toggle_mod(server_dir: String, file_name: String, folder_name: Option<S
     let mods_dir = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods"));
     let from = mods_dir.join(&file_name);
     if !from.is_file() {
-        return Err(format!("Mod não encontrado: {}", file_name));
+        return Err(tr!("err.modNotFound", file = file_name));
     }
     let to = if file_name.to_lowercase().ends_with(".disabled") {
         mods_dir.join(file_name.trim_end_matches(".disabled"))
@@ -2998,7 +3005,7 @@ async fn toggle_mod(server_dir: String, file_name: String, folder_name: Option<S
 async fn delete_mod(server_dir: String, file_name: String, folder_name: Option<String>) -> Result<(), String> {
     let path = PathBuf::from(&server_dir).join(folder_name.as_deref().unwrap_or("mods")).join(&file_name);
     if !path.is_file() {
-        return Err(format!("Mod não encontrado: {}", file_name));
+        return Err(tr!("err.modNotFound", file = file_name));
     }
     std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
@@ -3081,7 +3088,7 @@ async fn backup_world(server_dir: String) -> Result<BackupInfo, String> {
     let level_name = read_level_name(&server_dir);
     let folders = world_folder_paths(&server_dir, &level_name);
     if folders.is_empty() {
-        return Err("Nenhuma pasta de mundo encontrada para fazer backup.".to_string());
+        return Err(tr!("backup.noWorld"));
     }
 
     let backups_dir = PathBuf::from(&server_dir).join("backups");
@@ -3120,16 +3127,16 @@ async fn backup_world(server_dir: String) -> Result<BackupInfo, String> {
 async fn restore_world_backup(server_dir: String, file_name: String) -> Result<(), String> {
     let zip_path = PathBuf::from(&server_dir).join("backups").join(&file_name);
     if !zip_path.is_file() {
-        return Err(format!("Backup não encontrado: {}", file_name));
+        return Err(tr!("backup.notFound", file = file_name));
     }
 
     // 1. Validar integridade do backup ANTES de tocar no mundo atual.
-    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o backup: {}", e))?;
+    let file = File::open(&zip_path).map_err(|e| tr!("backup.openFailed", error = e))?;
     let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Backup corrompido ou inválido — mundo atual preservado: {}", e))?;
+        .map_err(|e| tr!("backup.corrupted", error = e))?;
     for i in 0..archive.len() {
         archive.by_index(i).map_err(|e| {
-            format!("Backup corrompido (entrada {} ilegível) — mundo atual preservado: {}", i, e)
+            tr!("backup.corruptedEntry", index = i, error = e)
         })?;
     }
 
@@ -3151,7 +3158,7 @@ async fn restore_world_backup(server_dir: String, file_name: String) -> Result<(
                 let _ = std::fs::rename(staged, original);
             }
             let _ = std::fs::remove_dir_all(&staging_dir);
-            return Err(format!("Não foi possível preparar a restauração (mundo atual preservado): {}", e));
+            return Err(tr!("backup.prepareFailed", error = e));
         }
         moved.push((folder.clone(), dest));
     }
@@ -3189,7 +3196,7 @@ async fn restore_world_backup(server_dir: String, file_name: String) -> Result<(
                 let _ = std::fs::rename(staged, original);
             }
             let _ = std::fs::remove_dir_all(&staging_dir);
-            Err(format!("Falha ao extrair o backup — mundo original restaurado: {}", e))
+            Err(tr!("backup.extractFailed", error = e))
         }
     }
 }
@@ -3198,7 +3205,7 @@ async fn restore_world_backup(server_dir: String, file_name: String) -> Result<(
 async fn delete_world_backup(server_dir: String, file_name: String) -> Result<(), String> {
     let path = PathBuf::from(&server_dir).join("backups").join(&file_name);
     if !path.is_file() {
-        return Err(format!("Backup não encontrado: {}", file_name));
+        return Err(tr!("backup.notFound", file = file_name));
     }
     std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
@@ -3209,7 +3216,7 @@ async fn reset_world(server_dir: String) -> Result<(), String> {
     let level_name = read_level_name(&server_dir);
     let folders = world_folder_paths(&server_dir, &level_name);
     if folders.is_empty() {
-        return Err("Nenhuma pasta de mundo encontrada para resetar.".to_string());
+        return Err(tr!("backup.noWorldReset"));
     }
     for folder in folders {
         std::fs::remove_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -3338,13 +3345,10 @@ async fn resolve_player_uuid(server_dir: &str, name: &str) -> Result<String, Str
     let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
     let status = response.status().as_u16();
     if status == 204 || status == 404 {
-        return Err(format!(
-            "Jogador \"{}\" não encontrado (verifique o nome da conta Minecraft/Microsoft).",
-            name
-        ));
+        return Err(tr!("players.mojangNotFound", name = name));
     }
     if !response.status().is_success() {
-        return Err(format!("Falha ao consultar a API da Mojang: HTTP {}", status));
+        return Err(tr!("players.mojangHttp", status = status));
     }
     let profile: MojangProfile = response.json().await.map_err(|e| e.to_string())?;
     Ok(format_uuid_with_dashes(&profile.id))
@@ -3364,7 +3368,7 @@ async fn add_whitelist_player(server_dir: String, name: String) -> Result<Whitel
     let path = PathBuf::from(&server_dir).join("whitelist.json");
     let mut entries: Vec<WhitelistEntry> = read_json_list(&path)?;
     if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
-        return Err(format!("\"{}\" já está na whitelist.", name));
+        return Err(tr!("players.alreadyWhitelisted", name = name));
     }
     let uuid = resolve_player_uuid(&server_dir, &name).await?;
     let entry = WhitelistEntry { uuid, name };
@@ -3380,7 +3384,7 @@ async fn remove_whitelist_player(server_dir: String, uuid: String) -> Result<(),
     let before = entries.len();
     entries.retain(|e| e.uuid != uuid);
     if entries.len() == before {
-        return Err("Jogador não encontrado na whitelist.".to_string());
+        return Err(tr!("players.whitelistNotFound"));
     }
     write_json_list(&path, &entries)
 }
@@ -3395,7 +3399,7 @@ async fn add_op(server_dir: String, name: String) -> Result<OpEntry, String> {
     let path = PathBuf::from(&server_dir).join("ops.json");
     let mut entries: Vec<OpEntry> = read_json_list(&path)?;
     if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
-        return Err(format!("\"{}\" já é operador.", name));
+        return Err(tr!("players.alreadyOp", name = name));
     }
     let uuid = resolve_player_uuid(&server_dir, &name).await?;
     let entry = OpEntry { uuid, name, level: 4, bypasses_player_limit: false };
@@ -3411,7 +3415,7 @@ async fn remove_op(server_dir: String, uuid: String) -> Result<(), String> {
     let before = entries.len();
     entries.retain(|e| e.uuid != uuid);
     if entries.len() == before {
-        return Err("Operador não encontrado.".to_string());
+        return Err(tr!("players.opNotFound"));
     }
     write_json_list(&path, &entries)
 }
@@ -3426,7 +3430,7 @@ async fn ban_player(server_dir: String, name: String, reason: Option<String>) ->
     let path = PathBuf::from(&server_dir).join("banned-players.json");
     let mut entries: Vec<BannedPlayerEntry> = read_json_list(&path)?;
     if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
-        return Err(format!("\"{}\" já está banido.", name));
+        return Err(tr!("players.alreadyBanned", name = name));
     }
     let uuid = resolve_player_uuid(&server_dir, &name).await?;
     let entry = BannedPlayerEntry {
@@ -3451,7 +3455,7 @@ async fn pardon_player(server_dir: String, uuid: String) -> Result<(), String> {
     let before = entries.len();
     entries.retain(|e| e.uuid != uuid);
     if entries.len() == before {
-        return Err("Banimento não encontrado.".to_string());
+        return Err(tr!("players.banNotFound"));
     }
     write_json_list(&path, &entries)
 }
@@ -3466,7 +3470,7 @@ async fn ban_ip(server_dir: String, ip: String, reason: Option<String>) -> Resul
     let path = PathBuf::from(&server_dir).join("banned-ips.json");
     let mut entries: Vec<BannedIpEntry> = read_json_list(&path)?;
     if entries.iter().any(|e| e.ip == ip) {
-        return Err(format!("O IP \"{}\" já está banido.", ip));
+        return Err(tr!("players.ipAlreadyBanned", ip = ip));
     }
     let entry = BannedIpEntry {
         ip,
@@ -3489,7 +3493,7 @@ async fn pardon_ip(server_dir: String, ip: String) -> Result<(), String> {
     let before = entries.len();
     entries.retain(|e| e.ip != ip);
     if entries.len() == before {
-        return Err("Banimento de IP não encontrado.".to_string());
+        return Err(tr!("players.ipBanNotFound"));
     }
     write_json_list(&path, &entries)
 }
@@ -3638,32 +3642,32 @@ fn safe_mod_filename(raw: &str) -> String {
 async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummary, String> {
     use std::io::Read;
 
-    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+    let file = File::open(&zip_path).map_err(|e| tr!("err.openFile", error = e))?;
     let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+        .map_err(|e| tr!("err.invalidArchive", error = e))?;
 
     if archive.by_name("manifest.json").is_ok() {
         let manifest: CfManifest = {
             let mut entry = archive.by_name("manifest.json").map_err(|e| e.to_string())?;
             let mut contents = String::new();
             entry.read_to_string(&mut contents).map_err(|e| e.to_string())?;
-            serde_json::from_str(&contents).map_err(|e| format!("manifest.json inválido: {}", e))?
+            serde_json::from_str(&contents).map_err(|e| tr!("modpack.manifestInvalid", error = e))?
         };
 
         let primary = manifest.minecraft.mod_loaders.iter()
             .find(|l| l.primary)
             .or_else(|| manifest.minecraft.mod_loaders.first())
-            .ok_or("Modpack não especifica um mod loader (Forge/Fabric/NeoForge).")?;
+            .ok_or_else(|| tr!("modpack.noLoader"))?;
 
         let (loader_raw, loader_version) = primary.id.split_once('-')
             .map(|(l, v)| (l.to_string(), v.to_string()))
-            .ok_or_else(|| format!("Não foi possível interpretar o mod loader \"{}\".", primary.id))?;
+            .ok_or_else(|| tr!("modpack.loaderParse", loader = primary.id))?;
 
         let loader = match loader_raw.as_str() {
             "forge" => "forge",
             "neoforge" => "neoforge",
             "fabric" => "fabric",
-            other => return Err(format!("Mod loader \"{}\" não é suportado pelo CubeForge.", other)),
+            other => return Err(tr!("modpack.loaderUnsupported", loader = other)),
         }.to_string();
 
         let overrides_dir = manifest.overrides.clone().unwrap_or_else(|| "overrides".to_string());
@@ -3694,11 +3698,11 @@ async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummar
             let mut entry = archive.by_name("modrinth.index.json").map_err(|e| e.to_string())?;
             let mut contents = String::new();
             entry.read_to_string(&mut contents).map_err(|e| e.to_string())?;
-            serde_json::from_str(&contents).map_err(|e| format!("modrinth.index.json inválido: {}", e))?
+            serde_json::from_str(&contents).map_err(|e| tr!("modpack.indexInvalid", error = e))?
         };
 
         let mc_version = index.dependencies.get("minecraft").cloned()
-            .ok_or("Modpack não especifica a versão do Minecraft.")?;
+            .ok_or_else(|| tr!("modpack.noMcVersion"))?;
 
         let (loader, loader_version) = if let Some(v) = index.dependencies.get("forge") {
             ("forge".to_string(), v.clone())
@@ -3707,9 +3711,9 @@ async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummar
         } else if let Some(v) = index.dependencies.get("fabric-loader") {
             ("fabric".to_string(), v.clone())
         } else if index.dependencies.contains_key("quilt-loader") {
-            return Err("Modpacks Quilt não são suportados pelo CubeForge no momento.".to_string());
+            return Err(tr!("modpack.quilt"));
         } else {
-            return Err("Modpack não especifica um mod loader suportado (Forge/Fabric/NeoForge).".to_string());
+            return Err(tr!("modpack.noSupportedLoader"));
         };
 
         let modrinth_files: Vec<ModrinthManifestFile> = index.files.into_iter()
@@ -3745,7 +3749,7 @@ async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummar
             overrides_folders,
         })
     } else {
-        Err("Arquivo não é um modpack CurseForge (.zip) ou Modrinth (.mrpack) válido — manifest.json ou modrinth.index.json não encontrado.".to_string())
+        Err(tr!("modpack.notAModpack"))
     }
 }
 
@@ -3758,9 +3762,9 @@ async fn read_modpack_manifest(zip_path: String) -> Result<ModpackManifestSummar
 /// mundo já existente enquanto restaura).
 #[tauri::command]
 async fn extract_modpack_overrides(zip_path: String, dest_dir: String, overrides_folder: String) -> Result<u32, String> {
-    let file = File::open(&zip_path).map_err(|e| format!("Não foi possível abrir o arquivo: {}", e))?;
+    let file = File::open(&zip_path).map_err(|e| tr!("err.openFile", error = e))?;
     let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Arquivo inválido ou corrompido: {}", e))?;
+        .map_err(|e| tr!("err.invalidArchive", error = e))?;
 
     let prefix = format!("{}/", overrides_folder);
     let dest_root = PathBuf::from(&dest_dir);
@@ -4296,15 +4300,15 @@ async fn modrinth_lookup_by_sha1(hashes: &[String]) -> Result<HashMap<String, Mo
         .json(&serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))
         .send()
         .await
-        .map_err(|e| format!("Falha ao consultar o Modrinth: {}", e))?;
+        .map_err(|e| tr!("err.modrinthQuery", error = e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Modrinth respondeu HTTP {}", resp.status()));
+        return Err(tr!("err.modrinthHttp", status = resp.status()));
     }
 
     resp.json::<HashMap<String, ModrinthVersionLookup>>()
         .await
-        .map_err(|e| format!("Resposta inesperada do Modrinth: {}", e))
+        .map_err(|e| tr!("err.modrinthUnexpected", error = e))
 }
 
 /// Resolve a lista de mods atualmente na pasta mods/ de um servidor,
@@ -4769,7 +4773,7 @@ async fn execute_register_server(app: &tauri::AppHandle, payload: &serde_json::V
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
@@ -4784,7 +4788,7 @@ async fn execute_register_server(app: &tauri::AppHandle, payload: &serde_json::V
 
 /// PATCH /api/v1/servers/:shortCode — Atualizar servidor
 async fn execute_update_server(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4795,7 +4799,7 @@ async fn execute_update_server(app: &tauri::AppHandle, payload: &serde_json::Val
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -4809,7 +4813,7 @@ async fn execute_update_server(app: &tauri::AppHandle, payload: &serde_json::Val
 
 /// DELETE /api/v1/servers/:shortCode — Remover servidor
 async fn execute_delete_server(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4819,7 +4823,7 @@ async fn execute_delete_server(app: &tauri::AppHandle, payload: &serde_json::Val
     let response = client.delete(&url)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -4833,7 +4837,7 @@ async fn execute_delete_server(app: &tauri::AppHandle, payload: &serde_json::Val
 
 /// POST /api/v1/servers/:shortCode/sessions — Criar/atualizar sessão
 async fn execute_create_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}/sessions", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4844,7 +4848,7 @@ async fn execute_create_session(app: &tauri::AppHandle, payload: &serde_json::Va
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -4859,7 +4863,7 @@ async fn execute_create_session(app: &tauri::AppHandle, payload: &serde_json::Va
 /// POST /api/v1/servers/:shortCode/heartbeat — Atualizar sessão (via heartbeat com status)
 /// A API Central não tem PATCH /sessions. O heartbeat aceita status e currentPlayers no body.
 async fn execute_update_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4870,7 +4874,7 @@ async fn execute_update_session(app: &tauri::AppHandle, payload: &serde_json::Va
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -4884,7 +4888,7 @@ async fn execute_update_session(app: &tauri::AppHandle, payload: &serde_json::Va
 
 /// DELETE /api/v1/servers/:shortCode/sessions — Encerrar sessão
 async fn execute_delete_session(app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}/sessions", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4894,7 +4898,7 @@ async fn execute_delete_session(app: &tauri::AppHandle, payload: &serde_json::Va
     let response = client.delete(&url)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -4908,7 +4912,7 @@ async fn execute_delete_session(app: &tauri::AppHandle, payload: &serde_json::Va
 
 /// POST /api/v1/servers/:shortCode/heartbeat — Heartbeat
 async fn execute_heartbeat(_app: &tauri::AppHandle, payload: &serde_json::Value) -> Result<(), String> {
-    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or("shortCode obrigatório")?;
+    let short_code = payload.get("shortCode").and_then(|v| v.as_str()).ok_or_else(|| tr!("err.shortCodeRequired"))?;
     let url = format!("{}/api/v1/servers/{}/heartbeat", API_BASE_URL, short_code);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -4919,7 +4923,7 @@ async fn execute_heartbeat(_app: &tauri::AppHandle, payload: &serde_json::Value)
         .json(payload)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
     
     let status = response.status();
     if !status.is_success() {
@@ -5090,7 +5094,7 @@ async fn sync_register_server(
             Ok(serde_json::json!({
                 "success": true,
                 "code": "QUEUED",
-                "message": "Operação enfileirada para sincronização.",
+                "message": tr!("err.queuedForSync"),
                 "data": {
                     "operationId": op_id,
                     "pending": true,
@@ -5133,13 +5137,13 @@ async fn sync_update_server(
             Err(e) => {
                 Ok(serde_json::json!({
                     "success": true, "code": "QUEUED",
-                    "message": format!("Operação enfileirada: {}", e),
+                    "message": tr!("err.queuedWithError", error = e),
                     "data": { "operationId": op_id, "pending": true },
                 }))
             }
         }
     } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": tr!("err.queued") }))
     }
 }
 
@@ -5175,13 +5179,13 @@ async fn sync_delete_server(
             Err(e) => {
                 Ok(serde_json::json!({
                     "success": true, "code": "QUEUED",
-                    "message": format!("Operação enfileirada: {}", e),
+                    "message": tr!("err.queuedWithError", error = e),
                     "data": { "operationId": op_id, "pending": true },
                 }))
             }
         }
     } else {
-        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": "Operação enfileirada." }))
+        Ok(serde_json::json!({ "success": true, "code": "QUEUED", "message": tr!("err.queued") }))
     }
 }
 
@@ -5211,7 +5215,7 @@ async fn regenerate_server_code(
     let response = client.post(&url)
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
 
     let status = response.status();
     let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
@@ -5220,7 +5224,7 @@ async fn regenerate_server_code(
     }
 
     let new_short_code = body.get("data").and_then(|d| d.get("shortCode")).and_then(|v| v.as_str())
-        .ok_or("Resposta da API sem o novo shortCode")?
+        .ok_or_else(|| tr!("err.noNewShortCode"))?
         .to_string();
 
     // Se este era o servidor ativo (hospedando agora), atualiza a referência em
@@ -5292,7 +5296,7 @@ async fn send_sleep_heartbeat(short_code: &str, status: &str) -> Result<serde_js
         .json(&serde_json::json!({ "status": status, "currentPlayers": 0 }))
         .send()
         .await
-        .map_err(|e| format!("Falha de conexão: {}", e))?;
+        .map_err(|e| tr!("err.connectionFailed", error = e))?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -5362,14 +5366,14 @@ async fn wake_from_sleep(app: tauri::AppHandle, cfg: Arc<WakeOnDemandConfig>) {
     // notar e mexer na interface manualmente.
     const NETWORK_TIMEOUT: Duration = Duration::from_secs(45);
     const NETWORK_MAX_ATTEMPTS: u32 = 3;
-    let mut net_res: Result<(), String> = Err("Nunca tentado".to_string());
+    let mut net_res: Result<(), String> = Err(tr!("err.neverTried"));
     for attempt in 1..=NETWORK_MAX_ATTEMPTS {
         net_res = match tokio::time::timeout(
             NETWORK_TIMEOUT,
             start_network_node(app.clone(), app.state::<AppState>(), "host".to_string(), cfg.short_code.clone(), None, cfg.local_port),
         ).await {
             Ok(inner_result) => inner_result,
-            Err(_) => Err(format!("Timeout de {}s esperando a rede (tentativa {}/{})", NETWORK_TIMEOUT.as_secs(), attempt, NETWORK_MAX_ATTEMPTS)),
+            Err(_) => Err(tr!("err.networkTimeout", seconds = NETWORK_TIMEOUT.as_secs(), attempt = attempt, max = NETWORK_MAX_ATTEMPTS)),
         };
         if net_res.is_ok() { break; }
         log_to_file(&app, &format!("[WakeOnDemand] Tentativa {}/{} de iniciar a rede falhou: {:?}", attempt, NETWORK_MAX_ATTEMPTS, net_res));
@@ -5462,7 +5466,7 @@ async fn arm_wake_on_demand(
     mod_loader_version: Option<String>,
 ) -> Result<(), String> {
     if !std::path::Path::new(&java_path).exists() {
-        return Err("Java ainda não instalado para este servidor — inicie-o manualmente pelo menos uma vez antes de ativar o modo de espera.".to_string());
+        return Err(tr!("err.wakeNoJava"));
     }
 
     disarm_wake_on_demand(app.clone()).await?;
@@ -5851,11 +5855,16 @@ pub fn run() {
       // Fechar a janela (X) pergunta ao usuário (via modal no frontend, ver
       // on_window_event) se quer fechar tudo ou só minimizar; o tray é o que
       // fica visível pra voltar ao app ou sair de vez quando ele minimiza.
+      // Os itens ficam guardados em estado gerenciado para o comando set_locale
+      // poder retraduzi-los quando o usuário troca o idioma do app.
+      let show_item = MenuItem::with_id(app, "show", tr!("tray.show"), true, None::<&str>)?;
+      let quit_item = MenuItem::with_id(app, "quit", tr!("tray.quit"), true, None::<&str>)?;
       let tray_menu = MenuBuilder::new(app)
-        .text("show", "Abrir Cubicase")
+        .item(&show_item)
         .separator()
-        .text("quit", "Sair (encerra servidor e rede mesh)")
+        .item(&quit_item)
         .build()?;
+      app.manage(TrayMenuItems { show: show_item, quit: quit_item });
 
       TrayIconBuilder::new()
         .icon(app.default_window_icon().unwrap().clone())
@@ -5905,6 +5914,7 @@ pub fn run() {
     .manage(registry)
     .manage(telemetry)
     .invoke_handler(tauri::generate_handler![
+       set_locale,
        start_network_node,
        stop_network_node,
        add_minecraft_server_entry,

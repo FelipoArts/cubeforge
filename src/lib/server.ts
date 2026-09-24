@@ -3,6 +3,7 @@ import { join, documentDir } from "@tauri-apps/api/path";
 import { exists, mkdir, writeTextFile, readDir, readTextFile, remove, size } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 import { isJREInstalled, installJRE, getJREPath } from "@/lib/jre";
+import { t as tn } from "@/i18n";
 
 // ============================================================
 // Tipos exportados
@@ -292,7 +293,7 @@ export async function getMinecraftServerUrl(version: string): Promise<MinecraftS
   const manifestRes = await fetch(
     "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
   );
-  if (!manifestRes.ok) throw new Error("Falha ao baixar o manifest de versões da Mojang.");
+  if (!manifestRes.ok) throw new Error(tn("srv.err.manifest"));
 
   const manifest = await manifestRes.json() as {
     versions: Array<{ id: string; url: string }>;
@@ -300,18 +301,18 @@ export async function getMinecraftServerUrl(version: string): Promise<MinecraftS
 
   // 2. Localizar a versão desejada
   const versionEntry = manifest.versions.find((v) => v.id === version);
-  if (!versionEntry) throw new Error(`Versão ${version} não encontrada no manifest da Mojang.`);
+  if (!versionEntry) throw new Error(tn("srv.err.versionNotFound", { version }));
 
   // 3. Buscar o JSON específico da versão para obter o link do server.jar
   const versionRes = await fetch(versionEntry.url);
-  if (!versionRes.ok) throw new Error(`Falha ao baixar os detalhes da versão ${version}.`);
+  if (!versionRes.ok) throw new Error(tn("srv.err.versionDetails", { version }));
 
   const versionData = await versionRes.json() as {
     downloads: { server: { url: string; sha1?: string } };
   };
 
   if (!versionData?.downloads?.server?.url) {
-    throw new Error(`URL do server.jar não encontrada para a versão ${version}.`);
+    throw new Error(tn("srv.err.jarUrl", { version }));
   }
 
   return {
@@ -348,9 +349,9 @@ export async function installMinecraftServer(
   const jarPath = await join(serverPath, "server.jar");
 
   // --- Criar pasta ---
-  onProgress({ status: "Criando pasta do servidor...", percent: 5 });
+  onProgress({ status: tn("srv.progress.creatingFolder"), percent: 5 });
   if (!(await exists(serversRoot))) await mkdir(serversRoot, { recursive: true });
-  if (await exists(serverPath)) throw new Error(`Já existe um servidor com o nome "${serverName}".`);
+  if (await exists(serverPath)) throw new Error(tn("modpack.nameExists", { name: serverName }));
   await mkdir(serverPath, { recursive: true });
 
   // A partir daqui a pasta do servidor já existe — se qualquer etapa falhar,
@@ -358,23 +359,23 @@ export async function installMinecraftServer(
   // nova tentativa com o mesmo nome (que antes só via "já existe um servidor").
   try {
     // --- Resolver URL do server.jar ---
-    onProgress({ status: "Consultando API da Mojang...", percent: 15 });
+    onProgress({ status: tn("srv.progress.consultingMojang"), percent: 15 });
     const { url: jarUrl, sha1: jarSha1 } = await getMinecraftServerUrl(version);
 
     // --- Baixar server.jar via Rust (reqwest, sem PowerShell) ---
     // O Rust já retenta com backoff e verifica o SHA1 contra o manifest oficial,
     // apagando o arquivo se vier corrompido/truncado.
-    onProgress({ status: "Baixando server.jar...", percent: 25 });
+    onProgress({ status: tn("srv.progress.downloadingJar"), percent: 25 });
     await invoke("download_server_jar", { url: jarUrl, destPath: jarPath, expectedSha1: jarSha1 });
-    onProgress({ status: "Download concluído.", percent: 75 });
+    onProgress({ status: tn("modrinth.downloadDone"), percent: 75 });
 
     // --- Aceitar EULA automaticamente ---
-    onProgress({ status: "Aceitando EULA...", percent: 80 });
+    onProgress({ status: tn("srv.progress.eula"), percent: 80 });
     const eulaPath = await join(serverPath, "eula.txt");
     await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
 
     // --- Gerar server.properties ---
-    onProgress({ status: "Gerando configurações...", percent: 88 });
+    onProgress({ status: tn("srv.progress.settings"), percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
     const properties = generateServerProperties(version, ramGb, seed);
     await writeTextFile(propertiesPath, properties);
@@ -403,11 +404,11 @@ export async function installMinecraftServer(
       // Campos preparados para futuras extensões (opcionais)
       iconPath: null,
       tags: [],
-      motd: `Servidor Cubicase - ${serverName}`,
+      motd: tn("srv.motd.named", { name: serverName }),
       lastPlayedAt: null,
     }, null, 2));
 
-    onProgress({ status: "Servidor criado com sucesso!", percent: 100 });
+    onProgress({ status: tn("srv.progress.created"), percent: 100 });
   } catch (err) {
     await remove(serverPath, { recursive: true }).catch(() => {});
     throw err;
@@ -435,7 +436,7 @@ function generateServerProperties(version: string, _ramGb: number, seed?: string
     `difficulty=easy`,
     `gamemode=survival`,
     `enable-command-block=false`,
-    `motd=Servidor Cubicase`,
+    `motd=${tn("srv.motd")}`,
     `spawn-protection=0`,
     `enforce-whitelist=false`,
     `white-list=false`,
@@ -782,9 +783,9 @@ export async function installForgeServer(
   const serverPath = await join(serversRoot, serverName);
 
   // 1. Criar pasta
-  onProgress({ status: "Criando pasta do servidor...", percent: 5 });
+  onProgress({ status: tn("srv.progress.creatingFolder"), percent: 5 });
   if (!(await exists(serversRoot))) await mkdir(serversRoot, { recursive: true });
-  if (await exists(serverPath)) throw new Error(`Já existe um servidor com o nome "${serverName}".`);
+  if (await exists(serverPath)) throw new Error(tn("modpack.nameExists", { name: serverName }));
   await mkdir(serverPath, { recursive: true });
 
   // A partir daqui a pasta do servidor já existe — se qualquer etapa falhar,
@@ -796,27 +797,27 @@ export async function installForgeServer(
     // checagem, o usuário só descobria isso com um "HTTP 404" cru no meio da instalação.
     let provider = getProviderByName(providerName);
     let effectiveForgeVersion = forgeVersion;
-    onProgress({ status: "Verificando disponibilidade do instalador...", percent: 10 });
+    onProgress({ status: tn("srv.progress.checkingInstaller"), percent: 10 });
     let installerUrl = provider.getInstallerUrl(mcVersion, effectiveForgeVersion);
     if (!(await urlExists(installerUrl))) {
       // Import de modpack: a versão do loader vem do manifest do pack e trocar
       // silenciosamente por outra build pode quebrar compatibilidade com os
       // mods do pack — falha alto em vez de substituir.
       if (opts?.strict) {
-        throw new Error(`Este modpack requer ${providerName === 'forge' ? 'Forge' : 'NeoForge'} ${forgeVersion} para Minecraft ${mcVersion}, que não está mais disponível.`);
+        throw new Error(tn("srv.err.forgeUnavailable", { loader: providerName === 'forge' ? 'Forge' : 'NeoForge', forgeVersion, mc: mcVersion }));
       }
-      onProgress({ status: "Build selecionada indisponível, buscando alternativa...", percent: 12 });
+      onProgress({ status: tn("srv.progress.forgeFallback"), percent: 12 });
       forgeVersionCache.delete(`${provider.name}:${mcVersion}`);
       const freshBuilds = await getForgeVersions(mcVersion);
       const fallback = freshBuilds.find(b => b.provider === providerName) ?? freshBuilds[0];
       if (!fallback) {
-        throw new Error(`Não há nenhuma build de ${providerName === 'forge' ? 'Forge' : 'NeoForge'} disponível para Minecraft ${mcVersion} no momento.`);
+        throw new Error(tn("srv.err.forgeNoBuild", { loader: providerName === 'forge' ? 'Forge' : 'NeoForge', mc: mcVersion }));
       }
       provider = getProviderByName(fallback.provider);
       effectiveForgeVersion = fallback.forgeVersion;
       installerUrl = provider.getInstallerUrl(mcVersion, effectiveForgeVersion);
       if (!(await urlExists(installerUrl))) {
-        throw new Error(`Não foi possível encontrar um instalador de ${providerName === 'forge' ? 'Forge' : 'NeoForge'} válido para Minecraft ${mcVersion}.`);
+        throw new Error(tn("srv.err.forgeNoInstaller", { loader: providerName === 'forge' ? 'Forge' : 'NeoForge', mc: mcVersion }));
       }
     }
 
@@ -824,12 +825,12 @@ export async function installForgeServer(
     // Sem SHA1 conhecido de antemão (providers de Forge/NeoForge não publicam um
     // manifest com checksum como a Mojang) — ainda assim se beneficia do retry
     // com backoff e da limpeza de arquivo truncado que o comando já faz.
-    onProgress({ status: "Baixando instalador do Forge...", percent: 15 });
+    onProgress({ status: tn("srv.progress.downloadingForge"), percent: 15 });
     const installerPath = await join(serverPath, "forge-installer.jar");
     await invoke("download_server_jar", { url: installerUrl, destPath: installerPath, expectedSha1: null });
 
     // 3. Executar instalador headless via Rust (não bloqueia IPC do Tauri)
-    onProgress({ status: "Executando instalador do Forge (pode levar alguns minutos)...", percent: 50 });
+    onProgress({ status: tn("srv.progress.runningForge"), percent: 50 });
 
     // Determinar versão do Java (Forge 1.17+ = Java 17, 1.16- = Java 8) e garantir
     // que ela já está instalada — diferente do fluxo de "iniciar servidor", a
@@ -840,9 +841,9 @@ export async function installForgeServer(
     const javaVer = getJavaVersion(mcVersion);
     const { getJREPath, isJREInstalled, installJRE } = await import("@/lib/jre");
     if (!(await isJREInstalled(javaVer))) {
-      onProgress({ status: `Baixando Java ${javaVer} (necessário para este Forge)...`, percent: 35 });
+      onProgress({ status: tn("srv.progress.downloadingJava", { java: javaVer }), percent: 35 });
       await installJRE(javaVer, (p) => {
-        onProgress({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: 35 + Math.round((p.percent / 100) * 10) });
+        onProgress({ status: tn("app.mc.installingJre", { java: javaVer, status: p.status }), percent: 35 + Math.round((p.percent / 100) * 10) });
       });
     }
     const jrePath = await getJREPath(javaVer);
@@ -853,21 +854,21 @@ export async function installForgeServer(
     await invoke("run_forge_installer", { javaPath: javaExe, installerPath });
 
     // 4. Detectar como iniciar o Forge (JAR único ou layout moderno com args file)
-    onProgress({ status: "Detectando arquivos do Forge...", percent: 80 });
+    onProgress({ status: tn("srv.progress.detectingForge"), percent: 80 });
     const launchInfo = await detectForgeJar(serverPath);
     if (!launchInfo) {
-      throw new Error("Não foi possível encontrar o JAR do Forge após a instalação.");
+      throw new Error(tn("srv.err.forgeJar"));
     }
     const serverJar = launchInfo.mode === 'jar' ? (launchInfo.jarName ?? null) : null;
     const launchArgsDir = launchInfo.mode === 'argfile' ? (launchInfo.argsDir ?? null) : null;
 
     // 5. Aceitar EULA
-    onProgress({ status: "Aceitando EULA...", percent: 85 });
+    onProgress({ status: tn("srv.progress.eula"), percent: 85 });
     const eulaPath = await join(serverPath, "eula.txt");
     await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
 
     // 6. Gerar server.properties
-    onProgress({ status: "Gerando configurações...", percent: 90 });
+    onProgress({ status: tn("srv.progress.settings"), percent: 90 });
     const propertiesPath = await join(serverPath, "server.properties");
     const properties = generateServerProperties(mcVersion, ramGb, seed);
     await writeTextFile(propertiesPath, properties);
@@ -889,7 +890,7 @@ export async function installForgeServer(
       name: serverName,
       version: mcVersion,
       serverType: provider.name, // "forge" ou "neoforge"
-      description: `Servidor ${provider.name === 'forge' ? 'Forge' : 'NeoForge'} ${effectiveForgeVersion}`,
+      description: tn("srv.desc.forge", { loader: provider.name === 'forge' ? 'Forge' : 'NeoForge', version: effectiveForgeVersion }),
       forgeVersion: effectiveForgeVersion,
       ramGb,
       serverJar,
@@ -897,11 +898,11 @@ export async function installForgeServer(
       createdAt: new Date().toISOString(),
       iconPath: null,
       tags: [],
-      motd: `Servidor Cubicase [${provider.name === 'forge' ? 'Forge' : 'NeoForge'}] - ${serverName}`,
+      motd: tn("modpack.motd", { pack: provider.name === 'forge' ? 'Forge' : 'NeoForge', name: serverName }),
       lastPlayedAt: null,
     }, null, 2));
 
-    onProgress({ status: "Servidor Forge criado com sucesso!", percent: 100 });
+    onProgress({ status: tn("srv.progress.forgeCreated"), percent: 100 });
   } catch (err) {
     await remove(serverPath, { recursive: true }).catch(() => {});
     throw err;
@@ -1003,31 +1004,31 @@ export async function installFabricServer(
   const serversRoot = await join(docsDir, "CubicaseServers");
   const serverPath = await join(serversRoot, serverName);
 
-  onProgress({ status: "Criando pasta do servidor...", percent: 5 });
+  onProgress({ status: tn("srv.progress.creatingFolder"), percent: 5 });
   if (!(await exists(serversRoot))) await mkdir(serversRoot, { recursive: true });
-  if (await exists(serverPath)) throw new Error(`Já existe um servidor com o nome "${serverName}".`);
+  if (await exists(serverPath)) throw new Error(tn("modpack.nameExists", { name: serverName }));
   await mkdir(serverPath, { recursive: true });
 
   try {
-    onProgress({ status: "Selecionando versão do instalador Fabric...", percent: 15 });
+    onProgress({ status: tn("srv.progress.selectingFabric"), percent: 15 });
     const installers = await getFabricInstallerVersions();
     const installer = pickStable(installers);
     if (!installer) {
-      throw new Error("Não foi possível determinar uma versão do Fabric Installer. Verifique sua conexão e tente novamente.");
+      throw new Error(tn("srv.err.fabricInstaller"));
     }
 
     const jarPath = await join(serverPath, FABRIC_SERVER_JAR_NAME);
     const jarUrl = `https://meta.fabricmc.net/v2/versions/loader/${encodeURIComponent(mcVersion)}/${encodeURIComponent(loaderVersion)}/${encodeURIComponent(installer.version)}/server/jar`;
 
-    onProgress({ status: "Baixando servidor Fabric...", percent: 30 });
+    onProgress({ status: tn("srv.progress.downloadingFabric"), percent: 30 });
     await invoke("download_server_jar", { url: jarUrl, destPath: jarPath, expectedSha1: null, expectedSha256: null });
-    onProgress({ status: "Download concluído.", percent: 75 });
+    onProgress({ status: tn("modrinth.downloadDone"), percent: 75 });
 
-    onProgress({ status: "Aceitando EULA...", percent: 80 });
+    onProgress({ status: tn("srv.progress.eula"), percent: 80 });
     const eulaPath = await join(serverPath, "eula.txt");
     await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
 
-    onProgress({ status: "Gerando configurações...", percent: 88 });
+    onProgress({ status: tn("srv.progress.settings"), percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
     await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb, seed));
 
@@ -1044,7 +1045,7 @@ export async function installFabricServer(
       name: serverName,
       version: mcVersion,
       serverType: "fabric",
-      description: `Servidor Fabric ${loaderVersion}`,
+      description: tn("srv.desc.fabric", { version: loaderVersion }),
       forgeVersion: null,
       modLoaderVersion: loaderVersion,
       ramGb,
@@ -1053,11 +1054,11 @@ export async function installFabricServer(
       createdAt: new Date().toISOString(),
       iconPath: null,
       tags: [],
-      motd: `Servidor Cubicase [Fabric] - ${serverName}`,
+      motd: tn("modpack.motd", { pack: "Fabric", name: serverName }),
       lastPlayedAt: null,
     }, null, 2));
 
-    onProgress({ status: "Servidor Fabric criado com sucesso!", percent: 100 });
+    onProgress({ status: tn("srv.progress.fabricCreated"), percent: 100 });
   } catch (err) {
     await remove(serverPath, { recursive: true }).catch(() => {});
     throw err;
@@ -1158,13 +1159,13 @@ export async function installPaperServer(
   const serversRoot = await join(docsDir, "CubicaseServers");
   const serverPath = await join(serversRoot, serverName);
 
-  onProgress({ status: "Criando pasta do servidor...", percent: 5 });
+  onProgress({ status: tn("srv.progress.creatingFolder"), percent: 5 });
   if (!(await exists(serversRoot))) await mkdir(serversRoot, { recursive: true });
-  if (await exists(serverPath)) throw new Error(`Já existe um servidor com o nome "${serverName}".`);
+  if (await exists(serverPath)) throw new Error(tn("modpack.nameExists", { name: serverName }));
   await mkdir(serverPath, { recursive: true });
 
   try {
-    onProgress({ status: "Consultando builds do Paper...", percent: 10 });
+    onProgress({ status: tn("srv.progress.consultingPaper"), percent: 10 });
     let builds = await getPaperBuilds(mcVersion);
     let selected = builds.find(b => b.build === build);
     if (!selected) {
@@ -1175,25 +1176,25 @@ export async function installPaperServer(
       builds = await getPaperBuilds(mcVersion);
       selected = builds.find(b => b.recommended) ?? builds[0];
       if (!selected) {
-        throw new Error(`Não há nenhuma build do Paper disponível para Minecraft ${mcVersion} no momento.`);
+        throw new Error(tn("srv.err.paperNoBuild", { mc: mcVersion }));
       }
     }
 
     const jarPath = await join(serverPath, selected.jarName);
-    onProgress({ status: "Baixando servidor Paper...", percent: 25 });
+    onProgress({ status: tn("srv.progress.downloadingPaper"), percent: 25 });
     await invoke("download_server_jar", {
       url: selected.downloadUrl,
       destPath: jarPath,
       expectedSha1: null,
       expectedSha256: selected.sha256,
     });
-    onProgress({ status: "Download concluído.", percent: 75 });
+    onProgress({ status: tn("modrinth.downloadDone"), percent: 75 });
 
-    onProgress({ status: "Aceitando EULA...", percent: 80 });
+    onProgress({ status: tn("srv.progress.eula"), percent: 80 });
     const eulaPath = await join(serverPath, "eula.txt");
     await writeTextFile(eulaPath, "# Aceito automaticamente pelo Cubicase\neula=true\n");
 
-    onProgress({ status: "Gerando configurações...", percent: 88 });
+    onProgress({ status: tn("srv.progress.settings"), percent: 88 });
     const propertiesPath = await join(serverPath, "server.properties");
     await writeTextFile(propertiesPath, generateServerProperties(mcVersion, ramGb, seed));
 
@@ -1210,7 +1211,7 @@ export async function installPaperServer(
       name: serverName,
       version: mcVersion,
       serverType: "paper",
-      description: `Servidor Paper build ${selected.build}`,
+      description: tn("srv.desc.paper", { build: selected.build }),
       forgeVersion: null,
       modLoaderVersion: String(selected.build),
       ramGb,
@@ -1219,11 +1220,11 @@ export async function installPaperServer(
       createdAt: new Date().toISOString(),
       iconPath: null,
       tags: [],
-      motd: `Servidor Cubicase [Paper] - ${serverName}`,
+      motd: tn("modpack.motd", { pack: "Paper", name: serverName }),
       lastPlayedAt: null,
     }, null, 2));
 
-    onProgress({ status: "Servidor Paper criado com sucesso!", percent: 100 });
+    onProgress({ status: tn("srv.progress.paperCreated"), percent: 100 });
   } catch (err) {
     await remove(serverPath, { recursive: true }).catch(() => {});
     throw err;
@@ -1332,13 +1333,13 @@ export async function importExistingServer(path: string): Promise<ServerInfo> {
   // Validar e descobrir como este servidor é iniciado
   const launchInfo = await detectServerLaunchInfo(path);
   if (!launchInfo) {
-    throw new Error("A pasta selecionada não contém um servidor Minecraft válido (nenhum JAR executável ou instalação de Forge/NeoForge foi encontrado).");
+    throw new Error(tn("srv.err.invalidFolder"));
   }
   const serverJar = launchInfo.mode === 'jar' ? launchInfo.jarName : null;
   const launchArgsDir = launchInfo.mode === 'argfile' ? launchInfo.argsDir : null;
 
   // Extrair nome da pasta
-  const name = path.split('\\').pop()?.split('/').pop() || 'Servidor Importado';
+  const name = path.split('\\').pop()?.split('/').pop() || tn("srv.importedName");
 
   // Detectar versão
   const version = await detectServerVersion(path);
@@ -1487,7 +1488,7 @@ export async function scanExternalServer(serverPath: string): Promise<ServerInfo
   const launchInfo = await detectServerLaunchInfo(serverPath);
   if (!launchInfo) return null;
 
-  const name = serverPath.split('\\').pop()?.split('/').pop() || 'Servidor';
+  const name = serverPath.split('\\').pop()?.split('/').pop() || tn("srv.defaultName");
 
   // Ler metadados
   let version: string | null = null;
@@ -1976,16 +1977,16 @@ export async function startServerOrchestrated(
   const version = serverInfo.version || "1.20.1";
   const javaVer = getJavaVersion(version);
 
-  log(`Verificando compatibilidade com Java JRE ${javaVer}...`);
+  log(tn("srv.log.checkingJava", { java: javaVer }));
   const installed = await isJREInstalled(javaVer);
   if (!installed) {
-    log(`JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`);
+    log(tn("srv.log.jreMissing", { java: javaVer }));
     await installJRE(javaVer, (p) => {
-      onInstallProgress?.({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: p.percent });
+      onInstallProgress?.({ status: tn("app.mc.installingJre", { java: javaVer, status: p.status }), percent: p.percent });
     });
   }
   onInstallProgress?.(null);
-  log(`JRE ${javaVer} pronto!`);
+  log(tn("srv.log.jreReady", { java: javaVer }));
 
   const jrePath = await getJREPath(javaVer);
   const javaPath = `${jrePath}\\bin\\java.exe`;
@@ -2008,7 +2009,7 @@ export async function startServerOrchestrated(
     // usa a porta padrão
   }
 
-  log(`Iniciando Java runtime com ${ram}GB de RAM...`);
+  log(tn("srv.log.startingJava", { ram }));
   await invoke("start_minecraft_server", {
     serverDir: serverInfo.path,
     javaPath,

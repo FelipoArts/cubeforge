@@ -966,3 +966,12 @@ footer {
 .login-status.is-error {
   color: #ff9186;
 }
+
+/* ---------- Seletor de idioma (assets/i18n.js) ---------- */
+.lang-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 999px; }
+.lang-switch-link { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--text-muted); text-decoration: none; }
+.nav-links a.lang-switch-link:not(.btn) { padding: 4px 10px; }
+.lang-switch-link.is-active { background: var(--accent-soft); color: var(--accent); }
+.lang-switch-link:hover { color: var(--accent-hover); }
+/* Páginas traduzidas em runtime: esconde o corpo até a tradução ser aplicada (evita flash em pt-BR). */
+.i18n-pending body { visibility: hidden; }

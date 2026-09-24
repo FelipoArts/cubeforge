@@ -30,7 +30,7 @@ impl ProviderManager {
             "mock-v1" => {
                 self.start_mock(app, &session.credentials, mode, local_port).await
             }
-            other => Err(format!("Launcher '{}' não é suportado pelo ProviderManager.", other)),
+            other => Err(tr!("provider.launcherUnsupported", launcher = other)),
         }
     }
 
@@ -47,7 +47,7 @@ impl ProviderManager {
         let auth_key = credentials.get("auth_key")
             .or_else(|| credentials.get("authKey"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Credenciais não contêm 'authKey'".to_string())?;
+            .ok_or_else(|| tr!("provider.noAuthKey"))?;
 
         let hostname = credentials.get("hostname")
             .and_then(|v| v.as_str())
@@ -55,9 +55,9 @@ impl ProviderManager {
 
         // Criar pasta de dados
         let data_dir = app.path().app_local_data_dir()
-            .map_err(|e| format!("Erro ao obter data_dir: {}", e))?;
+            .map_err(|e| tr!("provider.dataDir", error = e))?;
         std::fs::create_dir_all(&data_dir)
-            .map_err(|e| format!("Erro ao criar data_dir: {}", e))?;
+            .map_err(|e| tr!("provider.dataDirCreate", error = e))?;
 
         // Criar arquivo temporário de configuração
         let config_path = data_dir.join(format!("tsnet_{}.json", session_id));
@@ -69,22 +69,22 @@ impl ProviderManager {
             "localPort": local_port,
         });
         let config_str = serde_json::to_string(&config)
-            .map_err(|e| format!("Erro ao serializar config: {}", e))?;
+            .map_err(|e| tr!("provider.serializeConfig", error = e))?;
         
         let mut file = std::fs::File::create(&config_path)
-            .map_err(|e| format!("Erro ao criar arquivo temp: {}", e))?;
+            .map_err(|e| tr!("provider.tempFile", error = e))?;
         file.write_all(config_str.as_bytes())
-            .map_err(|e| format!("Erro ao escrever config: {}", e))?;
+            .map_err(|e| tr!("provider.writeConfig", error = e))?;
 
         let config_path_str = config_path.to_string_lossy().to_string();
         let shell = app.shell();
         // Tauri v2 spawn retorna (Receiver<CommandEvent>, CommandChild)
         let (mut rx, child) = shell
             .sidecar("tsnet-node")
-            .map_err(|e| format!("Erro ao criar sidecar: {}", e))?
+            .map_err(|e| tr!("provider.createSidecar", error = e))?
             .args(["--config", &config_path_str])
             .spawn()
-            .map_err(|e| format!("Erro ao spawnar sidecar: {}", e))?;
+            .map_err(|e| tr!("provider.spawnSidecar", error = e))?;
 
         Ok((child, rx))
     }
@@ -103,6 +103,6 @@ impl ProviderManager {
 
         // Mock não precisa de sidecar real
         // Para simplificar, retornamos erro indicando que o mock deve ser tratado separadamente
-        Err("Mock provider não requer sidecar. Use o fluxo mock diretamente.".to_string())
+        Err(tr!("provider.mockNoSidecar"))
     }
 }

@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Settings, X } from "lucide-react";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { useT } from "@/i18n";
 
 // ============================================================
 // SettingsModal
@@ -27,6 +28,7 @@ export function SettingsModal({
   currentPort,
   onSave,
 }: SettingsModalProps) {
+  const { t } = useT();
   const [port, setPort] = useState(currentPort);
 
   useLockBodyScroll(isOpen);
@@ -67,7 +69,7 @@ export function SettingsModal({
                   <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center">
                     <Settings className="text-indigo-600 w-5 h-5" />
                   </div>
-                  <h3 className="text-xl font-bold text-theme-primary">Ajustes do Sistema</h3>
+                  <h3 className="text-xl font-bold text-theme-primary">{t("hostSettings.title")}</h3>
                 </div>
                 <button
                   type="button"
@@ -82,7 +84,7 @@ export function SettingsModal({
             <div className="px-8 overflow-y-auto flex-1 custom-scrollbar">
               <div className="space-y-4 pb-4">
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Porta Local de Convidado</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("hostSettings.guestPort")}</label>
                   <input
                     type="number"
                     min="1024"
@@ -92,7 +94,7 @@ export function SettingsModal({
                     className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent"
                   />
                   <p className="text-[10px] text-theme-secondary">
-                    Porta local usada apenas quando VOCÊ entra como convidado no servidor de outra pessoa (padrão 25565). Não afeta servidores que você hospeda — a porta desses é definida em "Configurações do Servidor", em cada servidor.
+                    {t("hostSettings.guestPortHint")}
                   </p>
                 </div>
               </div>
@@ -105,14 +107,14 @@ export function SettingsModal({
                   onClick={onClose}
                   className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold cursor-pointer"
                 >
-                  Cancelar
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="button"
                   onClick={handleSave}
                   className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold shadow-md shadow-theme-shadow cursor-pointer"
                 >
-                  Salvar Ajustes
+                  {t("hostSettings.save")}
                 </button>
               </div>
             </div>

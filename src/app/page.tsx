@@ -32,6 +32,8 @@ import { createLagMonitor } from "@/lib/lagDetector";
 import { createResourceMonitor, explainResourceBottleneck, type ResourceSnapshot } from "@/lib/resourceDiagnostics";
 import { maybeBackupWorld } from "@/lib/autoBackup";
 import { connectAddressFor } from "@/lib/connectAddress";
+import { t, useT } from "@/i18n";
+import { initNativeLocaleSync } from "@/i18n/native";
 
 // Componentes extraídos
 import { HostView } from "@/app/components/host/HostView";
@@ -48,11 +50,18 @@ import { GuestView } from "@/app/components/guest/GuestView";
 
 export default function Home() {
   const { resolvedTheme } = useTheme();
+  // Re-renderiza o shell ao trocar o idioma (t() fora do hook lê o idioma atual).
+  const { t: tr } = useT();
   const [mounted, setMounted] = useState(false);
 
   // Evitar hydration mismatch: só renderizar o logo após montar no cliente
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // Informa o idioma efetivo ao backend Tauri (erros, diagnósticos, tray) — agora e a cada troca.
+  useEffect(() => {
+    initNativeLocaleSync();
   }, []);
 
   // Checagem de atualização: silenciosa, alguns segundos após o boot (não
@@ -255,7 +264,7 @@ export default function Home() {
     if (registeredShortCodeRef.current === metaShortCode) return Promise.resolve();
     registeredShortCodeRef.current = metaShortCode;
 
-    setLogs(prev => [...prev, `[INFO] Código do servidor: CF-${metaShortCode}`]);
+    setLogs(prev => [...prev, t("app.log.serverCode", { code: metaShortCode })]);
 
     const type = serverInfo.serverType || "vanilla";
     const typeLabel =
@@ -269,7 +278,7 @@ export default function Home() {
       name: serverInfo.name,
       version: serverInfo.version || "1.20.1",
       serverType: type,
-      description: serverInfo.description || `Servidor Minecraft ${typeLabel} ${serverInfo.version || "1.20.1"}`,
+      description: serverInfo.description || t("app.defaultDescription", { type: typeLabel, version: serverInfo.version || "1.20.1" }),
       shortCode: metaShortCode,
       owner: null,
       forgeVersion: serverInfo.forgeVersion ?? null,
@@ -282,15 +291,15 @@ export default function Home() {
       try {
         const response = typeof responseJson === "string" ? JSON.parse(responseJson) : responseJson;
         if (response.code === "SERVER_CREATED") {
-          setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central! Código: CF-${metaShortCode}`]);
+          setLogs(prev => [...prev, t("app.log.registered", { code: metaShortCode })]);
         } else if (response.code === "QUEUED") {
-          setLogs(prev => [...prev, `[INFO] ⏳ Servidor enfileirado para sincronização. Código: CF-${metaShortCode}`]);
+          setLogs(prev => [...prev, t("app.log.queued", { code: metaShortCode })]);
         }
       } catch {
-        setLogs(prev => [...prev, `[INFO] ✅ Servidor registrado na API Central!`]);
+        setLogs(prev => [...prev, t("app.log.registeredNoCode")]);
       }
     }).catch(() => {
-      setLogs(prev => [...prev, `[INFO] ⚠ API Central indisponível. Servidor funcionando em modo offline.`]);
+      setLogs(prev => [...prev, t("app.log.centralOffline")]);
     });
   };
 
@@ -316,7 +325,7 @@ export default function Home() {
   const startMinecraftForServer = async (serverInfo: ServerInfo) => {
     setServerStatus("starting");
     useAppStore.getState().setRunningServer(serverInfo.name);
-    useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] Inicializando preparação do servidor "${serverInfo.name}"...`]);
+    useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, t("app.mc.preparing", { name: serverInfo.name })]);
 
     try {
       const version = serverInfo.version || "1.20.1";
@@ -324,9 +333,9 @@ export default function Home() {
 
       const installed = await isJREInstalled(javaVer);
       if (!installed) {
-        useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] JRE ${javaVer} não encontrado na máquina. Baixando de Adoptium...`]);
+        useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, t("app.mc.jreMissing", { java: javaVer })]);
         await installJRE(javaVer, (p) => {
-          setServerInstallProgress({ status: `Instalando JRE ${javaVer}: ${p.status}`, percent: p.percent });
+          setServerInstallProgress({ status: t("app.mc.installingJre", { java: javaVer, status: p.status }), percent: p.percent });
         });
         setServerInstallProgress(null);
       }
@@ -356,7 +365,7 @@ export default function Home() {
       });
     } catch (err: any) {
       console.error(err);
-      useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase ERR] Falha ao iniciar automaticamente: ${err}`]);
+      useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, t("app.mc.autoStartFailed", { error: String(err) })]);
       setServerStatus("offline");
     }
   };
@@ -404,7 +413,7 @@ export default function Home() {
               for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
               serverShortCodeRef.current = code;
               setShortCode(code);
-              setLogs(prev => [...prev, `[INFO] Código gerado localmente: CF-${code}`]);
+              setLogs(prev => [...prev, t("app.log.localCode", { code })]);
             }
           }
         } else {
@@ -428,8 +437,8 @@ export default function Home() {
         if (event.payload.is_error) {
           pushDiagnostic({
             level: "error",
-            source: "Rede",
-            title: "Falha na rede mesh",
+            source: t("diag.source.network"),
+            title: t("app.net.meshFailure"),
             message: event.payload.message,
           });
         }
@@ -472,7 +481,7 @@ export default function Home() {
             title,
             message,
             detail,
-            source: "Servidor",
+            source: t("diag.source.server"),
           });
 
           // "mc-diagnostic" só é emitido pelo Rust no caso de crash do servidor —
@@ -496,11 +505,11 @@ export default function Home() {
                   const javaVer = getJavaVersion(serverInfo.version || "1.20.1");
                   pushDiagnostic({
                     level: "info",
-                    source: "Servidor",
-                    title: "Corrigindo automaticamente",
-                    message: `Reinstalando a JRE ${javaVer} (provável instalação corrompida) e tentando iniciar "${serverInfo.name}" novamente...`,
+                    source: t("diag.source.server"),
+                    title: t("app.autofix.title"),
+                    message: t("app.autofix.message", { java: javaVer, name: serverInfo.name }),
                   });
-                  useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, `[Cubicase] Detectada JRE ${javaVer} incompatível/corrompida — reinstalando automaticamente...`]);
+                  useAppStore.getState().setMcLogs(serverInfo.name, prev => [...prev, t("app.autofix.log", { java: javaVer })]);
                   const jrePath = await getJREPath(javaVer);
                   await remove(jrePath, { recursive: true }).catch(() => {});
                   await startMinecraftForServer(serverInfo);
@@ -515,7 +524,7 @@ export default function Home() {
       unlistenNetDiagnostic = await listen<{ level: "info" | "warning" | "error" | "critical"; title: string; message: string; detail?: string }>(
         "network-diagnostic",
         (event) => {
-          pushDiagnostic({ ...event.payload, source: "Rede" });
+          pushDiagnostic({ ...event.payload, source: t("diag.source.network") });
         }
       );
 
@@ -541,11 +550,11 @@ export default function Home() {
 
         let statusMsg = "";
         switch (status) {
-          case "online": statusMsg = "[Cubicase] Servidor de Minecraft está ONLINE!"; break;
-          case "offline": statusMsg = "[Cubicase] Servidor de Minecraft está OFFLINE."; break;
-          case "starting": statusMsg = "[Cubicase] Servidor de Minecraft está INICIANDO..."; break;
-          case "stopping": statusMsg = "[Cubicase] Servidor de Minecraft está PARANDO..."; break;
-          case "crashed": statusMsg = "[Cubicase ERR] O servidor de Minecraft fechou de forma inesperada (CRASHED)!"; break;
+          case "online": statusMsg = t("app.mc.status.online"); break;
+          case "offline": statusMsg = t("app.mc.status.offline"); break;
+          case "starting": statusMsg = t("app.mc.status.starting"); break;
+          case "stopping": statusMsg = t("app.mc.status.stopping"); break;
+          case "crashed": statusMsg = t("app.mc.status.crashed"); break;
         }
         if (statusMsg) appendMcLogToRunningServer(statusMsg);
 
@@ -589,7 +598,7 @@ export default function Home() {
           pushDiagnostic({
             ...lagDiagnostic,
             message: bottleneck ? `${lagDiagnostic.message} ${bottleneck}` : lagDiagnostic.message,
-            source: "Servidor",
+            source: t("diag.source.server"),
           });
         }
 
@@ -606,7 +615,7 @@ export default function Home() {
 
         const resourceDiagnostic = resourceMonitorRef.current.ingestSample(event.payload);
         if (resourceDiagnostic) {
-          pushDiagnostic({ ...resourceDiagnostic, source: "Servidor" });
+          pushDiagnostic({ ...resourceDiagnostic, source: t("diag.source.server") });
         }
 
         // "Backup de segurança": reaproveita este tick de ~15s como relógio
@@ -649,13 +658,13 @@ export default function Home() {
         }
         if (status.minecraftStatus === "online") {
           setServerStatus("online");
-          appendMcLogToRunningServer("[Cubicase] ✅ Servidor Minecraft já estava ONLINE (detectado após recarga).");
+          appendMcLogToRunningServer(t("app.mc.restore.online"));
         } else if (status.minecraftStatus === "crashed") {
           setServerStatus("crashed");
-          appendMcLogToRunningServer("[Cubicase] ❌ Servidor Minecraft estava CRASHADO (detectado após recarga).");
+          appendMcLogToRunningServer(t("app.mc.restore.crashed"));
         } else if (status.minecraftStatus === "starting") {
           setServerStatus("starting");
-          appendMcLogToRunningServer("[Cubicase] ⏳ Servidor Minecraft ainda está inicializando (detectado após recarga).");
+          appendMcLogToRunningServer(t("app.mc.restore.starting"));
         }
       } catch (err) {
         console.warn("[Restore] Erro ao verificar estado do sistema:", err);
@@ -727,14 +736,14 @@ export default function Home() {
         // rodando, exceção na orquestração) fica só num console.error que
         // ninguém olha, e do ponto de vista de quem está na frente do PC
         // "nada acontece" quando na real algo falhou silenciosamente.
-        pushDiagnostic({ level: "info", source: "Painel", title: "Início remoto pedido pelo painel web", message: `Procurando servidor (id: ${serverId})...` });
+        pushDiagnostic({ level: "info", source: t("diag.source.panel"), title: t("app.panel.requested.title"), message: t("app.panel.requested.message", { id: serverId }) });
         try {
           const { listAllServers, findServerById, startServerOrchestrated } = await import("@/lib/server");
           const store = useAppStore.getState();
           const servers = await listAllServers(store.importedServerPaths);
           const serverInfo = findServerById(servers, serverId);
           if (!serverInfo) {
-            pushDiagnostic({ level: "error", source: "Painel", title: "Início remoto falhou", message: `Nenhum servidor local corresponde ao id "${serverId}" enviado pelo painel.` });
+            pushDiagnostic({ level: "error", source: t("diag.source.panel"), title: t("app.panel.failed.title"), message: t("app.panel.notFound", { id: serverId }) });
             return;
           }
           // Mesma regra do plano: nunca sobe um servidor por cima de outro já
@@ -749,7 +758,7 @@ export default function Home() {
           // algo ativo agora.
           const somethingActive = !!store.runningServer && ["starting", "online", "stopping"].includes(store.serverStatus);
           if (somethingActive && store.runningServer !== serverInfo.name) {
-            pushDiagnostic({ level: "warning", source: "Painel", title: "Início remoto recusado", message: `"${store.runningServer}" já está em execução. Pare-o antes de iniciar outro pelo painel.` });
+            pushDiagnostic({ level: "warning", source: t("diag.source.panel"), title: t("app.panel.refused.title"), message: t("app.panel.refused.message", { name: store.runningServer ?? "" }) });
             return;
           }
           if (somethingActive && store.runningServer === serverInfo.name) return; // já rodando — nada a fazer
@@ -769,7 +778,7 @@ export default function Home() {
           });
         } catch (err) {
           console.error("[panel] Falha ao iniciar servidor remotamente:", err);
-          pushDiagnostic({ level: "error", source: "Painel", title: "Início remoto falhou", message: String(err) });
+          pushDiagnostic({ level: "error", source: t("diag.source.panel"), title: t("app.panel.failed.title"), message: String(err) });
           useAppStore.getState().setServerStatus("offline");
         }
       });
@@ -834,7 +843,7 @@ export default function Home() {
     setDiscoveredServer(null);
     setNetStatus("connecting");
     setNetMode("guest");
-    setLogs(prev => [...prev, `[INFO] Conectando ao código ${inviteCode}...`]);
+    setLogs(prev => [...prev, t("app.guest.connecting", { code: inviteCode })]);
 
     let discoveredName: string | null = null;
     const shortCodeClean = inviteCode.replace("CF-", "");
@@ -854,7 +863,7 @@ export default function Home() {
         const envelope = await response.json();
         const server = envelope?.data?.server ?? {};
         const session = envelope?.data?.session ?? {};
-        setLogs(prev => [...prev, `[INFO] Servidor encontrado: ${server.name} (${server.version})`]);
+        setLogs(prev => [...prev, t("app.guest.found", { name: server.name, version: server.version })]);
         setDiscoveredServer({
           name: server.name,
           version: server.version,
@@ -873,12 +882,12 @@ export default function Home() {
       setNetStatus("offline");
       setNetMode(null);
       useAppStore.getState().setGuestConnectedShortCode(null);
-      setLogs(prev => [...prev, `[ERR] Não foi possível encontrar esse servidor online. Confira o código ou peça para o host verificar se a rede mesh dele está ativa.`]);
+      setLogs(prev => [...prev, t("app.guest.notFoundLog")]);
       pushDiagnostic({
         level: "error",
-        source: "Rede",
-        title: "Servidor não encontrado",
-        message: "A API Central não retornou um endereço de rede para esse código — o host provavelmente não está com a rede mesh online agora.",
+        source: t("diag.source.network"),
+        title: t("app.guest.notFound.title"),
+        message: t("app.guest.notFound.message"),
       });
       return;
     }
@@ -893,7 +902,7 @@ export default function Home() {
       setNetStatus("online");
       setNetMode("guest");
       const connectAddress = connectAddressFor({ shortCode: shortCodeClean, connectName }, minecraftPort);
-      setLogs(prev => [...prev, `[INFO] ✅ Túnel estabelecido! Conecte-se em ${connectAddress}`]);
+      setLogs(prev => [...prev, t("app.guest.tunnel", { address: connectAddress })]);
 
       // Adiciona (ou atualiza) automaticamente o servidor na lista "Multiplayer"
       // do cliente Minecraft do convidado, editando o servers.dat diretamente —
@@ -902,28 +911,28 @@ export default function Home() {
       // normalmente (o convidado só digita o endereço manualmente).
       try {
         const result = await invoke<string>("add_minecraft_server_entry", {
-          name: discoveredName ?? "Servidor CubeForge",
+          name: discoveredName ?? t("app.guest.defaultEntryName"),
           address: connectAddress,
         });
         if (result === "added") {
-          setLogs(prev => [...prev, `[INFO] ✅ Servidor adicionado automaticamente à sua lista de Multiplayer do Minecraft.`]);
+          setLogs(prev => [...prev, t("app.guest.addedToList")]);
         } else {
-          setLogs(prev => [...prev, `[INFO] Não encontramos sua instalação do Minecraft — adicione "${connectAddress}" manualmente na lista de Multiplayer.`]);
+          setLogs(prev => [...prev, t("app.guest.launcherNotFound", { address: connectAddress })]);
         }
       } catch (err) {
         console.warn("[Guest] Falha ao adicionar servidor ao cliente Minecraft:", err);
-        setLogs(prev => [...prev, `[INFO] Não foi possível adicionar o servidor automaticamente — adicione "${connectAddress}" manualmente na lista de Multiplayer.`]);
+        setLogs(prev => [...prev, t("app.guest.addFailed", { address: connectAddress })]);
       }
     } catch (err) {
       console.error(err);
       setNetStatus("offline");
       setNetMode(null);
       useAppStore.getState().setGuestConnectedShortCode(null);
-      setLogs(prev => [...prev, `[ERR] Falha ao conectar: ${err}`]);
+      setLogs(prev => [...prev, t("app.guest.connectFailedLog", { error: String(err) })]);
       pushDiagnostic({
         level: "error",
-        source: "Rede",
-        title: "Falha ao conectar ao servidor",
+        source: t("diag.source.network"),
+        title: t("app.guest.connectFailed.title"),
         message: String(err),
       });
     }
@@ -937,7 +946,7 @@ export default function Home() {
       setNetIp(null);
       setDiscoveredServer(null);
       useAppStore.getState().setGuestConnectedShortCode(null);
-      setLogs(prev => [...prev, `[INFO] Conexão encerrada.`]);
+      setLogs(prev => [...prev, t("app.guest.disconnected")]);
     } catch (err) {
       console.error(err);
     }
@@ -976,7 +985,7 @@ export default function Home() {
                 )}
               >
                 <Monitor className="w-3.5 h-3.5" />
-                Host
+                {tr("app.tab.host")}
               </button>
               <button
                 type="button"
@@ -989,7 +998,7 @@ export default function Home() {
                 )}
               >
                 <Globe className="w-3.5 h-3.5" />
-                Convidado
+                {tr("app.tab.guest")}
               </button>
             </div>
 
@@ -1000,7 +1009,7 @@ export default function Home() {
                 setAppSettingsCategory(undefined);
                 setShowAppSettings(true);
               }}
-              title="Configurações"
+              title={tr("app.settings")}
               className="w-9 h-9 flex items-center justify-center rounded-xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors cursor-pointer"
             >
               <SettingsIcon className="w-4.5 h-4.5" />

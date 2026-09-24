@@ -24,6 +24,7 @@ import type { ServerStatus } from "@/app/store";
 import { ConfirmActionModal } from "./ConfirmActionModal";
 import { ModBrowserModal } from "./ModBrowserModal";
 import { loaderForServerType } from "@/lib/modrinth";
+import { useT, t as tn, getLocale } from "@/i18n";
 
 // ============================================================
 // ServerManagePanel
@@ -67,21 +68,23 @@ function formatSize(bytes: number): string {
 }
 
 function formatDate(iso: string): string {
-  if (!iso) return "Data desconhecida";
+  if (!iso) return tn("manage.unknownDate");
   try {
-    return new Date(iso).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+    return new Date(iso).toLocaleString(getLocale(), { dateStyle: "short", timeStyle: "short" });
   } catch {
     return iso;
   }
 }
 
 export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersion }: ServerManagePanelProps) {
+  const { t, rich } = useT();
   // Forge/NeoForge/Fabric usam pasta "mods"; Paper (e derivados como Spigot/Purpur)
   // usam pasta "plugins" — mesmo conceito de gerenciamento, pasta e rótulo diferentes.
   const isPluginBased = serverType === "paper" || serverType === "spigot" || serverType === "purpur" || serverType === "bukkit";
   const modsCapable = serverType === "forge" || serverType === "neoforge" || serverType === "fabric" || isPluginBased;
   const itemsFolder = isPluginBased ? "plugins" : "mods";
   const itemsLabel = isPluginBased ? "Plugins" : "Mods";
+  const itemWord = isPluginBased ? "plugin" : "mod";
   // A Modrinth só cobre esse mesmo conjunto de loaders (ver loaderForServerType em
   // src/lib/modrinth.ts); precisamos também saber a versão do MC pra filtrar por
   // compatibilidade, que nem sempre está disponível (ex: servidor importado sem meta).
@@ -119,7 +122,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       });
     } catch (err) {
       console.error("Erro ao listar mods:", err);
-      pushDiagnostic({ level: "warning", source: "Servidor", title: "Não foi possível listar os mods", message: String(err) });
+      pushDiagnostic({ level: "warning", source: tn("diag.source.server"), title: tn("manage.err.listMods"), message: String(err) });
     } finally {
       setLoadingMods(false);
     }
@@ -132,7 +135,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       setBackups(list);
     } catch (err) {
       console.error("Erro ao listar backups:", err);
-      pushDiagnostic({ level: "warning", source: "Servidor", title: "Não foi possível listar os backups", message: String(err) });
+      pushDiagnostic({ level: "warning", source: tn("diag.source.server"), title: tn("manage.err.listBackups"), message: String(err) });
     } finally {
       setLoadingBackups(false);
     }
@@ -154,7 +157,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       await loadMods();
     } catch (err) {
       console.error(err);
-      pushDiagnostic({ level: "error", source: "Servidor", title: `Erro ao alternar o ${isPluginBased ? "plugin" : "mod"}`, message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("manage.err.toggle", { item: itemWord }), message: String(err) });
     }
   };
 
@@ -179,7 +182,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       await invoke("open_path_in_explorer", { path: modsPath });
     } catch (err) {
       console.error(err);
-      pushDiagnostic({ level: "error", source: "Sistema", title: `Erro ao abrir a pasta de ${itemsLabel.toLowerCase()}`, message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("manage.source.system"), title: tn("manage.err.openFolder", { items: itemsLabel.toLowerCase() }), message: String(err) });
     }
   };
 
@@ -192,7 +195,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
     } catch (err) {
       console.error(err);
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Falha ao criar backup do mundo", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("manage.err.backup"), message: String(err) });
     } finally {
       setIsBackingUp(false);
     }
@@ -220,7 +223,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       }
     } catch (err) {
       console.error(err);
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao executar a ação", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("manage.err.action"), message: String(err) });
     } finally {
       setPendingAction(null);
     }
@@ -231,9 +234,9 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
           <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest bg-indigo-100 dark:bg-indigo-900/30 px-2.5 py-1 rounded-full">
-            Gerenciamento
+            {t("manage.badge")}
           </span>
-          <h2 className="text-2xl font-bold text-theme-primary mt-2">{itemsLabel} &amp; Mundo</h2>
+          <h2 className="text-2xl font-bold text-theme-primary mt-2">{t("manage.heading", { items: itemsLabel })}</h2>
         </div>
 
         <div className="flex items-center gap-2 bg-theme-muted p-1 rounded-2xl border border-theme-card">
@@ -257,7 +260,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
               activeTab === "mundo" ? "bg-theme-card text-indigo-600 shadow-theme-shadow" : "text-theme-secondary hover:text-theme-primary"
             )}
           >
-            <Globe2 className="w-3.5 h-3.5" /> Mundo
+            <Globe2 className="w-3.5 h-3.5" /> {t("manage.tab.world")}
           </button>
         </div>
       </div>
@@ -267,7 +270,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
           {serverStatus === "online" && (
             <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-              Alterações em {itemsLabel.toLowerCase()} só têm efeito após reiniciar o servidor.
+              {t("manage.restartNote", { items: itemsLabel.toLowerCase() })}
             </div>
           )}
 
@@ -277,7 +280,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                 <button
                   type="button"
                   onClick={toggleSelectAllMods}
-                  title={allModsSelected ? "Desmarcar todos" : "Selecionar todos"}
+                  title={allModsSelected ? t("manage.deselectAll") : t("manage.selectAll")}
                   className="h-9 w-9 flex items-center justify-center bg-theme-muted hover:bg-theme-card border border-theme-card rounded-xl text-indigo-600 transition-colors cursor-pointer"
                 >
                   {allModsSelected ? <CheckSquare className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5" />}
@@ -285,7 +288,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                 <button
                   type="button"
                   onClick={() => setPendingAction({ kind: "delete-mods-bulk", fileNames: Array.from(selectedMods) })}
-                  title={`Excluir ${itemsLabel.toLowerCase()} selecionados`}
+                  title={t("manage.deleteSelected", { items: itemsLabel.toLowerCase() })}
                   className="h-9 w-9 flex items-center justify-center bg-rose-50 dark:bg-rose-900/20 hover:bg-rose-100 dark:hover:bg-rose-900/30 border border-theme-card rounded-xl text-rose-500 transition-colors cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
@@ -296,24 +299,24 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
               type="button"
               onClick={() => setShowModBrowser(true)}
               disabled={!modBrowserAvailable}
-              title={modBrowserAvailable ? undefined : "Versão do Minecraft deste servidor não foi detectada — não é possível buscar itens compatíveis."}
+              title={modBrowserAvailable ? undefined : t("manage.browseUnavailable")}
               className="h-9 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              <PackagePlus className="w-3.5 h-3.5" /> Buscar {itemsLabel} Online
+              <PackagePlus className="w-3.5 h-3.5" /> {t("manage.browse", { items: itemsLabel })}
             </button>
             <button
               type="button"
               onClick={handleOpenModsFolder}
               className="h-9 px-4 bg-theme-muted hover:bg-theme-card border border-theme-card rounded-xl text-xs font-bold text-theme-secondary hover:text-indigo-600 flex items-center gap-1.5 transition-colors cursor-pointer"
             >
-              <FolderOpen className="w-3.5 h-3.5" /> Abrir Pasta de {itemsLabel}
+              <FolderOpen className="w-3.5 h-3.5" /> {t("manage.openFolder", { items: itemsLabel })}
             </button>
             <button
               type="button"
               onClick={loadMods}
               disabled={loadingMods}
               className="h-9 w-9 flex items-center justify-center bg-theme-muted hover:bg-theme-card border border-theme-card rounded-xl text-theme-secondary hover:text-indigo-600 transition-colors cursor-pointer disabled:opacity-50"
-              title="Atualizar lista"
+              title={t("manage.refresh")}
             >
               <RefreshCw className={cn("w-3.5 h-3.5", loadingMods && "animate-spin")} />
             </button>
@@ -324,7 +327,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
               {loadingMods ? (
                 <Loader2 className="w-5 h-5 animate-spin mx-auto" />
               ) : (
-                <>Nenhum {isPluginBased ? "plugin" : "mod"} instalado. Adicione arquivos .jar na pasta de {itemsFolder} do servidor.</>
+                <>{t("manage.empty", { item: itemWord, folder: itemsFolder })}</>
               )}
             </div>
           ) : (
@@ -340,7 +343,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                       checked={selectedMods.has(mod.file_name)}
                       onChange={() => toggleModSelection(mod.file_name)}
                       className="w-4 h-4 rounded accent-indigo-600 cursor-pointer flex-shrink-0"
-                      title="Selecionar mod"
+                      title={t("manage.selectMod")}
                     />
                     <div className="min-w-0">
                       <p className={cn("text-sm font-semibold truncate", mod.enabled ? "text-theme-primary" : "text-theme-secondary line-through")}>
@@ -355,7 +358,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                       role="switch"
                       aria-checked={mod.enabled}
                       onClick={() => handleToggleMod(mod)}
-                      title={mod.enabled ? `Desabilitar ${isPluginBased ? "plugin" : "mod"}` : `Habilitar ${isPluginBased ? "plugin" : "mod"}`}
+                      title={mod.enabled ? t("manage.disable", { item: itemWord }) : t("manage.enable", { item: itemWord })}
                       className={cn(
                         "relative h-6 w-11 rounded-full transition-colors cursor-pointer flex-shrink-0",
                         mod.enabled ? "bg-emerald-500" : "bg-slate-300 dark:bg-slate-600"
@@ -371,7 +374,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                     <button
                       type="button"
                       onClick={() => setPendingAction({ kind: "delete-mod", fileName: mod.file_name, displayName: mod.display_name })}
-                      title={`Excluir ${isPluginBased ? "plugin" : "mod"}`}
+                      title={t("manage.delete", { item: itemWord })}
                       className="h-8 w-8 flex items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 transition-colors cursor-pointer"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -389,7 +392,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
           {!isServerStopped && (
             <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-              Pare o servidor para gerenciar backups do mundo.
+              {t("manage.stopForBackups")}
             </div>
           )}
           {error && (
@@ -406,7 +409,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
               className="h-10 px-5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition-all active:scale-95 disabled:opacity-40 cursor-pointer shadow-md shadow-theme-shadow"
             >
               {isBackingUp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-              {isBackingUp ? "Gerando backup..." : "Fazer Backup Agora"}
+              {isBackingUp ? t("manage.backingUp") : t("manage.backupNow")}
             </button>
             <button
               type="button"
@@ -414,21 +417,21 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
               disabled={!isServerStopped}
               className="h-10 px-5 bg-rose-50 dark:bg-rose-900/20 hover:bg-rose-100 dark:hover:bg-rose-900/30 text-rose-600 dark:text-rose-300 rounded-xl text-xs font-bold flex items-center gap-2 transition-all active:scale-95 disabled:opacity-40 cursor-pointer"
             >
-              <RotateCcw className="w-3.5 h-3.5" /> Resetar Mundo
+              <RotateCcw className="w-3.5 h-3.5" /> {t("manage.resetWorld")}
             </button>
           </div>
 
           <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-bold text-theme-secondary uppercase tracking-wide flex items-center gap-1.5">
-                <Archive className="w-3.5 h-3.5" /> Backups
+                <Archive className="w-3.5 h-3.5" /> {t("manage.backups")}
               </h3>
               <button
                 type="button"
                 onClick={loadBackups}
                 disabled={loadingBackups}
                 className="h-7 w-7 flex items-center justify-center rounded-lg text-theme-secondary hover:text-indigo-600 hover:bg-theme-muted transition-colors cursor-pointer disabled:opacity-50"
-                title="Atualizar lista"
+                title={t("manage.refresh")}
               >
                 <RefreshCw className={cn("w-3.5 h-3.5", loadingBackups && "animate-spin")} />
               </button>
@@ -436,7 +439,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
 
             {backups.length === 0 ? (
               <div className="text-center py-8 text-theme-secondary text-sm">
-                {loadingBackups ? <Loader2 className="w-5 h-5 animate-spin mx-auto" /> : <>Nenhum backup gerado ainda.</>}
+                {loadingBackups ? <Loader2 className="w-5 h-5 animate-spin mx-auto" /> : <>{t("manage.noBackups")}</>}
               </div>
             ) : (
               <div className="space-y-2 max-h-72 overflow-y-auto pr-1 custom-scrollbar">
@@ -456,7 +459,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                         type="button"
                         onClick={() => setPendingAction({ kind: "restore-backup", fileName: backup.file_name })}
                         disabled={!isServerStopped}
-                        title="Restaurar backup"
+                        title={t("manage.restoreBackup")}
                         className="h-8 w-8 flex items-center justify-center rounded-lg text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-colors cursor-pointer disabled:opacity-40"
                       >
                         <RotateCcw className="w-4 h-4" />
@@ -464,7 +467,7 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
                       <button
                         type="button"
                         onClick={() => setPendingAction({ kind: "delete-backup", fileName: backup.file_name })}
-                        title="Excluir backup"
+                        title={t("manage.deleteBackup")}
                         className="h-8 w-8 flex items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 transition-colors cursor-pointer"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -484,34 +487,34 @@ export function ServerManagePanel({ serverDir, serverType, serverStatus, mcVersi
         onConfirm={handleConfirmAction}
         title={
           pendingAction?.kind === "delete-mod" || pendingAction?.kind === "delete-mods-bulk"
-            ? `Excluir ${isPluginBased ? "Plugin(s)" : "Mod(s)"}`
+            ? t("manage.confirm.deleteItem.title", { item: isPluginBased ? "Plugin" : "Mod" })
             : pendingAction?.kind === "delete-backup"
-            ? "Excluir Backup"
+            ? t("manage.confirm.deleteBackup.title")
             : pendingAction?.kind === "restore-backup"
-            ? "Restaurar Backup"
-            : "Resetar Mundo"
+            ? t("manage.confirm.restore.title")
+            : t("manage.confirm.reset.title")
         }
         confirmLabel={
           pendingAction?.kind === "delete-mod" || pendingAction?.kind === "delete-mods-bulk" || pendingAction?.kind === "delete-backup"
-            ? "Excluir"
+            ? t("manage.confirm.delete")
             : pendingAction?.kind === "restore-backup"
-            ? "Restaurar"
-            : "Resetar"
+            ? t("manage.confirm.restore")
+            : t("manage.confirm.reset")
         }
         requireTypedConfirmation={
-          pendingAction?.kind === "restore-backup" ? "RESTAURAR" : pendingAction?.kind === "reset-world" ? "RESETAR" : undefined
+          pendingAction?.kind === "restore-backup" ? t("manage.confirm.typed.restore") : pendingAction?.kind === "reset-world" ? t("manage.confirm.typed.reset") : undefined
         }
         message={
           pendingAction?.kind === "delete-mod" ? (
-            <>Tem certeza que deseja excluir o {isPluginBased ? "plugin" : "mod"} <strong className="text-theme-primary">{`"${pendingAction.displayName}"`}</strong>?</>
+            <>{rich("manage.confirm.deleteMod.msg", { item: itemWord, name: <strong className="text-theme-primary">{`"${pendingAction.displayName}"`}</strong> })}</>
           ) : pendingAction?.kind === "delete-mods-bulk" ? (
-            <>Tem certeza que deseja excluir <strong className="text-theme-primary">{pendingAction.fileNames.length} {isPluginBased ? "plugin(s)" : "mod(s)"}</strong> selecionado(s)?</>
+            <>{rich("manage.confirm.bulk.msg", { what: <strong className="text-theme-primary">{t("manage.confirm.bulk.what", { count: pendingAction.fileNames.length, item: itemWord })}</strong> })}</>
           ) : pendingAction?.kind === "delete-backup" ? (
-            <>Tem certeza que deseja excluir o backup <strong className="text-theme-primary">{`"${pendingAction.fileName}"`}</strong>? Esta ação não pode ser desfeita.</>
+            <>{rich("manage.confirm.deleteBackup.msg", { name: <strong className="text-theme-primary">{`"${pendingAction.fileName}"`}</strong> })}</>
           ) : pendingAction?.kind === "restore-backup" ? (
-            <>Isso vai <strong className="text-theme-primary">substituir o mundo atual</strong> pelo conteúdo do backup selecionado. O progresso atual do mundo será perdido. Esta ação não pode ser desfeita.</>
+            <>{rich("manage.confirm.restore.msg", { emph: <strong className="text-theme-primary">{t("manage.confirm.restore.emph")}</strong> })}</>
           ) : (
-            <>Isso vai <strong className="text-theme-primary">apagar o mundo atual</strong> permanentemente. O Minecraft vai gerar um mundo novo na próxima vez que o servidor iniciar. Esta ação não pode ser desfeita.</>
+            <>{rich("manage.confirm.reset.msg", { emph: <strong className="text-theme-primary">{t("manage.confirm.reset.emph")}</strong> })}</>
           )
         }
       />

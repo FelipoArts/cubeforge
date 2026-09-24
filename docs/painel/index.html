@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-BR" data-i18n="runtime">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -12,6 +12,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/assets/style.css" />
+  <script src="/assets/i18n/en.js"></script>
+  <script src="/assets/i18n.js"></script>
   <style>
     /* Só o que é específico desta página — o resto vem de assets/style.css. */
     [hidden] { display: none !important; }
@@ -138,6 +140,7 @@
   </style>
 </head>
 <body>
+  <div class="lang-switch" data-lang-switch style="position:fixed;top:14px;right:14px;z-index:30;"></div>
   <div class="ambient-glow"></div>
 
   <nav class="nav">
@@ -376,7 +379,7 @@
       if (!session?.access_token) { showStep("login"); throw new Error("sem sessão"); }
       const resp = await fetch(`${API_BASE}/api/v1/panel${path}`, {
         method,
-        headers: { Authorization: `Bearer ${session.access_token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+        headers: { Authorization: `Bearer ${session.access_token}`, "Accept-Language": i18n.lang, ...(body ? { "Content-Type": "application/json" } : {}) },
         body: body ? JSON.stringify(body) : undefined,
       });
       const json = await resp.json().catch(() => null);
@@ -386,22 +389,22 @@
     // ---- Permissões: presets, resumo e editor ----
 
     const PRESETS = {
-      viewer: { label: "Visualizador", desc: "só acompanha status e console", perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "none", allowlist: [] } } },
-      operator: { label: "Operador", desc: "liga, desliga e reinicia", perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "none", allowlist: [] } } },
-      moderator: { label: "Moderador", desc: "console + say, kick e whitelist", perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "allowlist", allowlist: ["say", "kick", "whitelist"] } } },
-      admin: { label: "Administrador", desc: "tudo, inclusive comandos livres", perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "all", allowlist: [] } } },
+      viewer: { label: i18n.t("Visualizador"), desc: i18n.t("só acompanha status e console"), perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "none", allowlist: [] } } },
+      operator: { label: i18n.t("Operador"), desc: i18n.t("liga, desliga e reinicia"), perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "none", allowlist: [] } } },
+      moderator: { label: i18n.t("Moderador"), desc: i18n.t("console + say, kick e whitelist"), perms: { viewConsole: true, start: false, stop: false, restart: false, commands: { mode: "allowlist", allowlist: ["say", "kick", "whitelist"] } } },
+      admin: { label: i18n.t("Administrador"), desc: i18n.t("tudo, inclusive comandos livres"), perms: { viewConsole: true, start: true, stop: true, restart: true, commands: { mode: "all", allowlist: [] } } },
     };
 
     function summarizePermissions(p) {
-      if (!p) return "Permissões inválidas";
+      if (!p) return i18n.t("Permissões inválidas");
       const out = [];
-      if (p.viewConsole) out.push("Ver console");
-      if (p.start) out.push("Ligar");
-      if (p.stop) out.push("Desligar");
-      if (p.restart) out.push("Reiniciar");
-      if (p.commands.mode === "all") out.push("Todos os comandos");
-      else if (p.commands.mode === "allowlist") out.push(`Comandos: ${p.commands.allowlist.join(", ")}`);
-      return out.length ? out.join(" · ") : "Só vê o status";
+      if (p.viewConsole) out.push(i18n.t("Ver console"));
+      if (p.start) out.push(i18n.t("Ligar"));
+      if (p.stop) out.push(i18n.t("Desligar"));
+      if (p.restart) out.push(i18n.t("Reiniciar"));
+      if (p.commands.mode === "all") out.push(i18n.t("Todos os comandos"));
+      else if (p.commands.mode === "allowlist") out.push(i18n.t("Comandos: {list}", { list: p.commands.allowlist.join(", ") }));
+      return out.length ? out.join(" · ") : i18n.t("Só vê o status");
     }
 
     function normalizeEntry(s) {
@@ -492,7 +495,7 @@
       submitBtn.disabled = true;
       const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
       submitBtn.disabled = false;
-      showStatus(error ? `Não foi possível enviar o link: ${error.message}` : "Link enviado! Confira seu e-mail.", !!error);
+      showStatus(error ? i18n.t("Não foi possível enviar o link: {error}", { error: error.message }) : i18n.t("Link enviado! Confira seu e-mail."), !!error);
     });
     el("btn-logout").addEventListener("click", async () => {
       closeSocket();
@@ -528,17 +531,17 @@
       try { r = await api(`/invites/preview?token=${encodeURIComponent(token)}`); } catch { return; }
       if (!r.ok) {
         clearInvite();
-        await loadDevices(r.message || "Não foi possível abrir este convite.", true);
+        await loadDevices(r.message || i18n.t("Não foi possível abrir este convite."), true);
         return;
       }
       const info = r.data;
       if (info.isOwner || info.alreadyMember) {
         clearInvite();
-        await loadDevices(info.isOwner ? "Esse convite é para um computador que já é seu." : "Você já tem acesso a este computador.");
+        await loadDevices(info.isOwner ? i18n.t("Esse convite é para um computador que já é seu.") : i18n.t("Você já tem acesso a este computador."));
         return;
       }
-      el("invite-title").innerHTML = `<strong>${escapeHtml(info.ownerLabel)}</strong> quer compartilhar o computador <strong>${escapeHtml(info.deviceName)}</strong> com você.`;
-      el("invite-perms").textContent = `Você poderá: ${summarizePermissions(info.permissions)}`;
+      el("invite-title").innerHTML = i18n.t("{owner} quer compartilhar o computador {device} com você.", { owner: `<strong>${escapeHtml(info.ownerLabel)}</strong>`, device: `<strong>${escapeHtml(info.deviceName)}</strong>` });
+      el("invite-perms").textContent = i18n.t("Você poderá: {perms}", { perms: summarizePermissions(info.permissions) });
       showStep("invite");
       el("btn-invite-accept").onclick = async () => {
         el("btn-invite-accept").disabled = true;
@@ -546,7 +549,7 @@
         try { res = await api("/invites/accept", { method: "POST", body: { token } }); } catch { el("btn-invite-accept").disabled = false; return; }
         el("btn-invite-accept").disabled = false;
         clearInvite();
-        await loadDevices(res.ok ? `Convite aceito! "${res.data?.deviceName ?? "O computador"}" já aparece na sua lista.` : (res.message || "Não foi possível aceitar o convite."), !res.ok);
+        await loadDevices(res.ok ? i18n.t("Convite aceito! \"{name}\" já aparece na sua lista.", { name: res.data?.deviceName ?? i18n.t("O computador") }) : (res.message || i18n.t("Não foi possível aceitar o convite.")), !res.ok);
       };
       el("btn-invite-decline").onclick = async () => { clearInvite(); await loadDevices(); };
     }
@@ -576,7 +579,7 @@
       if (!r.ok) {
         noticeEl.hidden = false;
         noticeEl.classList.add("is-error");
-        noticeEl.textContent = r.message || "Não foi possível carregar seus computadores.";
+        noticeEl.textContent = r.message || i18n.t("Não foi possível carregar seus computadores.");
         return;
       }
       const { owned = [], shared = [], pendingInvites = [] } = r.data;
@@ -592,17 +595,17 @@
         sections.appendChild(list);
         return list;
       };
-      const seenText = (d) => d.lastSeenAt ? `Visto por último em ${new Date(d.lastSeenAt).toLocaleString("pt-BR")}` : "Nunca conectou ainda";
+      const seenText = (d) => d.lastSeenAt ? i18n.t("Visto por último em {date}", { date: new Date(d.lastSeenAt).toLocaleString(i18n.locale()) }) : i18n.t("Nunca conectou ainda");
 
       if (pendingInvites.length) {
-        const list = addSection("Convites para você");
+        const list = addSection(i18n.t("Convites para você"));
         for (const inv of pendingInvites) {
           const row = document.createElement("div");
           row.className = "device-item is-static";
           row.innerHTML = `
             <div>
               <div class="name">${escapeHtml(inv.deviceName)}</div>
-              <div class="seen">Convite de ${escapeHtml(inv.invitedBy)}</div>
+              <div class="seen">${escapeHtml(i18n.t("Convite de {who}", { who: inv.invitedBy }))}</div>
               <div class="perms">${escapeHtml(summarizePermissions(inv.permissions))}</div>
             </div>
             <div class="row-actions">
@@ -612,7 +615,7 @@
           row.querySelector('[data-act="accept"]').addEventListener("click", async (e) => {
             e.target.disabled = true;
             const res = await api("/invites/accept", { method: "POST", body: { inviteId: inv.id } }).catch(() => null);
-            await loadDevices(res?.ok ? "Convite aceito!" : (res?.message || "Não foi possível aceitar o convite."), !res?.ok);
+            await loadDevices(res?.ok ? i18n.t("Convite aceito!") : (res?.message || i18n.t("Não foi possível aceitar o convite.")), !res?.ok);
           });
           row.querySelector('[data-act="decline"]').addEventListener("click", async (e) => {
             e.target.disabled = true;
@@ -624,7 +627,7 @@
       }
 
       if (owned.length) {
-        const list = addSection("Meus computadores");
+        const list = addSection(i18n.t("Meus computadores"));
         for (const d of owned) {
           const row = document.createElement("div");
           row.className = "device-item";
@@ -635,24 +638,24 @@
       }
 
       if (shared.length) {
-        const list = addSection("Compartilhados comigo");
+        const list = addSection(i18n.t("Compartilhados comigo"));
         for (const d of shared) {
           const row = document.createElement("div");
           row.className = "device-item";
           row.innerHTML = `
             <div>
               <div class="name">${escapeHtml(d.deviceName)}</div>
-              <div class="seen">De ${escapeHtml(d.ownerLabel)} · ${seenText(d)}</div>
+              <div class="seen">${escapeHtml(i18n.t("De {owner} · {seen}", { owner: d.ownerLabel, seen: seenText(d) }))}</div>
               <div class="perms">${escapeHtml(summarizePermissions(d.permissions))}</div>
             </div>
             <div class="row-actions"><button type="button" class="link-btn" data-act="leave">Sair</button><span>›</span></div>`;
           row.addEventListener("click", () => openDevice({ id: d.id, deviceName: d.deviceName, isOwner: false }));
           row.querySelector('[data-act="leave"]').addEventListener("click", async (e) => {
             e.stopPropagation();
-            if (!confirm(`Deixar de ter acesso a "${d.deviceName}"? Para voltar, será preciso um novo convite.`)) return;
+            if (!confirm(i18n.t("Deixar de ter acesso a \"{name}\"? Para voltar, será preciso um novo convite.", { name: d.deviceName }))) return;
             const { data: { session } } = await supabase.auth.getSession();
             const res = await api(`/devices/${d.id}/members/${session.user.id}`, { method: "DELETE" }).catch(() => null);
-            await loadDevices(res?.ok ? "Você saiu deste computador." : (res?.message || "Não foi possível sair."), !res?.ok);
+            await loadDevices(res?.ok ? i18n.t("Você saiu deste computador.") : (res?.message || i18n.t("Não foi possível sair.")), !res?.ok);
           });
           list.appendChild(row);
         }
@@ -741,7 +744,7 @@
       el("console-command-form").hidden = mode === "none";
       const hint = el("console-hint");
       if (mode === "allowlist") {
-        hint.textContent = `Comandos liberados para você: ${p.commands.allowlist.join(", ")}`;
+        hint.textContent = i18n.t("Comandos liberados para você: {list}", { list: p.commands.allowlist.join(", ") });
         hint.hidden = false;
       } else {
         hint.hidden = true;
@@ -753,7 +756,7 @@
 
     function sendToAgent(payload) {
       if (!socket || socket.readyState !== WebSocket.OPEN) {
-        alert("Sem conexão com o computador agora. Tente de novo em alguns instantes.");
+        alert(i18n.t("Sem conexão com o computador agora. Tente de novo em alguns instantes."));
         return;
       }
       socket.send(JSON.stringify(payload));
@@ -782,14 +785,14 @@
       const { action, serverId } = btn.dataset;
 
       if (action === "stop") {
-        if (!confirm("Isso vai parar o servidor agora (comando de stop). Continuar?")) return;
+        if (!confirm(i18n.t("Isso vai parar o servidor agora (comando de stop). Continuar?"))) return;
         sendToAgent({ type: "stop_server" });
       } else if (action === "restart") {
-        if (!confirm("Isso vai reiniciar o servidor — jogadores conectados serão desconectados. Continuar?")) return;
+        if (!confirm(i18n.t("Isso vai reiniciar o servidor — jogadores conectados serão desconectados. Continuar?"))) return;
         sendToAgent({ type: "restart_server", serverId });
       } else if (action === "start") {
         const stopFirst = btn.dataset.stopFirst === "true";
-        if (stopFirst && !confirm("Outro servidor está rodando agora. Isso vai pará-lo para iniciar este. Continuar?")) return;
+        if (stopFirst && !confirm(i18n.t("Outro servidor está rodando agora. Isso vai pará-lo para iniciar este. Continuar?"))) return;
         requestStartServer(serverId, { stopFirst });
       }
     });
@@ -800,7 +803,7 @@
       const raw = input.value.trim();
       if (!raw) return;
       if (raw.replace(/^\//, "").toLowerCase() === "stop") {
-        if (!confirm('Isso vai parar o servidor (comando "stop"). Continuar?')) return;
+        if (!confirm(i18n.t("Isso vai parar o servidor (comando \"stop\"). Continuar?"))) return;
       }
       sendToAgent({ type: "command", command: raw });
       input.value = "";
@@ -809,7 +812,7 @@
     function setAgentStatus(connected) {
       const pill = el("agent-status");
       pill.classList.toggle("is-offline", !connected);
-      el("agent-status-text").textContent = connected ? "Computador conectado" : "Computador desconectado";
+      el("agent-status-text").textContent = connected ? i18n.t("Computador conectado") : i18n.t("Computador desconectado");
       if (!connected) {
         el("stat-server-status").textContent = "—";
         el("stat-players").textContent = "—";
@@ -833,7 +836,7 @@
       try {
         const resp = await fetch(`${API_BASE}/api/v1/panel/ws-ticket`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+          headers: { "Content-Type": "application/json", "Accept-Language": i18n.lang, Authorization: `Bearer ${session.access_token}` },
           body: JSON.stringify({ deviceId: currentDevice.id }),
         });
         const json = await resp.json().catch(() => null);
@@ -842,7 +845,7 @@
           // backoff não adianta, volta pra lista com o motivo. Só falha de
           // rede/servidor (5xx, 429) continua tentando sozinha.
           if ([401, 402, 403, 404].includes(resp.status)) {
-            await leaveDeviceWithMessage(json?.message || "Não foi possível acessar este computador.");
+            await leaveDeviceWithMessage(json?.message || i18n.t("Não foi possível acessar este computador."));
             return;
           }
           throw new Error(json?.message || `HTTP ${resp.status}`);
@@ -860,12 +863,12 @@
         setAgentStatus(false);
         if (manuallyClosed) return;
         if (event.code === 4001 && event.reason === "access-removed") {
-          leaveDeviceWithMessage("Seu acesso a este computador foi removido.");
+          leaveDeviceWithMessage(i18n.t("Seu acesso a este computador foi removido."));
           return;
         }
         if (event.code === 4001) {
           // Permissões alteradas pelo dono: reconecta na hora com as novas.
-          showToast("Suas permissões neste computador foram atualizadas.");
+          showToast(i18n.t("Suas permissões neste computador foram atualizadas."));
           reconnectAttempt = 0;
           connect();
           return;
@@ -888,7 +891,7 @@
       container.innerHTML = "";
       empty.hidden = lastServers.length > 0;
       const anyRunning = lastServers.some((s) => s.status === "running");
-      const noPerm = 'disabled title="Você não tem permissão para isso"';
+      const noPerm = `disabled title="${escapeHtml(i18n.t("Você não tem permissão para isso"))}"`;
       for (const s of lastServers) {
         const row = document.createElement("div");
         row.className = "panel-server-row";
@@ -929,7 +932,7 @@
 
       if (msg.type === "status") {
         setAgentStatus(true);
-        el("stat-server-status").textContent = msg.serverRunning ? "Rodando" : "Parado";
+        el("stat-server-status").textContent = msg.serverRunning ? i18n.t("Rodando") : i18n.t("Parado");
         el("stat-players").textContent = `${msg.playerCount ?? 0}/${msg.maxPlayers ?? 20}`;
         el("stat-server-name").textContent = msg.serverName || "—";
         lastServerRunning = !!msg.serverRunning;
@@ -961,8 +964,9 @@
       if (msg.type === "error") {
         // Também vira aviso solto: quem não pode ver o console não veria
         // o motivo de uma ação negada só na linha do console.
-        appendConsoleLine(`⚠ ${msg.message}`, { isError: true });
-        showToast(msg.message, true);
+        const shown = i18n.t(msg.message);
+        appendConsoleLine(`⚠ ${shown}`, { isError: true });
+        showToast(shown, true);
         return;
       }
 
@@ -982,8 +986,8 @@
     }
 
     async function copyText(text) {
-      try { await navigator.clipboard.writeText(text); showToast("Copiado!"); }
-      catch { window.prompt("Copie o link:", text); }
+      try { await navigator.clipboard.writeText(text); showToast(i18n.t("Copiado!")); }
+      catch { window.prompt(i18n.t("Copie o link:"), text); }
     }
 
     function inviteUrl(token) {
@@ -995,7 +999,7 @@
       for (const b of el("invite-kind").querySelectorAll("button")) b.classList.toggle("is-active", b.dataset.kind === kind);
       el("invite-email-fields").hidden = kind !== "email";
       el("invite-link-fields").hidden = kind !== "link";
-      el("btn-send-invite").textContent = kind === "email" ? "Enviar convite" : "Gerar link";
+      el("btn-send-invite").textContent = kind === "email" ? i18n.t("Enviar convite") : i18n.t("Gerar link");
     }
 
     el("invite-kind").addEventListener("click", (e) => {
@@ -1027,13 +1031,13 @@
     el("btn-send-invite").addEventListener("click", async () => {
       const permissions = inviteEditor.get();
       if (permissions.commands.mode === "allowlist" && permissions.commands.allowlist.length === 0) {
-        showShareResult("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\".", true);
+        showShareResult(escapeHtml(i18n.t("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\".")), true);
         return;
       }
       const body = { kind: inviteKind, permissions };
       if (inviteKind === "email") {
         body.email = el("invite-email").value.trim();
-        if (!body.email) { showShareResult("Informe o e-mail da conta.", true); return; }
+        if (!body.email) { showShareResult(escapeHtml(i18n.t("Informe o e-mail da conta.")), true); return; }
       } else {
         body.singleUse = el("invite-single-use").checked;
         body.expiresInHours = Number(el("invite-expiry").value);
@@ -1043,16 +1047,16 @@
       btn.disabled = true;
       let r;
       try { r = await api(`/devices/${currentDevice.id}/invites`, { method: "POST", body }); }
-      catch { r = { ok: false, message: "Sem conexão. Tente de novo." }; }
+      catch { r = { ok: false, message: i18n.t("Sem conexão. Tente de novo.") }; }
       btn.disabled = false;
 
-      if (!r.ok) { showShareResult(escapeHtml(r.message || "Não foi possível criar o convite."), true); return; }
+      if (!r.ok) { showShareResult(escapeHtml(r.message || i18n.t("Não foi possível criar o convite.")), true); return; }
       if (inviteKind === "email") {
         el("invite-email").value = "";
         showShareResult(escapeHtml(r.message));
       } else {
         const url = inviteUrl(r.data.token);
-        const box = showShareResult("Link criado. Envie para quem você quer convidar:");
+        const box = showShareResult(escapeHtml(i18n.t("Link criado. Envie para quem você quer convidar:")));
         const wrap = document.createElement("div");
         wrap.className = "link-box";
         wrap.innerHTML = `<input type="text" class="login-input" readonly value="${escapeHtml(url)}" /><button type="button" class="btn-mini">Copiar</button>`;
@@ -1069,20 +1073,20 @@
       let r;
       try { r = await api(`/devices/${currentDevice.id}/members`); } catch { return; }
       if (!r.ok) {
-        membersBox.innerHTML = `<p class="panel-empty-note">${escapeHtml(r.message || "Não foi possível carregar.")}</p>`;
+        membersBox.innerHTML = `<p class="panel-empty-note">${escapeHtml(r.message || i18n.t("Não foi possível carregar."))}</p>`;
         invitesBox.innerHTML = "";
         return;
       }
       const { members = [], invites = [] } = r.data;
 
       membersBox.innerHTML = "";
-      if (members.length === 0) membersBox.innerHTML = '<p class="panel-empty-note">Ninguém além de você tem acesso ainda.</p>';
+      if (members.length === 0) membersBox.innerHTML = `<p class="panel-empty-note">${escapeHtml(i18n.t("Ninguém além de você tem acesso ainda."))}</p>`;
       for (const m of members) {
         const row = document.createElement("div");
         row.className = "share-row";
         row.innerHTML = `
           <div class="top">
-            <div class="who">${escapeHtml(m.name || m.email || "Conta")}${m.name && m.email ? `<small>${escapeHtml(m.email)}</small>` : ""}</div>
+            <div class="who">${escapeHtml(m.name || m.email || i18n.t("Conta"))}${m.name && m.email ? `<small>${escapeHtml(m.email)}</small>` : ""}</div>
             <div style="display:flex;gap:8px;">
               <button type="button" class="btn-mini" data-act="edit">Editar permissões</button>
               <button type="button" class="btn-mini btn-mini-danger" data-act="remove">Remover</button>
@@ -1101,42 +1105,42 @@
           save.type = "button";
           save.className = "btn btn-primary";
           save.style.marginTop = "14px";
-          save.textContent = "Salvar permissões";
+          save.textContent = i18n.t("Salvar permissões");
           save.addEventListener("click", async () => {
             const perms = editor.get();
             if (perms.commands.mode === "allowlist" && perms.commands.allowlist.length === 0) {
-              showToast("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\".", true);
+              showToast(i18n.t("Informe ao menos um comando na lista, ou escolha \"Nenhum\"/\"Todos\"."), true);
               return;
             }
             save.disabled = true;
             const res = await api(`/devices/${currentDevice.id}/members/${m.userId}`, { method: "PATCH", body: { permissions: perms } }).catch(() => null);
             save.disabled = false;
-            if (res?.ok) { showToast("Permissões atualizadas."); await refreshShareLists(); }
-            else showToast(res?.message || "Não foi possível salvar.", true);
+            if (res?.ok) { showToast(i18n.t("Permissões atualizadas.")); await refreshShareLists(); }
+            else showToast(res?.message || i18n.t("Não foi possível salvar."), true);
           });
           slot.appendChild(save);
           slot.hidden = false;
         });
         row.querySelector('[data-act="remove"]').addEventListener("click", async () => {
-          if (!confirm(`Remover o acesso de ${m.name || m.email || "esta conta"}? A pessoa será desconectada agora.`)) return;
+          if (!confirm(i18n.t("Remover o acesso de {who}? A pessoa será desconectada agora.", { who: m.name || m.email || i18n.t("esta conta") }))) return;
           const res = await api(`/devices/${currentDevice.id}/members/${m.userId}`, { method: "DELETE" }).catch(() => null);
-          if (res?.ok) { showToast("Acesso removido."); await refreshShareLists(); }
-          else showToast(res?.message || "Não foi possível remover.", true);
+          if (res?.ok) { showToast(i18n.t("Acesso removido.")); await refreshShareLists(); }
+          else showToast(res?.message || i18n.t("Não foi possível remover."), true);
         });
         membersBox.appendChild(row);
       }
 
       invitesBox.innerHTML = "";
-      if (invites.length === 0) invitesBox.innerHTML = '<p class="panel-empty-note">Nenhum convite pendente.</p>';
+      if (invites.length === 0) invitesBox.innerHTML = `<p class="panel-empty-note">${escapeHtml(i18n.t("Nenhum convite pendente."))}</p>`;
       for (const inv of invites) {
         const row = document.createElement("div");
         row.className = "share-row";
         const title = inv.kind === "email"
-          ? `Por e-mail: ${escapeHtml(inv.target ?? "")}`
-          : `Link (${inv.singleUse ? "uso único" : `${inv.uses} uso(s)`})`;
+          ? i18n.t("Por e-mail: {target}", { target: escapeHtml(inv.target ?? "") })
+          : i18n.t("Link ({kind})", { kind: inv.singleUse ? i18n.t("uso único") : i18n.t("{uses} uso(s)", { uses: inv.uses }) });
         row.innerHTML = `
           <div class="top">
-            <div class="who">${title}<small>Vale até ${escapeHtml(new Date(inv.expiresAt).toLocaleString("pt-BR"))}</small></div>
+            <div class="who">${title}<small>${escapeHtml(i18n.t("Vale até {date}", { date: new Date(inv.expiresAt).toLocaleString(i18n.locale()) }))}</small></div>
             <div style="display:flex;gap:8px;">
               ${inv.kind === "link" ? '<button type="button" class="btn-mini" data-act="copy">Copiar link</button>' : ""}
               <button type="button" class="btn-mini btn-mini-danger" data-act="revoke">Cancelar</button>
@@ -1148,7 +1152,7 @@
         row.querySelector('[data-act="revoke"]').addEventListener("click", async () => {
           const res = await api(`/devices/${currentDevice.id}/invites/${inv.id}`, { method: "DELETE" }).catch(() => null);
           if (res?.ok) await refreshShareLists();
-          else showToast(res?.message || "Não foi possível cancelar.", true);
+          else showToast(res?.message || i18n.t("Não foi possível cancelar."), true);
         });
         invitesBox.appendChild(row);
       }
@@ -1161,7 +1165,7 @@
       if (data.session) afterLogin();
       else {
         showStep("login");
-        if (initialInvite || pendingInviteToken()) showStatus("Você recebeu um convite para acessar um computador. Faça login para aceitá-lo.");
+        if (initialInvite || pendingInviteToken()) showStatus(i18n.t("Você recebeu um convite para acessar um computador. Faça login para aceitá-lo."));
       }
     });
     supabase.auth.onAuthStateChange((event, session) => {

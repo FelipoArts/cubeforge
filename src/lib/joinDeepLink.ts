@@ -31,6 +31,7 @@
 import { onOpenUrl, getCurrent } from "@tauri-apps/plugin-deep-link";
 import { useAppStore } from "@/app/store";
 import { pushDiagnostic } from "@/app/diagnostics";
+import { t } from "@/i18n";
 
 const JOIN_PREFIX = "cubicase://join/";
 
@@ -55,18 +56,18 @@ function handleJoinUrl(url: string): void {
     // isso não deveria acontecer, então vale avisar.
     pushDiagnostic({
       level: "warning",
-      source: "Convite",
-      title: "Link de convite não reconhecido",
-      message: "Recebemos um link, mas não conseguimos entender o convite.",
+      source: t("diag.source.invite"),
+      title: t("deeplink.unrecognized.title"),
+      message: t("deeplink.unrecognized.message"),
       detail: url,
     });
     return;
   }
   pushDiagnostic({
     level: "info",
-    source: "Convite",
-    title: "Convite recebido",
-    message: `Abrindo a biblioteca de convidado para o servidor CF-${code}...`,
+    source: t("diag.source.invite"),
+    title: t("deeplink.received.title"),
+    message: t("deeplink.received.message", { code }),
   });
   useAppStore.getState().setMode("guest");
   useAppStore.getState().setPendingJoinShortCode(code);

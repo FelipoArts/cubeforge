@@ -4,6 +4,7 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle } from "lucide-react";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { useT } from "@/i18n";
 
 // ============================================================
 // ConfirmActionModal
@@ -34,6 +35,7 @@ export function ConfirmActionModal({
   onClose,
   onConfirm,
 }: ConfirmActionModalProps) {
+  const { t } = useT();
   const [confirmInput, setConfirmInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -89,7 +91,7 @@ export function ConfirmActionModal({
               {requireTypedConfirmation && (
                 <div className="space-y-1.5">
                   <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">
-                    {`Digite "${requireTypedConfirmation}" para confirmar`}
+                    {t("confirm.typeToConfirm", { text: requireTypedConfirmation })}
                   </label>
                   <input
                     type="text"
@@ -110,7 +112,7 @@ export function ConfirmActionModal({
                 disabled={isSubmitting}
                 className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold disabled:opacity-40"
               >
-                Cancelar
+                {t("common.cancel")}
               </button>
               <button
                 type="button"
@@ -118,7 +120,7 @@ export function ConfirmActionModal({
                 disabled={!canConfirm || isSubmitting}
                 className="px-6 h-12 bg-rose-500 text-white rounded-2xl hover:bg-rose-600 transition-colors text-sm font-semibold shadow-md shadow-theme-shadow disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {isSubmitting ? "Aguarde..." : confirmLabel}
+                {isSubmitting ? t("confirm.wait") : confirmLabel}
               </button>
             </div>
           </motion.div>

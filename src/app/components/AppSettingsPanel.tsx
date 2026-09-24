@@ -10,6 +10,8 @@ import { readTextFile } from "@tauri-apps/plugin-fs";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
 import { useAppStore } from "@/app/store";
 import { ThemeToggle } from "@/app/components/ThemeToggle";
+import { LanguageSelector } from "@/app/components/LanguageSelector";
+import { useT, formatNumber, formatDateTime, type TKey } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { requireAuth, logout, setPassword, getLinkedProviders } from "@/lib/auth";
 import { getJavaVersion, updateWakeOnDemandConfig } from "@/lib/server";
@@ -36,12 +38,12 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 15;
 
 export type SettingsCategory = "inicio" | "backups" | "tema" | "conta" | "assinatura";
 
-const CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Archive }[] = [
-  { id: "inicio", label: "Início", icon: Home },
-  { id: "backups", label: "Backups", icon: Archive },
-  { id: "tema", label: "Tema", icon: Palette },
-  { id: "conta", label: "Conta", icon: UserIcon },
-  { id: "assinatura", label: "Assinatura", icon: Sparkles },
+const CATEGORIES: { id: SettingsCategory; labelKey: TKey; icon: typeof Archive }[] = [
+  { id: "inicio", labelKey: "settings.cat.home", icon: Home },
+  { id: "backups", labelKey: "settings.cat.backups", icon: Archive },
+  { id: "tema", labelKey: "settings.cat.theme", icon: Palette },
+  { id: "conta", labelKey: "settings.cat.account", icon: UserIcon },
+  { id: "assinatura", labelKey: "settings.cat.subscription", icon: Sparkles },
 ];
 
 interface AppSettingsPanelProps {
@@ -52,6 +54,7 @@ interface AppSettingsPanelProps {
 }
 
 export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettingsPanelProps) {
+  const { t } = useT();
   const [category, setCategory] = useState<SettingsCategory>(initialCategory ?? "backups");
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
@@ -111,7 +114,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
     try {
       await openSubscriptionCheckout(plan);
     } catch (err: any) {
-      setSubError(err?.message || "Não foi possível abrir o checkout.");
+      setSubError(err?.message || t("settings.sub.checkoutFailed"));
     } finally {
       setSubAction(null);
     }
@@ -123,7 +126,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
     try {
       await openBillingPortal();
     } catch (err: any) {
-      setSubError(err?.message || "Não foi possível abrir o portal de assinatura.");
+      setSubError(err?.message || t("settings.sub.portalFailed"));
     } finally {
       setSubAction(null);
     }
@@ -164,7 +167,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
       const version = serverInfo.version || "1.20.1";
       const javaVer = getJavaVersion(version);
       if (!(await isJREInstalled(javaVer))) {
-        throw new Error("Java ainda não instalado para este servidor — inicie-o manualmente pelo menos uma vez antes de ativar o modo de espera.");
+        throw new Error(t("settings.wake.javaMissing"));
       }
       const jrePath = await getJREPath(javaVer);
       const javaPath = `${jrePath}\\bin\\java.exe`;
@@ -247,7 +250,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
     try {
       await requireAuth();
     } catch (err: any) {
-      setLoginError(err?.message || "Não foi possível concluir o login.");
+      setLoginError(err?.message || t("settings.account.loginFailed"));
     } finally {
       setLoggingIn(false);
     }
@@ -294,7 +297,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                 <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center">
                   <Settings className="text-indigo-600 w-5 h-5" />
                 </div>
-                <h3 className="text-xl font-bold text-theme-primary">Configurações</h3>
+                <h3 className="text-xl font-bold text-theme-primary">{t("settings.title")}</h3>
               </div>
               <button
                 type="button"
@@ -308,7 +311,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
             <div className="flex flex-1 min-h-0">
               <nav className="w-44 flex-shrink-0 border-r border-theme-card p-3 flex flex-col justify-between">
                 <div className="space-y-1">
-                  {CATEGORIES.map(({ id, label, icon: Icon }) => (
+                  {CATEGORIES.map(({ id, labelKey, icon: Icon }) => (
                     <button
                       key={id}
                       type="button"
@@ -321,21 +324,21 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                       )}
                     >
                       <Icon className="w-4 h-4" />
-                      {label}
+                      {t(labelKey)}
                     </button>
                   ))}
                 </div>
                 {appVersion && (
-                  <p className="text-[10px] text-theme-secondary text-center px-2">Cubicase v{appVersion}</p>
+                  <p className="text-[10px] text-theme-secondary text-center px-2">{t("settings.version", { version: appVersion })}</p>
                 )}
               </nav>
 
               <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
                 {category === "inicio" && (
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Aba ao abrir o app</label>
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.home.label")}</label>
                     <p className="text-[10px] text-theme-secondary pb-1">
-                      Qual tela aparece assim que o Cubicase é iniciado.
+                      {t("settings.home.hint")}
                     </p>
                     <div className="grid grid-cols-2 gap-3 pt-1">
                       <button
@@ -349,8 +352,8 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                         )}
                       >
                         <Monitor className="w-4.5 h-4.5 text-indigo-600 mb-2" />
-                        <div className="text-sm font-bold text-theme-primary">Host</div>
-                        <div className="text-[10px] text-theme-secondary">Hospedar um servidor</div>
+                        <div className="text-sm font-bold text-theme-primary">{t("settings.home.host")}</div>
+                        <div className="text-[10px] text-theme-secondary">{t("settings.home.hostDesc")}</div>
                       </button>
                       <button
                         type="button"
@@ -363,8 +366,8 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                         )}
                       >
                         <Globe className="w-4.5 h-4.5 text-indigo-600 mb-2" />
-                        <div className="text-sm font-bold text-theme-primary">Convidado</div>
-                        <div className="text-[10px] text-theme-secondary">Conectar a um servidor</div>
+                        <div className="text-sm font-bold text-theme-primary">{t("settings.home.guest")}</div>
+                        <div className="text-[10px] text-theme-secondary">{t("settings.home.guestDesc")}</div>
                       </button>
                     </div>
                   </div>
@@ -380,16 +383,15 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                           onChange={(e) => setAutoBackupEnabled(e.target.checked)}
                           className="w-4.5 h-4.5 rounded-lg text-indigo-600 focus:ring-indigo-500"
                         />
-                        <span className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Backup automático do mundo</span>
+                        <span className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.backups.auto")}</span>
                       </label>
                       <p className="text-[10px] text-theme-secondary">
-                        Gera backup sozinho quando o servidor é parado ou crasha, e periodicamente
-                        em sessões longas. Pula sozinho se o mundo não mudou desde o último.
+                        {t("settings.backups.autoHint")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Manter últimos N backups</label>
+                      <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.backups.retention")}</label>
                       <input
                         type="number"
                         min="1"
@@ -400,12 +402,12 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                         className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent disabled:opacity-50"
                       />
                       <p className="text-[10px] text-theme-secondary">
-                        Backups mais antigos que isso (automáticos ou manuais) são apagados sozinhos.
+                        {t("settings.backups.retentionHint")}
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Intervalo do backup de segurança (horas)</label>
+                      <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.backups.interval")}</label>
                       <input
                         type="number"
                         min="1"
@@ -416,19 +418,22 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                         className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all font-mono text-sm text-theme-primary bg-transparent disabled:opacity-50"
                       />
                       <p className="text-[10px] text-theme-secondary">
-                        Em sessões longas que nunca são paradas manualmente, gera um backup extra a cada esse tanto de horas.
+                        {t("settings.backups.intervalHint")}
                       </p>
                     </div>
                   </div>
                 )}
 
                 {category === "tema" && (
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Aparência</label>
-                    <div className="flex items-center justify-between pt-1">
-                      <span className="text-sm text-theme-primary">Modo claro / escuro</span>
-                      <ThemeToggle />
+                  <div className="space-y-6">
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.theme.appearance")}</label>
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-sm text-theme-primary">{t("settings.theme.mode")}</span>
+                        <ThemeToggle />
+                      </div>
                     </div>
+                    <LanguageSelector />
                   </div>
                 )}
 
@@ -437,10 +442,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                     {!user ? (
                       <div className="space-y-3">
                         <p className="text-[10px] text-theme-secondary">
-                          Uma conta é opcional — o Cubicase continua funcionando
-                          normalmente sem login. Ela só é necessária pro Cubicase Plus
-                          (aba Assinatura) ou se você quiser vincular seus servidores
-                          a um perfil.
+                          {t("settings.account.intro")}
                         </p>
                         <button
                           type="button"
@@ -448,33 +450,33 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                           disabled={loggingIn}
                           className="w-full h-12 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-sm rounded-2xl transition-colors cursor-pointer"
                         >
-                          {loggingIn ? "Abrindo o navegador..." : "Entrar"}
+                          {loggingIn ? t("settings.account.opening") : t("settings.account.login")}
                         </button>
                         {loginError && <p className="text-[10px] text-rose-500">{loginError}</p>}
                       </div>
                     ) : (
                       <div className="space-y-5">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Logado como</label>
+                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.account.loggedAs")}</label>
                           <p className="text-sm text-theme-primary">{user.email}</p>
                           {providers.length > 0 && (
                             <p className="text-[10px] text-theme-secondary">
-                              Provedores vinculados: {providers.join(", ")}
+                              {t("settings.account.providers", { providers: providers.join(", ") })}
                             </p>
                           )}
                         </div>
 
                         <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Definir senha</label>
+                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.account.setPassword")}</label>
                           <p className="text-[10px] text-theme-secondary">
-                            Opcional — permite entrar com senha além do link mágico/Google/Discord.
+                            {t("settings.account.setPasswordHint")}
                           </p>
                           <div className="flex gap-2">
                             <input
                               type="password"
                               value={newPassword}
                               onChange={(e) => { setNewPassword(e.target.value); setPasswordStatus("idle"); }}
-                              placeholder="Nova senha"
+                              placeholder={t("settings.account.newPassword")}
                               className="flex-1 h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm text-theme-primary bg-transparent"
                             />
                             <button
@@ -483,12 +485,12 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                               disabled={passwordStatus === "saving"}
                               className="h-12 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-sm rounded-2xl transition-colors cursor-pointer"
                             >
-                              Salvar
+                              {t("settings.account.save")}
                             </button>
                           </div>
-                          {passwordStatus === "saved" && <p className="text-[10px] text-emerald-600">Senha atualizada.</p>}
+                          {passwordStatus === "saved" && <p className="text-[10px] text-emerald-600">{t("settings.account.passwordSaved")}</p>}
                           {passwordStatus === "error" && (
-                            <p className="text-[10px] text-rose-500">Senha inválida (mínimo 6 caracteres) ou falha ao salvar.</p>
+                            <p className="text-[10px] text-rose-500">{t("settings.account.passwordError")}</p>
                           )}
                         </div>
 
@@ -497,7 +499,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                           onClick={() => logout()}
                           className="text-xs font-semibold text-rose-500 hover:text-rose-600 transition-colors cursor-pointer"
                         >
-                          Sair da conta
+                          {t("settings.account.logout")}
                         </button>
                       </div>
                     )}
@@ -509,7 +511,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                     {!user ? (
                       <div className="space-y-3">
                         <p className="text-[10px] text-theme-secondary">
-                          Entre com uma conta pra assinar o Cubicase Plus.
+                          {t("settings.sub.loginPrompt")}
                         </p>
                         <button
                           type="button"
@@ -517,24 +519,24 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                           disabled={loggingIn}
                           className="w-full h-12 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-sm rounded-2xl transition-colors cursor-pointer"
                         >
-                          {loggingIn ? "Abrindo o navegador..." : "Entrar"}
+                          {loggingIn ? t("settings.account.opening") : t("settings.account.login")}
                         </button>
                         {loginError && <p className="text-[10px] text-rose-500">{loginError}</p>}
                       </div>
                     ) : (
                       <div className="space-y-5">
                         <div className="space-y-2 p-4 bg-theme-muted border border-theme-card rounded-2xl">
-                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Cubicase Plus</label>
+                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.sub.title")}</label>
                           {subLoading ? (
-                            <p className="text-[10px] text-theme-secondary">Verificando assinatura...</p>
+                            <p className="text-[10px] text-theme-secondary">{t("settings.sub.checking")}</p>
                           ) : isSubscriptionActive(subscription) ? (
                             <>
                               <p className="text-sm text-theme-primary">
-                                Plano {subscription!.plan === "annual" ? "anual" : "mensal"} ativo
-                                {subscription!.currentPeriodEnd && (
-                                  <> — {subscription!.cancelAtPeriodEnd ? "cancela" : "renova"} em{" "}
-                                    {new Date(subscription!.currentPeriodEnd).toLocaleDateString("pt-BR")}</>
-                                )}
+                                {t(subscription!.plan === "annual" ? "settings.sub.active.annual" : "settings.sub.active.monthly")}
+                                {subscription!.currentPeriodEnd &&
+                                  t(subscription!.cancelAtPeriodEnd ? "settings.sub.cancelsOn" : "settings.sub.renewsOn", {
+                                    date: formatDateTime(subscription!.currentPeriodEnd, { dateStyle: "short" }),
+                                  })}
                               </p>
                               <button
                                 type="button"
@@ -542,13 +544,13 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                                 disabled={subAction !== null}
                                 className="h-10 px-4 bg-theme-card border border-theme-card hover:bg-theme-muted disabled:opacity-50 text-theme-primary font-semibold text-xs rounded-xl transition-colors cursor-pointer"
                               >
-                                {subAction === "portal" ? "Abrindo..." : "Gerenciar assinatura"}
+                                {subAction === "portal" ? t("settings.sub.opening") : t("settings.sub.manage")}
                               </button>
                             </>
                           ) : (
                             <>
                               <p className="text-[10px] text-theme-secondary">
-                                Sem custo pra usar o Cubicase — o Plus desbloqueia recursos extras.
+                                {t("settings.sub.freeHint")}
                               </p>
                               <div className="flex gap-2 pt-1">
                                 <button
@@ -557,7 +559,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                                   disabled={subAction !== null}
                                   className="flex-1 h-10 px-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer"
                                 >
-                                  {subAction === "monthly" ? "Abrindo..." : "Mensal — R$14,90"}
+                                  {subAction === "monthly" ? t("settings.sub.opening") : t("settings.sub.monthly", { price: formatNumber(14.9, { style: "currency", currency: "BRL" }) })}
                                 </button>
                                 <button
                                   type="button"
@@ -565,7 +567,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                                   disabled={subAction !== null}
                                   className="flex-1 h-10 px-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold text-xs rounded-xl transition-colors cursor-pointer"
                                 >
-                                  {subAction === "annual" ? "Abrindo..." : "Anual — R$149,90"}
+                                  {subAction === "annual" ? t("settings.sub.opening") : t("settings.sub.annual", { price: formatNumber(149.9, { style: "currency", currency: "BRL" }) })}
                                 </button>
                               </div>
                             </>
@@ -574,16 +576,15 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                         </div>
 
                         <div className="space-y-2.5 p-4 bg-theme-muted border border-theme-card rounded-2xl">
-                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Servidor sob demanda</label>
+                          <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("settings.wake.title")}</label>
 
                           {!isSubscriptionActive(subscription) ? (
                             <p className="text-[10px] text-theme-secondary">
-                              Assine o Cubicase Plus acima pra desbloquear: o servidor liga sozinho quando
-                              alguém tenta entrar, e desliga sozinho depois de um tempo sem jogadores.
+                              {t("settings.wake.locked")}
                             </p>
                           ) : !serverInfo ? (
                             <p className="text-[10px] text-theme-secondary">
-                              Selecione um servidor na aba Hospedar primeiro.
+                              {t("settings.wake.selectServer")}
                             </p>
                           ) : (
                             <>
@@ -591,7 +592,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                                 <div>
                                   <p className="text-sm text-theme-primary font-semibold">{serverInfo.name}</p>
                                   <p className="text-[10px] text-theme-secondary">
-                                    Liga sozinho quando alguém tenta entrar, desliga sozinho sem jogadores.
+                                    {t("settings.wake.desc")}
                                   </p>
                                 </div>
                                 <label className="relative inline-flex items-center cursor-pointer flex-shrink-0 ml-3">
@@ -607,7 +608,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                               </div>
 
                               <div className="space-y-1 pt-1">
-                                <label className="text-[10px] font-bold text-theme-secondary uppercase tracking-wide">Desligar sem jogadores após</label>
+                                <label className="text-[10px] font-bold text-theme-secondary uppercase tracking-wide">{t("settings.wake.idleAfter")}</label>
                                 <select
                                   value={wakeIdleMinutes}
                                   disabled={wakeSubmitting}
@@ -625,7 +626,7 @@ export function AppSettingsPanel({ isOpen, onClose, initialCategory }: AppSettin
                                   className="w-full h-11 px-3 rounded-xl border border-theme-card bg-theme-card text-theme-primary focus:outline-none focus:border-indigo-500 transition-all text-sm disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                   {IDLE_TIMEOUT_OPTIONS.map((min) => (
-                                    <option key={min} value={min}>{min} minutos</option>
+                                    <option key={min} value={min}>{t("settings.wake.minutes", { count: min })}</option>
                                   ))}
                                 </select>
                               </div>

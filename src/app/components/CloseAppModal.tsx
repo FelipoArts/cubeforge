@@ -4,6 +4,7 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Power, Minus } from "lucide-react";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { useT } from "@/i18n";
 
 // ============================================================
 // CloseAppModal
@@ -23,6 +24,7 @@ interface CloseAppModalProps {
 }
 
 export function CloseAppModal({ isOpen, onClose, onQuitFully, onMinimizeToTray }: CloseAppModalProps) {
+  const { t } = useT();
   const [pending, setPending] = useState<"quit" | "minimize" | null>(null);
 
   useLockBodyScroll(isOpen);
@@ -71,10 +73,9 @@ export function CloseAppModal({ isOpen, onClose, onQuitFully, onMinimizeToTray }
             className="relative w-full max-w-md bg-theme-card rounded-[2rem] border-theme-card shadow-2xl p-8 z-10 space-y-6"
           >
             <div className="space-y-1.5">
-              <h3 className="text-xl font-bold text-theme-primary">Fechar o Cubicase</h3>
+              <h3 className="text-xl font-bold text-theme-primary">{t("close.title")}</h3>
               <p className="text-sm text-theme-secondary leading-relaxed">
-                O que você quer fazer? Se o servidor Minecraft ou a rede mesh estiverem ativos,
-                eles continuam rodando a menos que você escolha fechar tudo.
+                {t("close.desc")}
               </p>
             </div>
 
@@ -90,9 +91,9 @@ export function CloseAppModal({ isOpen, onClose, onQuitFully, onMinimizeToTray }
                 </div>
                 <div>
                   <div className="text-sm font-bold text-theme-primary">
-                    {pending === "minimize" ? "Minimizando..." : "Manter em segundo plano"}
+                    {pending === "minimize" ? t("close.minimizing") : t("close.minimize")}
                   </div>
-                  <div className="text-xs text-theme-secondary">Servidor e rede mesh continuam rodando</div>
+                  <div className="text-xs text-theme-secondary">{t("close.minimizeDesc")}</div>
                 </div>
               </button>
 
@@ -107,9 +108,9 @@ export function CloseAppModal({ isOpen, onClose, onQuitFully, onMinimizeToTray }
                 </div>
                 <div>
                   <div className="text-sm font-bold text-theme-primary">
-                    {pending === "quit" ? "Fechando..." : "Fechar tudo"}
+                    {pending === "quit" ? t("close.quitting") : t("close.quit")}
                   </div>
-                  <div className="text-xs text-theme-secondary">Encerra o servidor, a rede mesh e o app</div>
+                  <div className="text-xs text-theme-secondary">{t("close.quitDesc")}</div>
                 </div>
               </button>
             </div>
@@ -121,7 +122,7 @@ export function CloseAppModal({ isOpen, onClose, onQuitFully, onMinimizeToTray }
                 disabled={pending !== null}
                 className="px-5 h-11 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold disabled:opacity-40 cursor-pointer"
               >
-                Cancelar
+                {t("common.cancel")}
               </button>
             </div>
           </motion.div>

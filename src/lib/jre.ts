@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { exists, mkdir, remove } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
+import { t } from "@/i18n";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -40,12 +41,12 @@ export async function installJRE(
       lastErr = err;
       console.warn(`[JRE] Tentativa ${attempt}/${MAX_INSTALL_ATTEMPTS} falhou:`, err);
       if (attempt < MAX_INSTALL_ATTEMPTS) {
-        onProgress({ status: `Falha no download, tentando novamente (${attempt}/${MAX_INSTALL_ATTEMPTS})...`, percent: 5 });
+        onProgress({ status: t("jre.retrying", { attempt, max: MAX_INSTALL_ATTEMPTS }), percent: 5 });
         await sleep(1000 * 2 ** (attempt - 1));
       }
     }
   }
-  throw new Error(`Falha ao instalar a JRE ${version} após ${MAX_INSTALL_ATTEMPTS} tentativas: ${lastErr}`);
+  throw new Error(t("jre.installFailed", { version, max: MAX_INSTALL_ATTEMPTS, error: String(lastErr) }));
 }
 
 async function installJREOnce(
@@ -71,13 +72,13 @@ async function installJREOnce(
     `https://api.adoptium.net/v3/assets/latest/${version}/hotspot?vendor=eclipse&os=windows&architecture=x64&image_type=jdk`
   );
 
-  if (!assetsResponse.ok) throw new Error("Falha ao consultar a API da Adoptium");
+  if (!assetsResponse.ok) throw new Error(t("jre.apiFailed"));
 
   const assets = (await assetsResponse.json()) as Array<{
     binary: { package: { link: string; checksum: string } };
   }>;
   const asset = assets[0];
-  if (!asset) throw new Error("Nenhum build de JRE disponível na API da Adoptium para esta versão.");
+  if (!asset) throw new Error(t("jre.noBuild"));
 
   const downloadUrl = asset.binary.package.link;
   const expectedSha256 = asset.binary.package.checksum;
@@ -106,7 +107,7 @@ async function installJREOnce(
     // sem isso, a tentativa seguinte podia herdar lixo do download interrompido.
     await remove(tempZip, { recursive: false }).catch(() => {});
     await remove(jrePath, { recursive: true }).catch(() => {});
-    throw new Error(`Erro na instalação do JRE: ${err}`);
+    throw new Error(t("jre.installError", { error: String(err) }));
   }
 
   onProgress({ status: "Java instalado com sucesso!", percent: 100 });

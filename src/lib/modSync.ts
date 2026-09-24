@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
 import { exists, readDir } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
+import { t } from "@/i18n";
 
 // ============================================================
 // modSync — sincronização de mods do CLIENTE do convidado com o que o
@@ -63,10 +64,10 @@ export async function fetchRemoteModsList(shortCode: string): Promise<RemoteModE
   try {
     res = await fetch(`${MODS_PROXY_BASE}/mods?code=${encodeURIComponent(shortCode)}`);
   } catch {
-    throw new Error("Não foi possível falar com o host para checar os mods — a rede mesh pode estar instável ou o host offline.");
+    throw new Error(t("modsync.hostUnreachable"));
   }
   if (res.status === 404) {
-    throw new Error("O host não está hospedando este servidor agora (ou você já não está mais conectado a ele).");
+    throw new Error(t("modsync.notHosting"));
   }
   if (!res.ok) {
     throw new Error(`O host respondeu com erro ao listar os mods (HTTP ${res.status}).`);
@@ -181,7 +182,7 @@ export async function runModSync(opts: RunModSyncOptions): Promise<void> {
     const mod = byFilename.get(entry.filename);
     if (!mod) {
       entry.status = "failed";
-      entry.error = "Mod não está mais na lista do host (pode ter sido removido durante a sincronização).";
+      entry.error = t("modsync.removedFromHost");
       onProgress([...entries]);
       continue;
     }
@@ -228,7 +229,7 @@ export async function runLocalModSync(opts: RunLocalModSyncOptions): Promise<voi
     const mod = byFilename.get(entry.filename);
     if (!mod) {
       entry.status = "failed";
-      entry.error = "Mod não está mais na pasta do servidor (pode ter sido removido durante a sincronização).";
+      entry.error = t("modsync.removedFromFolder");
       onProgress([...entries]);
       continue;
     }

@@ -12,6 +12,7 @@ import { fetch } from "@tauri-apps/plugin-http";
 import { open } from "@tauri-apps/plugin-shell";
 import { supabase } from "@/lib/supabaseClient";
 import { requireAuth } from "@/lib/auth";
+import { getLocale, t } from "@/i18n";
 
 const SUBSCRIPTIONS_API_BASE = "https://cubeforge-api.cubeforge.workers.dev";
 
@@ -62,19 +63,20 @@ interface ApiEnvelope<T> {
 
 async function authedCheckoutFetch(path: string, body: unknown): Promise<string> {
   const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.access_token) throw new Error("Não autenticado.");
+  if (!session?.access_token) throw new Error(t("err.notAuthenticated"));
 
   const res = await fetch(`${SUBSCRIPTIONS_API_BASE}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${session.access_token}`,
+      "Accept-Language": getLocale(),
     },
     body: JSON.stringify(body),
   });
   const json = (await res.json().catch(() => null)) as ApiEnvelope<{ url?: string }> | null;
   if (!res.ok || !json?.success || !json.data?.url) {
-    throw new Error(json?.message || `Falha na operação (HTTP ${res.status}).`);
+    throw new Error(json?.message || t("err.operationFailed", { status: res.status }));
   }
   return json.data.url;
 }

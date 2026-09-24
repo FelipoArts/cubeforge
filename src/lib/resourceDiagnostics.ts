@@ -11,6 +11,8 @@
 // ajustar depois com uso real sem mexer no resto do código.
 // ============================================================
 
+import { t } from "@/i18n";
+
 export interface ResourceSnapshot {
   totalRamMb?: number;
   availableRamMb?: number;
@@ -43,17 +45,17 @@ function formatGb(mb: number): string {
 export function explainRamAllocation(snapshot: ResourceSnapshot): string {
   const { totalRamMb, allocatedRamMb } = snapshot;
   if (!totalRamMb || !allocatedRamMb) {
-    return "O servidor ficou sem memória (RAM) durante a execução. Aumente a RAM alocada nas configurações do servidor, ou feche outros programas para liberar memória no computador.";
+    return t("res.oom.generic");
   }
 
   const recommendedMaxMb = totalRamMb - OS_RESERVED_RAM_MB;
   const headroomMb = recommendedMaxMb - allocatedRamMb;
 
   if (headroomMb >= MIN_HEADROOM_MB) {
-    return `O servidor ficou sem memória, mas seu computador tem RAM de sobra: você alocou ${formatGb(allocatedRamMb)}GB, e o computador tem ${formatGb(totalRamMb)}GB no total. Pode aumentar a RAM alocada nas configurações do servidor com segurança até uns ${formatGb(recommendedMaxMb)}GB.`;
+    return t("res.oom.headroom", { allocated: formatGb(allocatedRamMb), total: formatGb(totalRamMb), max: formatGb(recommendedMaxMb) });
   }
 
-  return `O servidor ficou sem memória, e seu computador só tem ${formatGb(totalRamMb)}GB de RAM no total — já não sobra muita folga além do que está alocado (${formatGb(allocatedRamMb)}GB). Considere reduzir a quantidade de mods/jogadores, diminuir um pouco a RAM alocada para dar mais folga ao sistema, ou fazer um upgrade de RAM no computador.`;
+  return t("res.oom.tight", { total: formatGb(totalRamMb), allocated: formatGb(allocatedRamMb) });
 }
 
 /**
@@ -66,14 +68,14 @@ export function explainResourceBottleneck(snapshot: ResourceSnapshot | null): st
   const { cpuUsagePercent, totalRamMb, availableRamMb } = snapshot;
 
   if (cpuUsagePercent !== undefined && cpuUsagePercent >= HIGH_CPU_THRESHOLD) {
-    return `O processador do computador está no limite (${Math.round(cpuUsagePercent)}% de uso) — esse é provavelmente o gargalo. Considere reduzir a distância de renderização (view-distance), remover mods pesados, ou fazer upgrade do processador.`;
+    return t("res.bottleneck.cpu", { percent: Math.round(cpuUsagePercent) });
   }
 
   if (totalRamMb && availableRamMb !== undefined && totalRamMb > 0 && availableRamMb / totalRamMb < LOW_FREE_RAM_RATIO) {
-    return `A memória do computador está quase toda ocupada (só ${formatGb(availableRamMb)}GB livres de ${formatGb(totalRamMb)}GB). Considere reduzir a RAM alocada para o servidor, fechar outros programas, ou aumentar a RAM do computador.`;
+    return t("res.bottleneck.ram", { free: formatGb(availableRamMb), total: formatGb(totalRamMb) });
   }
 
-  return "O processador e a memória do computador não parecem estar no limite — o lag provavelmente vem de um mod/plugin específico, ou de muitos jogadores/entidades carregados ao mesmo tempo.";
+  return t("res.bottleneck.none");
 }
 
 /**
@@ -108,16 +110,16 @@ export function createResourceMonitor() {
       lastPushedAt = now;
       return {
         level: "warning",
-        title: "Processador sob pressão sustentada",
-        message: `O processador do computador está acima de ${SUSTAINED_HIGH_CPU_THRESHOLD}% de uso há alguns minutos, mesmo sem o Minecraft ter acusado lag ainda. Isso costuma anteceder travamentos — considere reduzir mods pesados/jogadores, ou de olho se isso persistir.`,
+        title: t("res.sustainedCpu.title"),
+        message: t("res.sustainedCpu.message", { threshold: SUSTAINED_HIGH_CPU_THRESHOLD }),
       };
     }
     if (ramStreak >= SUSTAINED_SAMPLES_REQUIRED) {
       lastPushedAt = now;
       return {
         level: "warning",
-        title: "Memória do computador sob pressão sustentada",
-        message: "A memória RAM do computador está quase toda ocupada há alguns minutos. Considere reduzir a RAM alocada para o servidor ou fechar outros programas antes que isso vire uma queda por falta de memória.",
+        title: t("res.sustainedRam.title"),
+        message: t("res.sustainedRam.message"),
       };
     }
     return null;

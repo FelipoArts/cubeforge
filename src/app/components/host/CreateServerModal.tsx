@@ -22,6 +22,7 @@ import {
   type PaperBuild,
 } from "@/lib/server";
 import { useLockBodyScroll } from "@/lib/useLockBodyScroll";
+import { useT } from "@/i18n";
 
 // ============================================================
 // CreateServerModal
@@ -58,6 +59,7 @@ export function CreateServerModal({
   installProgress,
   totalRamGb,
 }: CreateServerModalProps) {
+  const { t } = useT();
   useLockBodyScroll(isOpen);
 
   const [serverName, setServerName] = useState("");
@@ -168,7 +170,7 @@ export function CreateServerModal({
         setServerVersion(manifest.latest.release);
       } catch (err) {
         console.warn("Falha ao carregar manifest da Mojang:", err);
-        setManifestError("Não foi possível carregar a lista de versões.");
+        setManifestError(t("create.manifestError"));
         setServerVersion("1.20.1");
       } finally {
         setManifestLoading(false);
@@ -221,7 +223,7 @@ export function CreateServerModal({
     const seed = serverSeed.trim() || undefined;
     if (serverType === "forge") {
       if (!selectedForgeBuild) {
-        pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Forge não selecionada", message: "Selecione uma versão do Forge." });
+        pushDiagnostic({ level: "warning", source: t("diag.source.install"), title: t("create.forge.notSelected.title"), message: t("create.forge.notSelected.message") });
         return;
       }
       // A build pode ter vindo do provider Forge clássico ou do NeoForge — o formato
@@ -231,13 +233,13 @@ export function CreateServerModal({
       await onCreate(cleanName, serverVersion, serverRam, build?.provider ?? "forge", selectedForgeBuild, seed);
     } else if (serverType === "fabric") {
       if (!selectedFabricLoader) {
-        pushDiagnostic({ level: "warning", source: "Instalação", title: "Versão do Fabric não selecionada", message: "Selecione uma versão do Fabric Loader." });
+        pushDiagnostic({ level: "warning", source: t("diag.source.install"), title: t("create.fabric.notSelected.title"), message: t("create.fabric.notSelected.message") });
         return;
       }
       await onCreate(cleanName, serverVersion, serverRam, "fabric", selectedFabricLoader, seed);
     } else if (serverType === "paper") {
       if (selectedPaperBuild === null) {
-        pushDiagnostic({ level: "warning", source: "Instalação", title: "Build do Paper não selecionada", message: "Selecione uma build do Paper." });
+        pushDiagnostic({ level: "warning", source: t("diag.source.install"), title: t("create.paper.notSelected.title"), message: t("create.paper.notSelected.message") });
         return;
       }
       await onCreate(cleanName, serverVersion, serverRam, "paper", String(selectedPaperBuild), seed);
@@ -270,7 +272,7 @@ export function CreateServerModal({
                 <div className="w-8 h-8 bg-indigo-100 dark:bg-indigo-800/40 rounded-lg flex items-center justify-center">
                   <Plus className="text-indigo-700 dark:text-indigo-300 w-5 h-5" />
                 </div>
-                <h3 className="text-xl font-bold text-theme-primary">Criar Servidor Minecraft</h3>
+                <h3 className="text-xl font-bold text-theme-primary">{t("create.title")}</h3>
               </div>
               {!installProgress && (
                 <button
@@ -296,21 +298,21 @@ export function CreateServerModal({
                       className="h-full bg-indigo-600 rounded-full"
                     />
                   </div>
-                  <div className="text-right text-[10px] font-bold text-theme-secondary">{installProgress.percent}% concluído</div>
+                  <div className="text-right text-[10px] font-bold text-theme-secondary">{t("modpack.installing", { percent: installProgress.percent })}</div>
                 </div>
                 <p className="text-[10px] text-theme-secondary text-center italic leading-relaxed">
-                  Estamos baixando os arquivos oficiais de forma nativa e segura. Isso ocorrerá apenas uma vez por versão instalada.
+                  {t("create.installingHint")}
                 </p>
               </div>
             ) : (
               <form onSubmit={handleSubmit} className="space-y-4">
                 {/* Nome do Servidor */}
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Nome do Servidor</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.serverName")}</label>
                   <input
                     type="text"
                     required
-                    placeholder="Ex: Meu_Servidor"
+                    placeholder={t("create.serverNamePlaceholder")}
                     value={serverName}
                     onChange={(e) => setServerName(e.target.value)}
                     className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm font-semibold text-theme-primary bg-transparent"
@@ -319,7 +321,7 @@ export function CreateServerModal({
 
                 {/* Tipo de Servidor */}
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Tipo do Servidor</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.serverType")}</label>
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
@@ -374,7 +376,7 @@ export function CreateServerModal({
 
                 {/* Versão - Seletor Categorizado */}
                 <div className="space-y-1.5 relative" ref={versionDropdownRef}>
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Minecraft</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.mcVersion")}</label>
 
                   {/* Botão do dropdown */}
                   <button
@@ -384,7 +386,7 @@ export function CreateServerModal({
                     className="w-full h-12 px-4 border border-theme-card bg-transparent rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm font-semibold text-theme-primary flex items-center justify-between"
                   >
                     {manifestLoading ? (
-                      <span className="text-theme-secondary">Carregando versões...</span>
+                      <span className="text-theme-secondary">{t("create.loadingVersions")}</span>
                     ) : (
                       <span>{typeLabel} {serverVersion}</span>
                     )}
@@ -398,7 +400,7 @@ export function CreateServerModal({
                       <div className="p-2 border-b border-theme-card">
                         <input
                           type="text"
-                          placeholder="🔍 Buscar versão..."
+                          placeholder={t("create.searchPlaceholder")}
                           value={versionSearchQuery}
                           onChange={(e) => {
                             setVersionSearchQuery(e.target.value);
@@ -415,7 +417,7 @@ export function CreateServerModal({
                           if (!versionManifest) {
                             return (
                               <div className="p-4 text-center text-sm text-theme-secondary">
-                                {manifestError ? <span>{manifestError}</span> : <span>Carregando...</span>}
+                                {manifestError ? <span>{manifestError}</span> : <span>{t("create.loading")}</span>}
                               </div>
                             );
                           }
@@ -447,10 +449,10 @@ export function CreateServerModal({
                               currentSection = v.section;
                               let label = '';
                               switch (v.section) {
-                                case 'recommended': label = '⭐ Recomendadas'; break;
-                                case 'popular': label = '🔥 Versões Populares'; break;
-                                case 'todas': label = '📋 Todas as Versões'; break;
-                                case 'resultados': label = '🔍 Resultados da Busca'; break;
+                                case 'recommended': label = t('create.section.recommended'); break;
+                                case 'popular': label = t('create.section.popular'); break;
+                                case 'todas': label = t('create.section.all'); break;
+                                case 'resultados': label = t('create.section.results'); break;
                               }
                               sections.push({ label, key: v.section, ids: [] });
                             }
@@ -498,7 +500,7 @@ export function CreateServerModal({
                             }}
                             className="w-full h-9 text-xs font-semibold text-indigo-600 hover:bg-theme-accent rounded-xl transition-colors"
                           >
-                            {showAllVersions ? '← Mostrar apenas Recomendadas' : `📋 Mostrar todas as ${versionManifest ? getAllReleaseVersions(versionManifest).length : '...'} versões`}
+                            {showAllVersions ? t('create.showRecommendedOnly') : t('create.showAll', { count: versionManifest ? getAllReleaseVersions(versionManifest).length : '...' })}
                           </button>
                         </div>
                       )}
@@ -524,15 +526,15 @@ export function CreateServerModal({
                 {/* Seletor de build Forge (só aparece quando tipo = forge) */}
                 {serverType === "forge" && (
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Forge</label>
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.forge.label")}</label>
                     {forgeVersionsLoading ? (
                       <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        Carregando versões do Forge...
+                        {t("create.forge.loading")}
                       </div>
                     ) : forgeBuilds.length === 0 ? (
                       <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
-                        Nenhuma versão do Forge encontrada para {serverVersion}.
+                        {t("create.forge.none", { version: serverVersion })}
                       </div>
                     ) : (
                       <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
@@ -565,15 +567,15 @@ export function CreateServerModal({
                 {/* Seletor de loader Fabric (só aparece quando tipo = fabric) */}
                 {serverType === "fabric" && (
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Versão do Fabric Loader</label>
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.fabric.label")}</label>
                     {fabricVersionsLoading ? (
                       <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        Carregando versões do Fabric...
+                        {t("create.fabric.loading")}
                       </div>
                     ) : fabricBuilds.length === 0 ? (
                       <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
-                        Nenhuma versão do Fabric encontrada para {serverVersion}.
+                        {t("create.fabric.none", { version: serverVersion })}
                       </div>
                     ) : (
                       <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
@@ -594,7 +596,7 @@ export function CreateServerModal({
                               Fabric Loader {build.loaderVersion}
                             </span>
                             <span className="text-[10px] text-theme-secondary font-mono">
-                              {build.stable ? "Estável" : "Beta"}
+                              {build.stable ? t("create.stable") : "Beta"}
                             </span>
                           </button>
                         ))}
@@ -606,15 +608,15 @@ export function CreateServerModal({
                 {/* Seletor de build Paper (só aparece quando tipo = paper) */}
                 {serverType === "paper" && (
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Build do Paper</label>
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.paper.label")}</label>
                     {paperVersionsLoading ? (
                       <div className="flex items-center gap-2 px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary">
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        Carregando builds do Paper...
+                        {t("create.paper.loading")}
                       </div>
                     ) : paperBuilds.length === 0 ? (
                       <div className="px-4 py-3 border border-theme-card rounded-2xl text-sm text-theme-secondary italic">
-                        Nenhuma build do Paper encontrada para {serverVersion}.
+                        {t("create.paper.none", { version: serverVersion })}
                       </div>
                     ) : (
                       <div className="max-h-40 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
@@ -635,7 +637,7 @@ export function CreateServerModal({
                               Paper build {build.build}
                             </span>
                             <span className="text-[10px] text-theme-secondary font-mono">
-                              {build.channel === "STABLE" ? "Estável" : build.channel}
+                              {build.channel === "STABLE" ? t("create.stable") : build.channel}
                             </span>
                           </button>
                         ))}
@@ -647,7 +649,7 @@ export function CreateServerModal({
                 {/* RAM */}
                 <div className="space-y-2">
                   <div className="flex justify-between items-center">
-                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">RAM Alocada</label>
+                    <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.ram")}</label>
                     <span className="text-sm font-bold text-indigo-600 font-mono">{serverRam} GB</span>
                   </div>
                   <input
@@ -660,14 +662,14 @@ export function CreateServerModal({
                     className="w-full accent-indigo-600 cursor-pointer h-2 bg-theme-muted rounded-lg appearance-none"
                   />
                   <div className="flex justify-between text-[10px] text-theme-secondary">
-                    <span>Mín: 2 GB</span>
-                    <span>Total no PC: {totalRamGb} GB</span>
+                    <span>{t("create.ramMin")}</span>
+                    <span>{t("create.ramTotal", { total: totalRamGb })}</span>
                   </div>
                   {serverRam < 3 && (
                     <div className="mt-2 p-2.5 bg-theme-warning border border-amber-100 text-amber-800 text-[10px] rounded-xl flex items-start gap-2">
                       <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0 mt-0.5" />
                       <span>
-                        <strong>Atenção:</strong> Menos de 3 GB de RAM pode causar lentidão ou travamentos no servidor, especialmente com muitos jogadores ou mods.
+                        <strong>{t("create.ramWarn.label")}</strong> {t("create.ramWarn.low")}
                       </span>
                     </div>
                   )}
@@ -675,7 +677,7 @@ export function CreateServerModal({
                     <div className="p-3 bg-theme-warning border border-amber-100 text-amber-800 text-[10px] rounded-xl flex items-start gap-2">
                       <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0" />
                       <span>
-                        <strong>Atenção:</strong> Deixar menos de 2GB livres para o sistema operacional pode deixar o Windows lento ou instável.
+                        <strong>{t("create.ramWarn.label")}</strong> {t("create.ramWarn.os")}
                       </span>
                     </div>
                   )}
@@ -683,16 +685,16 @@ export function CreateServerModal({
 
                 {/* Semente do Mundo */}
                 <div className="space-y-1.5">
-                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Semente do Mundo (opcional)</label>
+                  <label className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("create.seed")}</label>
                   <input
                     type="text"
-                    placeholder="Deixe em branco para uma semente aleatória"
+                    placeholder={t("create.seedPlaceholder")}
                     value={serverSeed}
                     onChange={(e) => setServerSeed(e.target.value)}
                     className="w-full h-12 px-4 border border-theme-card rounded-2xl focus:border-indigo-500 focus:outline-none transition-all text-sm font-mono text-theme-primary bg-transparent"
                   />
                   <p className="text-[10px] text-theme-secondary">
-                    Só pode ser definida agora — o mundo é gerado no primeiro início do servidor e a semente não pode mais ser trocada depois.
+                    {t("create.seedHint")}
                   </p>
                 </div>
 
@@ -703,13 +705,13 @@ export function CreateServerModal({
                     onClick={onClose}
                     className="px-5 h-12 rounded-2xl text-theme-secondary hover:text-theme-primary hover:bg-theme-muted transition-colors text-sm font-semibold"
                   >
-                    Cancelar
+                    {t("common.cancel")}
                   </button>
                   <button
                     type="submit"
                     className="px-6 h-12 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-colors text-sm font-semibold shadow-md shadow-theme-shadow"
                   >
-                    Criar Servidor
+                    {t("create.submit")}
                   </button>
                 </div>
               </form>

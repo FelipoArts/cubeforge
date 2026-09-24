@@ -25,13 +25,14 @@
 
 import { fetch } from "@tauri-apps/plugin-http";
 import { supabase } from "@/lib/supabaseClient";
-import { SLUG_FORMAT_HINT, isValidSlugFormat } from "@/lib/inviteLink";
+import { slugFormatHint, isValidSlugFormat } from "@/lib/inviteLink";
+import { getLocale, t } from "@/i18n";
 
 const API_BASE = "https://cubeforge-api.cubeforge.workers.dev";
 export const CONNECT_NAME_DOMAIN = "link.cubicase.net";
 
 /** Mesma regra do Worker (isValidSlug) — checagem só pra feedback imediato, não é a fonte da verdade. */
-export const CONNECT_NAME_FORMAT_HINT = SLUG_FORMAT_HINT;
+export const connectNameFormatHint = slugFormatHint;
 
 export function isValidConnectNameFormat(name: string): boolean {
   return isValidSlugFormat(name);
@@ -70,19 +71,20 @@ export async function getServerConnectName(shortCode: string): Promise<string | 
 
 async function authedConnectNameFetch(shortCode: string, method: "PUT" | "DELETE", body?: unknown): Promise<ApiEnvelope<{ connectName?: string; address?: string }>> {
   const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.access_token) throw new Error("Não autenticado.");
+  if (!session?.access_token) throw new Error(t("err.notAuthenticated"));
 
   const res = await fetch(`${API_BASE}/api/v1/servers/${shortCode}/connect-name`, {
     method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${session.access_token}`,
+      "Accept-Language": getLocale(),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const json = (await res.json().catch(() => null)) as ApiEnvelope<{ connectName?: string; address?: string }> | null;
   if (!res.ok || !json?.success) {
-    throw new Error(json?.message || `Falha na operação (HTTP ${res.status}).`);
+    throw new Error(json?.message || t("err.operationFailed", { status: res.status }));
   }
   return json;
 }

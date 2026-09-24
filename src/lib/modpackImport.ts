@@ -4,6 +4,7 @@ import { exists, readTextFile, writeTextFile, remove } from "@tauri-apps/plugin-
 import { fetch } from "@tauri-apps/plugin-http";
 import { installForgeServer, installFabricServer, type ServerInstallProgress } from "@/lib/server";
 import { readModInstallRegistry, writeModInstallRegistry } from "@/lib/modrinth";
+import { t } from "@/i18n";
 
 // ============================================================
 // Import de Modpacks — CurseForge (.zip) e Modrinth (.mrpack)
@@ -102,7 +103,7 @@ async function curseForgeProxyFetch<T>(path: string, body: unknown): Promise<T> 
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Falha ao consultar a CurseForge (HTTP ${res.status}). O serviço de import pode estar temporariamente indisponível.`);
+    throw new Error(t("modpack.curseforgeHttp", { status: res.status }));
   }
   const data = (await res.json()) as { data: T };
   return data.data;
@@ -207,7 +208,7 @@ export async function parseModpack(zipPath: string): Promise<ParsedModpack> {
 
   if (!CURSEFORGE_IMPORT_ENABLED) {
     throw new Error(
-      "Import de modpacks da CurseForge ainda não está disponível (aguardando aprovação de acesso à API deles). Por enquanto, use um pacote .mrpack do Modrinth."
+      t("modpack.curseforgeUnavailable")
     );
   }
 
@@ -256,7 +257,7 @@ export async function installModpack(
   const docsDir = await documentDir();
   const serverPath = await join(docsDir, "CubicaseServers", serverName);
   if (await exists(serverPath)) {
-    throw new Error(`Já existe um servidor com o nome "${serverName}".`);
+    throw new Error(t("modpack.nameExists", { name: serverName }));
   }
 
   try {
@@ -307,7 +308,7 @@ export async function installModpack(
     try {
       const meta = JSON.parse(await readTextFile(metaPath));
       meta.description = parsed.packVersion ? `Modpack: ${parsed.packName} (${parsed.packVersion})` : `Modpack: ${parsed.packName}`;
-      meta.motd = `Servidor Cubicase [${parsed.packName}] - ${serverName}`;
+      meta.motd = t("modpack.motd", { pack: parsed.packName, name: serverName });
       await writeTextFile(metaPath, JSON.stringify(meta, null, 2));
     } catch {
       // Não crítico — o servidor já está funcional mesmo sem essa personalização.

@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { pushDiagnostic } from "@/app/diagnostics";
 import type { ServerStatus } from "@/app/store";
 import { ConfirmActionModal } from "./ConfirmActionModal";
+import { useT, t as tn } from "@/i18n";
 
 // ============================================================
 // PlayersPanel
@@ -71,6 +72,7 @@ function shortUuid(uuid: string): string {
 }
 
 export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCommand }: PlayersPanelProps) {
+  const { t, rich } = useT();
   const isOnline = serverStatus === "online";
 
   const [activeTab, setActiveTab] = useState<Tab>("online");
@@ -121,7 +123,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       setWhitelistEnabled(props["white-list"] === "true");
     } catch (err) {
       console.error("Erro ao listar jogadores:", err);
-      pushDiagnostic({ level: "warning", source: "Servidor", title: "Não foi possível listar whitelist/ops/banidos", message: String(err) });
+      pushDiagnostic({ level: "warning", source: tn("diag.source.server"), title: tn("players.err.list"), message: String(err) });
     } finally {
       setLoading(false);
     }
@@ -163,7 +165,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await loadAll();
     } catch (err) {
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao ativar whitelist", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.enableWhitelist"), message: String(err) });
     } finally {
       setEnablingWhitelist(false);
     }
@@ -184,7 +186,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await reloadAfterAction();
     } catch (err) {
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao adicionar à whitelist", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.addWhitelist"), message: String(err) });
     } finally {
       setSubmitting(false);
     }
@@ -205,7 +207,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await reloadAfterAction();
     } catch (err) {
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao tornar operador", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.makeOp"), message: String(err) });
     } finally {
       setSubmitting(false);
     }
@@ -228,7 +230,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await reloadAfterAction();
     } catch (err) {
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao banir jogador", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.banPlayer"), message: String(err) });
     } finally {
       setSubmitting(false);
     }
@@ -251,7 +253,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await reloadAfterAction();
     } catch (err) {
       setError(String(err));
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao banir IP", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.banIp"), message: String(err) });
     } finally {
       setSubmitting(false);
     }
@@ -288,7 +290,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       await reloadAfterAction();
     } catch (err) {
       console.error(err);
-      pushDiagnostic({ level: "error", source: "Servidor", title: "Erro ao executar a ação", message: String(err) });
+      pushDiagnostic({ level: "error", source: tn("diag.source.server"), title: tn("players.err.action"), message: String(err) });
     } finally {
       setPendingAction(null);
     }
@@ -298,10 +300,10 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
   // server.properties (`white-list=true`) — do contrário a lista existe no
   // arquivo mas não tem efeito nenhum, e mostrá-la só confunde.
   const tabs: { id: Tab; label: string; icon: typeof Users }[] = [
-    { id: "online", label: "Online", icon: Wifi },
-    ...(whitelistEnabled ? [{ id: "whitelist" as const, label: "Whitelist", icon: Users }] : []),
-    { id: "ops", label: "Operadores", icon: ShieldCheck },
-    { id: "banidos", label: "Banidos", icon: Ban },
+    { id: "online", label: t("players.tab.online"), icon: Wifi },
+    ...(whitelistEnabled ? [{ id: "whitelist" as const, label: t("players.tab.whitelist"), icon: Users }] : []),
+    { id: "ops", label: t("players.tab.ops"), icon: ShieldCheck },
+    { id: "banidos", label: t("players.tab.banned"), icon: Ban },
   ];
 
   // Se a whitelist estava selecionada e o recurso foi desativado (ou ainda nem
@@ -318,9 +320,9 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
           <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest bg-indigo-100 dark:bg-indigo-900/30 px-2.5 py-1 rounded-full">
-            Gerenciamento
+            {t("players.badge")}
           </span>
-          <h2 className="text-2xl font-bold text-theme-primary mt-2">Jogadores</h2>
+          <h2 className="text-2xl font-bold text-theme-primary mt-2">{t("players.heading")}</h2>
         </div>
 
         <div className="flex items-center gap-2 bg-theme-muted p-1 rounded-2xl border border-theme-card">
@@ -343,7 +345,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       {isOnline && (
         <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-          Servidor online: as ações abaixo são enviadas como comando pelo console e têm efeito imediato.
+          {t("players.onlineNote")}
         </div>
       )}
 
@@ -351,7 +353,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
         <div className="p-3 bg-theme-warning border border-theme-warning text-amber-800 dark:text-amber-200 rounded-xl flex items-center gap-2.5 text-xs flex-wrap">
           <AlertTriangle className="w-4 h-4 flex-shrink-0" />
           <span className="flex-1 min-w-[200px]">
-            Whitelist desativada: qualquer pessoa com o código do servidor consegue entrar, mesmo desconhecidos.
+            {t("players.whitelistOff")}
           </span>
           <button
             type="button"
@@ -359,7 +361,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
             disabled={enablingWhitelist}
             className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs disabled:opacity-50 cursor-pointer transition-colors"
           >
-            {enablingWhitelist ? "Ativando…" : "Ativar whitelist"}
+            {enablingWhitelist ? t("players.enablingWhitelist") : t("players.enableWhitelist")}
           </button>
         </div>
       )}
@@ -376,7 +378,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
           onClick={loadAll}
           disabled={loading}
           className="h-9 w-9 flex items-center justify-center bg-theme-muted hover:bg-theme-card border border-theme-card rounded-xl text-theme-secondary hover:text-indigo-600 transition-colors cursor-pointer disabled:opacity-50"
-          title="Atualizar listas"
+          title={t("players.refresh")}
         >
           <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
         </button>
@@ -385,9 +387,9 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       {activeTab === "online" && (
         <div className="space-y-4">
           {!isOnline ? (
-            <div className="text-center py-10 text-theme-secondary text-sm">Servidor offline — nenhum jogador conectado.</div>
+            <div className="text-center py-10 text-theme-secondary text-sm">{t("players.offlineEmpty")}</div>
           ) : onlinePlayers.length === 0 ? (
-            <div className="text-center py-10 text-theme-secondary text-sm">Nenhum jogador conectado no momento.</div>
+            <div className="text-center py-10 text-theme-secondary text-sm">{t("players.noneOnline")}</div>
           ) : (
             <div className="space-y-2 max-h-80 overflow-y-auto pr-1 custom-scrollbar">
               {onlinePlayers.map((name) => (
@@ -409,7 +411,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               value={whitelistInput}
               onChange={(e) => setWhitelistInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAddWhitelist()}
-              placeholder="Nome do jogador"
+              placeholder={t("players.namePlaceholder")}
               className="flex-1 h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
             />
             <button
@@ -418,7 +420,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               disabled={!whitelistInput.trim() || submitting}
               className="h-10 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />} Adicionar
+              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />} {t("players.add")}
             </button>
           </div>
 
@@ -427,7 +429,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               <Loader2 className="w-5 h-5 animate-spin mx-auto text-theme-secondary" />
             </div>
           ) : whitelist.length === 0 ? (
-            <div className="text-center py-10 text-theme-secondary text-sm">Nenhum jogador na whitelist.</div>
+            <div className="text-center py-10 text-theme-secondary text-sm">{t("players.emptyWhitelist")}</div>
           ) : (
             <div className="space-y-2 max-h-80 overflow-y-auto pr-1 custom-scrollbar">
               {whitelist.map((entry) => (
@@ -439,7 +441,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                   <button
                     type="button"
                     onClick={() => setPendingAction({ kind: "remove-whitelist", entry })}
-                    title="Remover da whitelist"
+                    title={t("players.removeFromWhitelist")}
                     className="h-8 w-8 flex items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 transition-colors cursor-pointer flex-shrink-0"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -459,7 +461,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               value={opInput}
               onChange={(e) => setOpInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAddOp()}
-              placeholder="Nome do jogador"
+              placeholder={t("players.namePlaceholder")}
               className="flex-1 h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
             />
             <button
@@ -468,7 +470,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               disabled={!opInput.trim() || submitting}
               className="h-10 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />} Tornar Operador
+              {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />} {t("players.makeOp")}
             </button>
           </div>
 
@@ -477,19 +479,19 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
               <Loader2 className="w-5 h-5 animate-spin mx-auto text-theme-secondary" />
             </div>
           ) : ops.length === 0 ? (
-            <div className="text-center py-10 text-theme-secondary text-sm">Nenhum operador definido.</div>
+            <div className="text-center py-10 text-theme-secondary text-sm">{t("players.emptyOps")}</div>
           ) : (
             <div className="space-y-2 max-h-80 overflow-y-auto pr-1 custom-scrollbar">
               {ops.map((entry) => (
                 <div key={entry.uuid} className="flex items-center justify-between gap-3 bg-theme-muted border border-theme-card rounded-2xl px-4 py-3">
                   <div className="min-w-0">
                     <p className="text-sm font-semibold text-theme-primary truncate">{entry.name}</p>
-                    <p className="text-[11px] text-theme-secondary font-mono">{shortUuid(entry.uuid)} • nível {entry.level}</p>
+                    <p className="text-[11px] text-theme-secondary font-mono">{t("players.opLevel", { uuid: shortUuid(entry.uuid), level: entry.level })}</p>
                   </div>
                   <button
                     type="button"
                     onClick={() => setPendingAction({ kind: "remove-op", entry })}
-                    title="Remover operador"
+                    title={t("players.removeOp")}
                     className="h-8 w-8 flex items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20 transition-colors cursor-pointer flex-shrink-0"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -504,13 +506,13 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
       {activeTab === "banidos" && (
         <div className="space-y-8">
           <div className="space-y-4">
-            <h3 className="text-xs font-bold text-theme-secondary uppercase tracking-wide">Jogadores banidos</h3>
+            <h3 className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("players.bannedPlayers")}</h3>
             <div className="flex items-center gap-2 flex-wrap">
               <input
                 type="text"
                 value={banInput}
                 onChange={(e) => setBanInput(e.target.value)}
-                placeholder="Nome do jogador"
+                placeholder={t("players.namePlaceholder")}
                 className="flex-1 min-w-[10rem] h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
               />
               <input
@@ -518,7 +520,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                 value={banReasonInput}
                 onChange={(e) => setBanReasonInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleBanPlayer()}
-                placeholder="Motivo (opcional)"
+                placeholder={t("players.reasonPlaceholder")}
                 className="flex-1 min-w-[10rem] h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
               />
               <button
@@ -527,7 +529,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                 disabled={!banInput.trim() || submitting}
                 className="h-10 px-4 bg-rose-500 hover:bg-rose-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Ban className="w-3.5 h-3.5" />} Banir
+                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Ban className="w-3.5 h-3.5" />} {t("players.ban")}
               </button>
             </div>
 
@@ -536,7 +538,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                 <Loader2 className="w-5 h-5 animate-spin mx-auto text-theme-secondary" />
               </div>
             ) : bannedPlayers.length === 0 ? (
-              <div className="text-center py-6 text-theme-secondary text-sm">Nenhum jogador banido.</div>
+              <div className="text-center py-6 text-theme-secondary text-sm">{t("players.emptyBanned")}</div>
             ) : (
               <div className="space-y-2 max-h-64 overflow-y-auto pr-1 custom-scrollbar">
                 {bannedPlayers.map((entry) => (
@@ -548,7 +550,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                     <button
                       type="button"
                       onClick={() => setPendingAction({ kind: "pardon-player", entry })}
-                      title="Remover banimento"
+                      title={t("players.removeBan")}
                       className="h-8 w-8 flex items-center justify-center rounded-lg text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors cursor-pointer flex-shrink-0"
                     >
                       <Undo2 className="w-4 h-4" />
@@ -560,13 +562,13 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
           </div>
 
           <div className="space-y-4 pt-2 border-t border-theme-card">
-            <h3 className="text-xs font-bold text-theme-secondary uppercase tracking-wide">IPs banidos</h3>
+            <h3 className="text-xs font-bold text-theme-secondary uppercase tracking-wide">{t("players.bannedIps")}</h3>
             <div className="flex items-center gap-2 flex-wrap">
               <input
                 type="text"
                 value={ipBanInput}
                 onChange={(e) => setIpBanInput(e.target.value)}
-                placeholder="Endereço IP"
+                placeholder={t("players.ipPlaceholder")}
                 className="flex-1 min-w-[10rem] h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
               />
               <input
@@ -574,7 +576,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                 value={ipBanReasonInput}
                 onChange={(e) => setIpBanReasonInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleBanIp()}
-                placeholder="Motivo (opcional)"
+                placeholder={t("players.reasonPlaceholder")}
                 className="flex-1 min-w-[10rem] h-10 px-4 border border-theme-card rounded-xl bg-transparent text-sm text-theme-primary focus:border-indigo-500 focus:outline-none transition-all"
               />
               <button
@@ -583,12 +585,12 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                 disabled={!ipBanInput.trim() || submitting}
                 className="h-10 px-4 bg-rose-500 hover:bg-rose-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Ban className="w-3.5 h-3.5" />} Banir IP
+                {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Ban className="w-3.5 h-3.5" />} {t("players.banIp")}
               </button>
             </div>
 
             {bannedIps.length === 0 ? (
-              <div className="text-center py-6 text-theme-secondary text-sm">Nenhum IP banido.</div>
+              <div className="text-center py-6 text-theme-secondary text-sm">{t("players.emptyBannedIps")}</div>
             ) : (
               <div className="space-y-2 max-h-64 overflow-y-auto pr-1 custom-scrollbar">
                 {bannedIps.map((entry) => (
@@ -600,7 +602,7 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
                     <button
                       type="button"
                       onClick={() => setPendingAction({ kind: "pardon-ip", entry })}
-                      title="Remover banimento de IP"
+                      title={t("players.removeIpBan")}
                       className="h-8 w-8 flex items-center justify-center rounded-lg text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors cursor-pointer flex-shrink-0"
                     >
                       <Undo2 className="w-4 h-4" />
@@ -619,23 +621,23 @@ export function PlayersPanel({ serverDir, serverStatus, onlinePlayers, onSendCom
         onConfirm={handleConfirmAction}
         title={
           pendingAction?.kind === "remove-whitelist"
-            ? "Remover da Whitelist"
+            ? t("players.confirm.removeWhitelist.title")
             : pendingAction?.kind === "remove-op"
-            ? "Remover Operador"
+            ? t("players.confirm.removeOp.title")
             : pendingAction?.kind === "pardon-player"
-            ? "Remover Banimento"
-            : "Remover Banimento de IP"
+            ? t("players.confirm.pardon.title")
+            : t("players.confirm.pardonIp.title")
         }
-        confirmLabel={pendingAction?.kind === "remove-whitelist" || pendingAction?.kind === "remove-op" ? "Remover" : "Desbanir"}
+        confirmLabel={pendingAction?.kind === "remove-whitelist" || pendingAction?.kind === "remove-op" ? t("players.confirm.remove") : t("players.confirm.unban")}
         message={
           pendingAction?.kind === "remove-whitelist" ? (
-            <>Tem certeza que deseja remover <strong className="text-theme-primary">{pendingAction.entry.name}</strong> da whitelist?</>
+            <>{rich("players.confirm.removeWhitelist.msg", { name: <strong className="text-theme-primary">{pendingAction.entry.name}</strong> })}</>
           ) : pendingAction?.kind === "remove-op" ? (
-            <>Tem certeza que deseja remover os privilégios de operador de <strong className="text-theme-primary">{pendingAction.entry.name}</strong>?</>
+            <>{rich("players.confirm.removeOp.msg", { name: <strong className="text-theme-primary">{pendingAction.entry.name}</strong> })}</>
           ) : pendingAction?.kind === "pardon-player" ? (
-            <>Tem certeza que deseja remover o banimento de <strong className="text-theme-primary">{pendingAction.entry.name}</strong>?</>
+            <>{rich("players.confirm.pardon.msg", { name: <strong className="text-theme-primary">{pendingAction.entry.name}</strong> })}</>
           ) : pendingAction?.kind === "pardon-ip" ? (
-            <>Tem certeza que deseja remover o banimento do IP <strong className="text-theme-primary">{pendingAction.entry.ip}</strong>?</>
+            <>{rich("players.confirm.pardonIp.msg", { ip: <strong className="text-theme-primary">{pendingAction.entry.ip}</strong> })}</>
           ) : null
         }
       />

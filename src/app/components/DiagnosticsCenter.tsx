@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDiagnosticsStore, type DiagnosticEntry, type DiagnosticLevel } from "@/app/diagnostics";
+import { useT, getLocale, type TKey } from "@/i18n";
 
 // ============================================================
 // Central de Diagnósticos — UI
@@ -28,16 +29,16 @@ const LEVEL_STYLES: Record<DiagnosticLevel, { bg: string; border: string; text: 
   critical: { bg: "bg-theme-danger", border: "border-theme-danger", text: "text-rose-800 dark:text-rose-200", icon: ShieldAlert },
 };
 
-const LEVEL_LABELS: Record<DiagnosticLevel, string> = {
-  info: "Info",
-  warning: "Aviso",
-  error: "Erro",
-  critical: "Crítico",
+const LEVEL_LABELS: Record<DiagnosticLevel, TKey> = {
+  info: "diag.level.info",
+  warning: "diag.level.warning",
+  error: "diag.level.error",
+  critical: "diag.level.critical",
 };
 
 function formatTime(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleTimeString(getLocale(), { hour: "2-digit", minute: "2-digit" });
 }
 
 // ------------------------------------------------------------
@@ -45,6 +46,7 @@ function formatTime(iso: string): string {
 // ------------------------------------------------------------
 
 export function DiagnosticsToasts() {
+  const { t } = useT();
   const entries = useDiagnosticsStore((s) => s.entries);
   const toastIds = useDiagnosticsStore((s) => s.toastIds);
   const dismissToast = useDiagnosticsStore((s) => s.dismissToast);
@@ -89,7 +91,7 @@ export function DiagnosticsToasts() {
                 type="button"
                 onClick={() => dismissToast(entry.id)}
                 className="p-1 rounded-lg hover:bg-theme-muted text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer flex-shrink-0"
-                title="Dispensar"
+                title={t("diag.dismiss")}
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -106,6 +108,7 @@ export function DiagnosticsToasts() {
 // ------------------------------------------------------------
 
 export function DiagnosticsBell() {
+  const { t } = useT();
   const entries = useDiagnosticsStore((s) => s.entries);
   const unreadCount = useDiagnosticsStore((s) => s.unreadCount);
   const markAllRead = useDiagnosticsStore((s) => s.markAllRead);
@@ -136,7 +139,7 @@ export function DiagnosticsBell() {
         type="button"
         onClick={handleToggle}
         className="relative p-2 rounded-xl hover:bg-theme-muted text-theme-secondary hover:text-theme-primary transition-colors cursor-pointer"
-        title="Central de diagnósticos"
+        title={t("diag.center")}
       >
         <Bell className="w-4.5 h-4.5" />
         {unreadCount > 0 && (
@@ -156,15 +159,15 @@ export function DiagnosticsBell() {
             className="absolute right-0 mt-2 w-96 max-h-[28rem] bg-theme-card border border-theme-card rounded-2xl shadow-2xl z-50 flex flex-col overflow-hidden"
           >
             <div className="p-4 flex items-center justify-between border-b border-theme-card flex-shrink-0">
-              <h4 className="text-sm font-bold text-theme-primary">Central de Diagnósticos</h4>
+              <h4 className="text-sm font-bold text-theme-primary">{t("diag.centerTitle")}</h4>
               {entries.length > 0 && (
                 <button
                   type="button"
                   onClick={clearHistory}
                   className="text-xs text-theme-secondary hover:text-rose-500 transition-colors flex items-center gap-1 cursor-pointer"
-                  title="Limpar histórico"
+                  title={t("diag.clearHistory")}
                 >
-                  <Trash2 className="w-3.5 h-3.5" /> Limpar
+                  <Trash2 className="w-3.5 h-3.5" /> {t("diag.clear")}
                 </button>
               )}
             </div>
@@ -172,7 +175,7 @@ export function DiagnosticsBell() {
             <div className="overflow-y-auto custom-scrollbar flex-1">
               {entries.length === 0 ? (
                 <div className="p-8 text-center text-sm text-theme-secondary">
-                  Nenhum evento registrado ainda.
+                  {t("diag.empty")}
                 </div>
               ) : (
                 entries.map((entry) => {
@@ -184,7 +187,7 @@ export function DiagnosticsBell() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className={cn("text-xs font-bold", style.text)}>{entry.title}</span>
-                          <span className="text-[10px] text-theme-muted">{LEVEL_LABELS[entry.level]}</span>
+                          <span className="text-[10px] text-theme-muted">{t(LEVEL_LABELS[entry.level])}</span>
                           {entry.count > 1 && (
                             <span className="text-[10px] text-theme-muted">×{entry.count}</span>
                           )}

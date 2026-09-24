@@ -11,5 +11,6 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.ts"],
     reporters: ["dot"],
+    setupFiles: ["src/i18n/__tests__/setup.ts"],
   },
 });

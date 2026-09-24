@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { join } from "@tauri-apps/api/path";
 import { exists, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
+import { t } from "@/i18n";
 
 // ============================================================
 // Modrinth — busca, checagem de compatibilidade e instalação de mods/plugins
@@ -286,7 +287,7 @@ export async function installModrinthFile(
   onProgress: (p: ModrinthInstallProgress) => void
 ): Promise<void> {
   const file = version.files.find((f) => f.primary) ?? version.files[0];
-  if (!file) throw new Error("Esta versão não possui nenhum arquivo para download.");
+  if (!file) throw new Error(t("modrinth.noFile"));
 
   onProgress({ status: `Baixando ${file.filename}...`, percent: 20 });
   const destPath = await join(serverDir, itemsFolder, file.filename);
@@ -296,7 +297,7 @@ export async function installModrinthFile(
     expectedSha1: file.hashes.sha1 ?? null,
     expectedSha256: null,
   });
-  onProgress({ status: "Download concluído.", percent: 80 });
+  onProgress({ status: t("modrinth.downloadDone"), percent: 80 });
 
   const registry = await readModInstallRegistry(serverDir);
   registry[file.filename] = {
