@@ -94,7 +94,7 @@ function buildEnglishPage(html, dict, page) {
   });
   // idioma, links internos e og:locale
   out = out.replace('<html lang="pt-BR">', '<html lang="en">');
-  out = out.replace(/href="\/(?!assets\/|en\/)([^"]*)"/g, (m, rest) => (rest === "" || rest.endsWith("/") ? `href="/en/${rest}"` : m));
+  out = out.replace(/href="\/([^"]*)"/g, (m, rest) => (rest === "" || rest === "download/" ? `href="/en/${rest}"` : m));
   out = out.replace(/(<meta property="og:type"[^>]*>)/, `$1\n  <meta property="og:locale" content="en_US" />`);
   return out;
 }
