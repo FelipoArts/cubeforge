@@ -94,7 +94,8 @@ function buildEnglishPage(html, dict, page) {
   });
   // idioma, links internos e og:locale
   out = out.replace('<html lang="pt-BR">', '<html lang="en">');
-  out = out.replace(/href="\/([^"]*)"/g, (m, rest) => (rest === "" || rest === "download/" ? `href="/en/${rest}"` : m));
+  // Só links <a> de navegação: os <link rel="alternate" hreflang> já apontam para o par pt-BR/en certo.
+  out = out.replace(/<a\b[^>]*>/g, (tag) => tag.replace(/href="\/([^"]*)"/, (m, rest) => (rest === "" || rest === "download/" ? `href="/en/${rest}"` : m)));
   out = out.replace(/(<meta property="og:type"[^>]*>)/, `$1\n  <meta property="og:locale" content="en_US" />`);
   return out;
 }
