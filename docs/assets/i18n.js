@@ -64,7 +64,8 @@
     var target = null;
     if (pageLang === "pt" && desired === "en") target = alternate("en");
     else if (pageLang === "en" && stored === "pt") target = alternate("pt-BR"); // só quando a pessoa escolheu PT explicitamente
-    if (target) { location.replace(target + location.search + location.hash); return; }
+    // Nunca redireciona para a própria URL (evita loop se o alternate estiver errado).
+    if (target && new URL(target, location.href).pathname !== location.pathname) { location.replace(target + location.search + location.hash); return; }
   }
 
   // ---------- Tradução ----------
